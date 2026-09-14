@@ -89,11 +89,14 @@ def run(
             print("Претрейн через behavioral cloning...")
             pretrain_policy_bc(ppo, dataset, epochs=epochs, normalize=not no_normalize_bc)
 
-    # FIX: раньше делали ppo.lr_schedule = schedule (несуществующее поле) — расписание не работало
-    lr_schedule = make_lr_schedule(2e-4, total_timesteps, steps_done_holder)
-    # SB3 читает learning_rate каждый апдейт, так что достаточно заменить поле
-    ppo.learning_rate = lr_schedule  # type: ignore
-    # также нужно обновить optimizer lr на случай resume? SB3 сам дергает schedule
+    # FIX: SB3 хранит расписание в ppo.lr_schedule (FloatSchedule), а не в learning_rate.
+    # Раньше делали ppo.lr_schedule = schedule без обёртки или ppo.learning_rate = schedule —
+    # в обоих случаях _update_learning_rate читал старое значение.
+    from stable_baselines3.common.utils import FloatSchedule
+    lr_schedule_fn = make_lr_schedule(2e-4, total_timesteps, steps_done_holder)
+    ppo.lr_schedule = FloatSchedule(lr_schedule_fn)
+    ppo.learning_rate = lr_schedule_fn  # для совместимости/логов
+    print(f"LR schedule установлен: {lr_schedule_fn(1.0):.2e} -> {lr_schedule_fn(0.0):.2e} за {total_timesteps} шагов")
 
     # FIX: ent_coef тоже должен аннилиться, иначе агент быстро детерминизируется и застревает 30-40%
     ent_schedule = make_ent_schedule(total_timesteps, steps_done_holder)
@@ -156,8 +159,7 @@ def run(
         # также логируем ent_coef и lr для дебага
         try:
             ppo.logger.record("train/ent_coef", float(ppo.ent_coef))
-            # lr_schedule возвращает текущий lr
-            cur_lr = lr_schedule(0) if callable(lr_schedule) else ppo.learning_rate
+            cur_lr = ppo.lr_schedule(ppo._current_progress_remaining) if hasattr(ppo, "lr_schedule") else 2e-4
             ppo.logger.record("train/learning_rate", float(cur_lr))
         except Exception:
             pass
