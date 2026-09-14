@@ -38,15 +38,16 @@
 `.gitignore` содержит строку `config.py` без слэша → игнорирует **любой** `config.py` в любой папке, включая `agents/config.py`. Поэтому файл никогда не попадает в git, даже если его создать. На чистой машине `ppo.load()` падает внутри `cloudpickle.loads` при десериализации `MaskedActorCriticPolicy`, которая импортирует `.config`.
 
 **Фикс:**
-* Создан `agents/config.py` с явными константами:
+* Восстановлен `agents/config.py` из вашего старого варианта (монки-патчи `SinglesEnv.order_to_action`/`action_to_order` и `PokemonType.damage_multiplier` → без них любой `ValueError`/`KeyError` ронял весь `SubprocVecEnv`). Константы:
   ```python
   BATTLE_FORMAT = "gen9fusionmonsrandombattle"
   N_FEATURES = 418  # посчитано из features.py, совпадает с heuristic_dataset.npz (265764,418) и vecnormalize.pkl
-  QUALIFIED_PREFIX = "qualified_"
+  QUALIFIED_PREFIX = "self_play_qualified_"  # как в старом конфиге
   SELF_PLAY_PATH = "models/self_play_snapshot"
   VECNORM_PATH = "models/vecnormalize.pkl"
-  MIN_WINRATE_TO_QUALIFY = 50  # было 55 — слишком высоко, пул пустой
+  MIN_WINRATE_TO_QUALIFY = 50
   ```
+  Патчи применяются при импорте `agents.config` — `env.py`/`policy_player.py` их теперь видят автоматически.
 * `.gitignore`: `config.py` → `/config.py` + `!agents/config.py`. Корневой `config.py` (логины) остаётся в игноре, а `agents/config.py` версионируется.
 * Добавлен `agents/__init__.py` чтобы сделать пакет явным.
 
@@ -190,7 +191,7 @@ for i in onlyfiles:
 ```
 .gitignore                     # /config.py + !agents/config.py
 agents/__init__.py             # новый (пустой)
-agents/config.py               # новый, N_FEATURES=418, MIN_WINRATE=50
+agents/config.py               # восстановлен старый с патчами, QUALIFIED_PREFIX=self_play_qualified_, N_FEATURES=418
 agents/env.py                 # фикс семплинга, 3 эвристика, проверка dims
 agents/fusion_parser.py        # set pending, защита от потери фьюжна
 agents/players.py              # mask guard, Forfeit guard

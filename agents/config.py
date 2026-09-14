@@ -1,18 +1,60 @@
-"""Конфиг обучения. Вынесен чтобы избежать циркулярных импортов и magic numbers.
+from poke_env.battle.pokemon_type import PokemonType
+from poke_env.environment.singles_env import SinglesEnv
+from poke_env.player import DefaultBattleOrder, Player
 
-Не игнорируется git'ом: корневой config.py (логин/пароль) по-прежнему в игноре через /config.py,
-а этот файл трекается.
-"""
 BATTLE_FORMAT = "gen9fusionmonsrandombattle"
-# Размер наблюдения считается в agents/features.py -> embed_battle_with_fusion.
-# При изменении признаков не забыть пересчитать и обновить vecnormalize.pkl:
-# TYPE_LIST 19 + statuses 7 + bench 27*5*2 + ... = 418
 N_FEATURES = 418
-
-QUALIFIED_PREFIX = "qualified_"
-SELF_PLAY_PATH = "models/self_play_snapshot"
 VECNORM_PATH = "models/vecnormalize.pkl"
-# Порог винрейта vs SimpleHeuristics чтобы снапшот попал в self-play пул.
-# 55 было слишком высоко (пул пустой -> нет давления self-play -> плато 30-40%).
-# Снижаем до 48-50 чтобы качественные снапшоты попадали регулярно, но мусор отсеивался.
+SELF_PLAY_PATH = "models/self_play_snapshot"
+QUALIFIED_PREFIX = "self_play_qualified_"
 MIN_WINRATE_TO_QUALIFY = 50
+
+# --- монки-патчи библиотеки poke-env, применяются один раз при импорте ---
+
+_original_order_to_action = SinglesEnv.order_to_action
+
+def _safe_order_to_action(order, battle, fake=False, strict=True):
+    try:
+        return _original_order_to_action(order, battle, fake=fake, strict=strict)
+    except ValueError:
+        pass
+
+    try:
+        fallback_order = Player.choose_random_move(battle)
+        return _original_order_to_action(fallback_order, battle, fake=fake, strict=strict)
+    except ValueError:
+        pass
+
+    try:
+        return _original_order_to_action(DefaultBattleOrder(), battle, fake=fake, strict=strict)
+    except ValueError:
+        # Последний рубеж: берём индекс первого действия, разрешённого маской
+        mask = SinglesEnv.get_action_mask(battle)
+        for idx, allowed in enumerate(mask):
+            if allowed:
+                return idx
+        return 0  # маска тоже пуста — возвращаем что угодно, PPO это переживёт как один плохой шаг
+SinglesEnv.order_to_action = staticmethod(_safe_order_to_action)
+
+_original_action_to_order = SinglesEnv.action_to_order
+
+def _safe_action_to_order(action, battle, fake=False, strict=True):
+    mask = SinglesEnv.get_action_mask(battle)
+    if sum(mask) == 0:
+        return DefaultBattleOrder()
+    try:
+        return _original_action_to_order(action, battle, fake=fake, strict=strict)
+    except ValueError:
+        return DefaultBattleOrder()
+
+SinglesEnv.action_to_order = staticmethod(_safe_action_to_order)
+
+_original_damage_multiplier = PokemonType.damage_multiplier
+
+def _safe_damage_multiplier(self, *args, **kwargs):
+    try:
+        return _original_damage_multiplier(self, *args, **kwargs)
+    except KeyError:
+        return 1.0
+
+PokemonType.damage_multiplier = _safe_damage_multiplier
