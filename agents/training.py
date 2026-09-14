@@ -351,9 +351,14 @@ def pretrain_policy_bc(
         ppo.policy.load_state_dict(best_state)
         print("Восстановлены веса с лучшей val_loss")
         # сбрасываем оптимизатор после BC чтобы не нести импульс в RL
-        # (опционально) — пересоздать optimizer с текущим lr
+        # ВАЖНО: нельзя делать optimizer.state = {} (теряется defaultdict -> KeyError в Adam),
+        # нужно clear() чтобы сохранить тип defaultdict
         try:
-            # SB3 хранит optimizer в policy, можно оставить, но сбросим state
-            ppo.policy.optimizer.state = {}
+            ppo.policy.optimizer.state.clear()
         except Exception:
-            pass
+            try:
+                # fallback: пересоздать как defaultdict если кто-то уже заменил на dict
+                from collections import defaultdict
+                ppo.policy.optimizer.state = defaultdict(dict)
+            except Exception:
+                pass
