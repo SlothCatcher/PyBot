@@ -4,7 +4,7 @@ from poke_env.player import RandomPlayer
 from poke_env import AccountConfiguration, ShowdownServerConfiguration
 from config import LOGIN,LOGIN_2, PASSWORD, CUSTOM_SERVER
 from stable_baselines3 import PPO
-from agents.policy_player import PolicyPlayer, MaskedActorCriticPolicy, BATTLE_FORMAT
+from agents.policy_player_simple import PolicyPlayer, MaskedActorCriticPolicy, BATTLE_FORMAT
 
 
 async def randomPlay():
