@@ -23,7 +23,10 @@ def _snapshot_number(fname: str) -> int | None:
 
 def _make_self_play_opponents():
     model_dir = "models/"
-    candidates = [f for f in listdir(model_dir) if isfile(join(model_dir, f)) and QUALIFIED_PREFIX in f]
+    try:
+        candidates = [f for f in listdir(model_dir) if isfile(join(model_dir, f)) and QUALIFIED_PREFIX in f]
+    except FileNotFoundError:
+        return []
     numbered = [(f, _snapshot_number(f)) for f in candidates]
     numbered = [(f, n) for f, n in numbered if n is not None]
     files = [f for f, _ in sorted(numbered, key=lambda pair: pair[1])][-3:]
@@ -32,6 +35,15 @@ def _make_self_play_opponents():
     for fname in files:
         try:
             snap = PPO.load(join(model_dir, fname), device="cpu")
+            # проверка совместимости: если снапшот был обучен на другом N_FEATURES, пропускаем
+            # (иначе ppo.policy будет падать на mismatch observation_space)
+            try:
+                obs_dim = snap.observation_space["observation"].shape[0]  # type: ignore
+                if obs_dim != N_FEATURES:
+                    print(f"Skip qualified snapshot {fname}: obs {obs_dim} != {N_FEATURES}")
+                    continue
+            except Exception:
+                pass
             players.append(PolicyPlayer(policy=snap.policy, battle_format=BATTLE_FORMAT, start_listening=False))
         except Exception as e:
             print(f"Failed to load qualified snapshot {fname}: {e}")
@@ -50,17 +62,48 @@ class ExampleEnv(SinglesEnv):
     @classmethod
     def create_env(cls, opponent_weights: dict[str, float] | None = None) -> Monitor:
         env = cls(battle_format=BATTLE_FORMAT, log_level=40, open_timeout=None)
-        heuristics = [SimpleHeuristicsPlayer(start_listening=False)]
+        # FIX: раньше был только SimpleHeuristicsPlayer, из-за чего агент не видел
+        # Random/MaxBase во время тренировки, но оценивался против них -> заниженный винрейт.
+        heuristics = [
+            RandomPlayer(start_listening=False),
+            MaxBasePowerPlayer(start_listening=False),
+            SimpleHeuristicsPlayer(start_listening=False),
+        ]
         self_play_opp = _make_self_play_opponents()
-        
-        for opp in self_play_opp:
-            opp._fusion_stats = env.agent1._fusion_stats
-        
+
+        # Убрали хак с подменой _fusion_stats:
+        # каждый игрок парсит сообщения самостоятельно, общий dict ломал pending и protect.
+        # Для наблюдения агента (env.agent1) достаточно его собственного парсера,
+        # он видит обе стороны боя.
+
         all_opponents = heuristics + self_play_opp
 
+        if not all_opponents:
+            # fallback если пусто
+            opponent = SimpleHeuristicsPlayer(start_listening=False)
+            return Monitor(SingleAgentWrapper(env, opponent))
+
         if opponent_weights:
-            names = [type(o).__name__ if o not in self_play_opp else "self_play" for o in all_opponents]
-            weights = [opponent_weights.get(n, 1.0 / len(all_opponents)) for n in names]
+            # opponent_weights приходит из training._get_opponent_weights
+            # ключи: "RandomPlayer","MaxBasePowerPlayer","SimpleHeuristicsPlayer","self_play"
+            # Для self_play вес делится поровну между всеми снапшотами.
+            weights = []
+            # суммарный вес self_play
+            self_play_total = opponent_weights.get("self_play", None)
+            # если self_play не в словаре (старые чекпоинты) - считаем его как среднее
+            if self_play_total is None:
+                # равномерное распределение если ключа нет
+                self_play_total = 0.25  # fallback 25%
+            n_sp = len(self_play_opp)
+            for opp in all_opponents:
+                if opp in self_play_opp:
+                    w = self_play_total / max(n_sp, 1) if n_sp else 0
+                else:
+                    w = opponent_weights.get(type(opp).__name__, 1.0 / len(all_opponents))
+                weights.append(max(w, 1e-6))
+            # нормализуем (random.choices делает это сам, но делаем явно для стабильности)
+            total = sum(weights)
+            weights = [w / total for w in weights]
         else:
             weights = [1.0 / len(all_opponents)] * len(all_opponents)
 
@@ -79,7 +122,7 @@ class ExampleEnv(SinglesEnv):
             from poke_env.player import DefaultBattleOrder
             return DefaultBattleOrder()
         return super().action_to_order(action, battle, fake=fake, strict=strict)
-    
+
     def embed_battle(self, battle: AbstractBattle):
         source = self.agent1 if battle is self.battle1 else self.agent2
         fusion_entry = lambda is_ours: (

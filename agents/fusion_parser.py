@@ -1,3 +1,4 @@
+import re
 from .features import _STATS_TABLE_RE, _SPEED_RANGE_RE
 
 def _parse_protect_message(protect_state: dict, split_messages):
@@ -31,21 +32,48 @@ def _parse_fusion_message(store: dict, pending: dict, split_messages):
             continue
 
         if msg_type == "-start" and len(m) >= 4 and m[3] == "typechange" and m[-1] == "[silent]":
-            pending[battle_tag] = m[2][:2]
+            # FIX: если уже есть pending другого сайда, не затираем — храним словарь по сайдам
+            # Было: pending[battle_tag] = side  (терялся второй фьюжн)
+            # Стало: pending как dict {"p1": True, "p2": True} или храним множество
+            # Для совместимости оставим строку, но если уже pending не None и другой сайд — заведём dict
+            side = m[2][:2]
+            if side in ("p1", "p2"):
+                cur = pending.get(battle_tag)
+                if cur is None:
+                    pending[battle_tag] = side
+                elif isinstance(cur, set):
+                    cur.add(side)
+                    pending[battle_tag] = cur
+                elif cur != side:
+                    # был один сайд, теперь другой — делаем множество
+                    pending[battle_tag] = {cur, side}
+                # иначе тот же сайд повторно — ничего
         elif msg_type == "html":
-            side = pending.get(battle_tag)
-            if side:
+            sides = pending.get(battle_tag)
+            if sides:
+                # sides может быть строкой или множеством
+                if isinstance(sides, str):
+                    sides = {sides}
                 html = m[2] if len(m) > 2 else ""
                 stats_m = _STATS_TABLE_RE.search(html)
                 speed_m = _SPEED_RANGE_RE.search(html)
                 if stats_m or speed_m:
-                    entry = store.setdefault(battle_tag, {}).setdefault(side, {})
-                    if stats_m:
-                        hp, atk, d, spa, spd, spe = map(int, stats_m.groups())
-                        entry["base_stats"] = {"hp": hp, "atk": atk, "def": d, "spa": spa, "spd": spd, "spe": spe}
-                    if speed_m:
-                        entry["speed_range"] = tuple(map(int, speed_m.groups()))
+                    # Если в html сразу две таблицы? Редко. Пытаемся определить сайд по html контенту эвристикой:
+                    # пока просто применяем к каждому pending сайду одну и ту же инфу (лучше чем терять)
+                    # В идеале парсить имя покемона из html, но его нет в текущем формате.
+                    # Так что раздаём всем pending сайдам.
+                    for side in list(sides):
+                        entry = store.setdefault(battle_tag, {}).setdefault(side, {})
+                        if stats_m:
+                            hp, atk, d, spa, spd, spe = map(int, stats_m.groups())
+                            entry["base_stats"] = {"hp": hp, "atk": atk, "def": d, "spa": spa, "spd": spd, "spe": spe}
+                        if speed_m:
+                            entry["speed_range"] = tuple(map(int, speed_m.groups()))
+                    # очищаем pending после успешного парса
                     pending[battle_tag] = None
+                elif sides:
+                    # html не про статы — не очищаем pending, ждём следующего html
+                    pass
 
 
 class FusionInfoParser:
@@ -54,7 +82,7 @@ class FusionInfoParser:
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._fusion_stats: dict[str, dict[str, dict]] = {}
-        self._pending_stats_side: dict[str, str | None] = {}
+        self._pending_stats_side: dict[str, str | set | None] = {}
         self._protect_state = {} 
 
     async def _handle_battle_message(self, split_messages):

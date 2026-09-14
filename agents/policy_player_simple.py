@@ -40,16 +40,15 @@ SELF_PLAY_PATH = "models/self_play_snapshot"
 def _make_self_play_opponents():
     onlyfiles = [f for f in listdir("models/") if isfile(join("models/", f)) and "self_play_snapshot_" in f]
     players = []
-    try:        
-        for i in onlyfiles:
-            snap = PPO.load(onlyfiles[i], device="cpu")
+    for fname in onlyfiles:
+        try:
+            snap = PPO.load(join("models", fname), device="cpu")
             players.append(PolicyPlayer(
                 policy=snap.policy, battle_format=BATTLE_FORMAT, start_listening=False
             ))
-        
-        return players
-    except Exception:
-        return players
+        except Exception as e:
+            print(f"Failed to load self_play snapshot {fname}: {e}")
+    return players
 
 def _hazards(side_conditions: dict) -> np.ndarray:
     return np.array(
@@ -132,9 +131,12 @@ class PolicyPlayer(Player):
     ) -> BattleOrder | Awaitable[BattleOrder]:
         if battle.wait:
             return DefaultBattleOrder()
+        if self.policy is None:
+            return DefaultBattleOrder()
         obs = self.embed_battle(battle)
-        obs 
         mask = np.array(SinglesEnv.get_action_mask(battle))
+        if mask.sum() == 0:
+            return DefaultBattleOrder()
         with torch.no_grad():
             obs_dict = {
                 "observation": torch.as_tensor(

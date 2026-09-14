@@ -1,4 +1,5 @@
-config.py
+/config.py
+!agents/config.py
 tb_logs
 venv
 # Byte-compiled / optimized / DLL files

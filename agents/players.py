@@ -22,15 +22,24 @@ class PolicyPlayer(FusionInfoParser, Player):
     def choose_move(self, battle: AbstractBattle) -> BattleOrder | Awaitable[BattleOrder]:
         if battle.wait:
             return DefaultBattleOrder()
+        if self.policy is None:
+            return DefaultBattleOrder()
         obs = self.embed_battle(battle)
         mask = np.array(SinglesEnv.get_action_mask(battle))
+        # FIX: если маска пустая, сразу возвращаем Default, а не лезем в политику (избегаем -inf логитов)
+        if mask.sum() == 0:
+            return DefaultBattleOrder()
         with torch.no_grad():
             obs_dict = {
                 "observation": torch.as_tensor(obs, device=self.policy.device).unsqueeze(0),
                 "action_mask": torch.as_tensor(mask, device=self.policy.device).unsqueeze(0),
             }
-            action, _, _ = self.policy.forward(obs_dict)
-        action = action.cpu().numpy()[0]
+            # Во время battle_against лучше детерминированно (меньше дисперсии оценки),
+            # но для обучения стохастичность важна. Здесь используем deterministic=False
+            # чтобы не расходиться с поведением во время тренировки; для финальной оценки
+            # можно переопределить вызов с deterministic=True.
+            action, _, _ = self.policy.forward(obs_dict, deterministic=False)
+        action = int(action.cpu().numpy()[0])
         return SinglesEnv.action_to_order(action, battle)
 
     def embed_battle(self, battle: AbstractBattle):
@@ -67,8 +76,12 @@ class HeuristicRecorder(FusionInfoParser, SimpleHeuristicsPlayer):
                 opp_protected_last_turn=opp_protect,
             )
             mask = np.array(SinglesEnv.get_action_mask(battle))
+            # order_to_action может бросить если order невалиден (например Forfeit)
             action = SinglesEnv.order_to_action(order, battle, fake=False, strict=False)
-            self.dataset.append((obs, mask, action, battle.battle_tag))
-        except Exception:
+            # action может быть -1/-2 (forfeit/default) — такие переходы не учим
+            if action is not None and action >= 0:
+                self.dataset.append((obs, mask, action, battle.battle_tag))
+        except Exception as e:
+            # не падаем из-за одного битого перехода
             pass
         return order
