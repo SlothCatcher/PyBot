@@ -35,7 +35,9 @@ class StepCounterCallback:
 
 
 def make_lr_schedule(initial_lr: float, total_timesteps: int, steps_holder: dict):
-    # SB3 передает progress_remaining, но мы считаем прогресс по глобальному счетчику
+    # --total-timesteps 0 используется для "только BC, без RL" (pretrain-battles>0, total 0)
+    if total_timesteps is None or total_timesteps <= 0:
+        return lambda progress_remaining: initial_lr
     def lr_schedule(progress_remaining: float) -> float:
         # progress_remaining от SB3 игнорируем, считаем по holder для консистентности resume
         global_progress = max(1.0 - (steps_holder["value"] / total_timesteps), 0.0)
@@ -43,6 +45,8 @@ def make_lr_schedule(initial_lr: float, total_timesteps: int, steps_holder: dict
     return lr_schedule
 
 def make_ent_schedule(total_timesteps: int, steps_holder: dict):
+    if total_timesteps is None or total_timesteps <= 0:
+        return lambda progress_remaining: 0.01
     def ent_schedule(progress_remaining: float) -> float:
         current_step = steps_holder["value"]
         progress = min(current_step / total_timesteps, 1.0)

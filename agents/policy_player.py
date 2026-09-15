@@ -93,11 +93,18 @@ def run(
     # FIX: SB3 хранит расписание в ppo.lr_schedule (FloatSchedule), а не в learning_rate.
     # Раньше делали ppo.lr_schedule = schedule без обёртки или ppo.learning_rate = schedule —
     # в обоих случаях _update_learning_rate читал старое значение.
+    # При total_timesteps==0 (только BC) расписания нет — оставляем константу, деления на 0 быть не должно.
     from stable_baselines3.common.utils import FloatSchedule
     lr_schedule_fn = make_lr_schedule(learning_rate, total_timesteps, steps_done_holder)
     ppo.lr_schedule = FloatSchedule(lr_schedule_fn)
     ppo.learning_rate = lr_schedule_fn  # для совместимости/логов
-    print(f"LR schedule установлен: {lr_schedule_fn(1.0):.2e} -> {lr_schedule_fn(0.0):.2e} за {total_timesteps} шагов (initial {learning_rate:.2e})")
+    if total_timesteps and total_timesteps > 0:
+        try:
+            print(f"LR schedule установлен: {lr_schedule_fn(1.0):.2e} -> {lr_schedule_fn(0.0):.2e} за {total_timesteps} шагов (initial {learning_rate:.2e})")
+        except ZeroDivisionError:
+            print(f"LR schedule установлен: {learning_rate:.2e} (константа, total_timesteps={total_timesteps})")
+    else:
+        print(f"RL пропущен (total_timesteps={total_timesteps}), LR зафиксирован: {learning_rate:.2e}")
     # если resume — сразу применим текущий LR к оптимизатору
     try:
         ppo._update_learning_rate(ppo.policy.optimizer)
