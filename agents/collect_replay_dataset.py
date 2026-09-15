@@ -435,6 +435,54 @@ def parse_replay_to_samples(replay_json: Dict[str, Any], inputlog_text: str | No
             turn_idx+=1
             continue
         # Начало хода turn_number
+        # Найдём границы текущего turn (нужны ДО snapshot, чтобы инферить available_moves)
+        next_turn_idx = None
+        for j in range(turn_idx+1, len(log_lines)):
+            if log_lines[j].startswith("|turn|"):
+                next_turn_idx = j
+                break
+        if next_turn_idx is None:
+            next_turn_idx = len(log_lines)
+        turn_slice = log_lines[turn_idx+1: next_turn_idx]
+
+        # --- FIX для replay: нет |request| -> available_moves пусто -> moves_base/wasted/acc/pp DEAD
+        # Инферим доступные ходы перед snapshot, иначе embed даёт -1/1/0
+        # Также восстанавливаем moves активного покемона из предстоящего |move| (иначе moves пусто на 1-м ходу)
+        for _batt in (battle_p1, battle_p2):
+            try:
+                # если у активного нет moves — добавим из turn_slice (первый увиденный мув этого игрока)
+                if _batt.active_pokemon is not None and len(_batt.active_pokemon.moves) == 0:
+                    # найдём предстоящий |move| этого игрока в turn_slice
+                    role = _batt.player_role  # p1/p2
+                    for _l in turn_slice:
+                        if _l.startswith("|move|") and f"|{role}a:" in _l:
+                            try:
+                                mv_name = _l.split("|")[3]
+                                from poke_env.data.normalize import to_id_str as _toid
+                                from poke_env.battle import Move
+                                mid = _toid(mv_name)
+                                # создаём Move, добавляем в актив
+                                if mid not in _batt.active_pokemon.moves:
+                                    mv = Move(mid, gen=_batt.gen)
+                                    _batt.active_pokemon.moves[mid] = mv
+                                    # также в team dict
+                                    _batt.active_pokemon.moves[mid] = mv
+                            except Exception:
+                                pass
+                            break
+                # теперь инферим available_moves/switches если пусто
+                if not _batt.available_moves and _batt.active_pokemon is not None and not _batt.trapped:
+                    known = list(_batt.active_pokemon.moves.values())[:4]
+                    if known:
+                        _batt._available_moves = known  # type: ignore
+                if not _batt.available_switches:
+                    # все живые неактивные
+                    switches = [m for m in _batt.team.values() if not m.fainted and not m.active]
+                    if switches:
+                        _batt._available_switches = switches  # type: ignore
+            except Exception as e:
+                logger.debug(f"prep battle {e}")
+
         # Снимаем obs для обоих игроков ПЕРЕД ходом
         # Fusion entries для каждого игрока
         # fusion_store[replay_id] = {"p1": {...}, "p2": {...}}
@@ -451,15 +499,6 @@ def parse_replay_to_samples(replay_json: Dict[str, Any], inputlog_text: str | No
         # Но не все turn'ы оба игрока ходят (может быть force switch)
         # Попробуем взять следующие инпуты из очереди
         # Для log-based fallback: смотрим |move|/|switch| внутри этого turn до следующего |turn|
-        # Найдём границы текущего turn
-        next_turn_idx = None
-        for j in range(turn_idx+1, len(log_lines)):
-            if log_lines[j].startswith("|turn|"):
-                next_turn_idx = j
-                break
-        if next_turn_idx is None:
-            next_turn_idx = len(log_lines)
-        turn_slice = log_lines[turn_idx+1: next_turn_idx]
 
         # Собираем действия из turn_slice
         # |move|p1a: ...|MoveName|p2a: ... и |switch|p1a: ...

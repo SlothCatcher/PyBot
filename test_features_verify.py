@@ -275,7 +275,7 @@ def check_embed_synthetic():
     is_old_bug = (fake_env.agent1 if b_copy is fake_env.battle1 else fake_env.agent2) == fake_env.agent2
     # проверяем фикс: по player_role должен выбраться agent1 (читаем файл, не импортируем — иначе нужен stable_baselines3)
     try:
-        src = pathlib.Path("agents/env.py").read_text()
+        src = pathlib.Path("agents/env.py").read_text(encoding="utf-8", errors="ignore")
         uses_player_role = "player_role" in src and "battle is self.battle1" not in src.split("def embed_battle")[1].split("def ")[0] if "def embed_battle" in src else "player_role" in src
         # более надёжно: ищем фиксатор в embed_battle
         import re
