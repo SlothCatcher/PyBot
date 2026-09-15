@@ -1,7 +1,9 @@
 """
-Верификатор features.py — гоняется без сервера, на heuristic_dataset.npz + моках.
+Верификатор features.py — гоняется без сервера, на любом датасете + моках.
 Запуск:  python test_features_verify.py
          python test_features_verify.py --samples 5000
+         python test_features_verify.py --samples 5000 --dataset models/replay_dataset.npz
+Авто-детект: heuristic_dataset.npz -> replay_dataset.npz -> mixed.npz
 """
 import argparse
 import numpy as np
@@ -15,13 +17,18 @@ from agents.features import (
 )
 
 
-def check_dataset(samples: int = 5000):
+def check_dataset(samples: int = 5000, dataset_path: str | None = None):
+    # dataset_path=None -> авто: пробуем heuristic_dataset.npz, затем replay_dataset.npz
+    if dataset_path is None:
+        candidates = ["models/heuristic_dataset.npz", "models/replay_dataset.npz", "models/replay_fusion.npz", "models/mixed.npz"]
+        p = next((pathlib.Path(c) for c in candidates if pathlib.Path(c).exists()), pathlib.Path("models/heuristic_dataset.npz"))
+    else:
+        p = pathlib.Path(dataset_path)
     print("="*70)
-    print("[1] heuristic_dataset.npz — форма и границы Box(-1,4)")
+    print(f"[1] {p} — форма и границы Box(-1,4)")
     print("="*70)
-    p = pathlib.Path("models/heuristic_dataset.npz")
     if not p.exists():
-        print(f"  SKIP: {p} не найден")
+        print(f"  SKIP: {p} не найден (укажи --dataset models/replay_dataset.npz)")
         return False
     data = np.load(p)
     obs, mask, action = data["obs"], data["mask"], data["action"]
@@ -298,12 +305,13 @@ def check_embed_synthetic():
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--samples", type=int, default=5000)
+    ap = argparse.ArgumentParser(description="Верификатор features — работает с любым npz (heuristic/replay)")
+    ap.add_argument("--samples", type=int, default=5000, help="Сколько семплов датасета проверять")
+    ap.add_argument("--dataset", type=str, default=None, help="Путь к npz (по умолчанию авто: heuristic -> replay -> mixed)")
     args = ap.parse_args()
-    ok1 = check_dataset(samples=args.samples)
+    ok1 = check_dataset(samples=args.samples, dataset_path=args.dataset)
     check_embed_synthetic()
     print("="*70)
     print("Готово. Если где-то FAIL/DEAD — пришли лог, поправлю.")
-    print("Запускай на Windows так же: python test_features_verify.py --samples 5000")
+    print("Запускай: python test_features_verify.py --samples 5000 --dataset models/replay_dataset.npz")
     print("="*70)
