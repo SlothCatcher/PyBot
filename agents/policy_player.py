@@ -36,7 +36,8 @@ def run(
     epochs: int = 5,
     dataset_path: str = "models/heuristic_dataset.npz",
     force_recollect: bool = False,
-    no_normalize_bc: bool = False
+    no_normalize_bc: bool = False,
+    learning_rate: float = 2e-4,
 ):
     # phase_size должен делиться на n_steps*num_envs = 3072 для ровных роллаутов
     if phase_size % 3072 != 0:
@@ -71,7 +72,7 @@ def run(
             MaskedActorCriticPolicy,
             env,
             ent_coef=ent_coef if ent_coef is not None else 0.01,
-            learning_rate=2e-4,
+            learning_rate=learning_rate,
             n_steps=3072 // num_envs,
             batch_size=128,
             n_epochs=10,
@@ -93,10 +94,15 @@ def run(
     # Раньше делали ppo.lr_schedule = schedule без обёртки или ppo.learning_rate = schedule —
     # в обоих случаях _update_learning_rate читал старое значение.
     from stable_baselines3.common.utils import FloatSchedule
-    lr_schedule_fn = make_lr_schedule(2e-4, total_timesteps, steps_done_holder)
+    lr_schedule_fn = make_lr_schedule(learning_rate, total_timesteps, steps_done_holder)
     ppo.lr_schedule = FloatSchedule(lr_schedule_fn)
     ppo.learning_rate = lr_schedule_fn  # для совместимости/логов
-    print(f"LR schedule установлен: {lr_schedule_fn(1.0):.2e} -> {lr_schedule_fn(0.0):.2e} за {total_timesteps} шагов")
+    print(f"LR schedule установлен: {lr_schedule_fn(1.0):.2e} -> {lr_schedule_fn(0.0):.2e} за {total_timesteps} шагов (initial {learning_rate:.2e})")
+    # если resume — сразу применим текущий LR к оптимизатору
+    try:
+        ppo._update_learning_rate(ppo.policy.optimizer)
+    except Exception:
+        pass
 
     # FIX: ent_coef тоже должен аннилиться, иначе агент быстро детерминизируется и застревает 30-40%
     ent_schedule = make_ent_schedule(total_timesteps, steps_done_holder)
@@ -238,11 +244,17 @@ if __name__ == "__main__":
     parser.add_argument("--norm-reward", action="store_true", help="Нормализовать награды VecNormalize (рекомендуется для стабильности)")
     parser.add_argument("--no-normalize-bc", action="store_true")
     parser.add_argument("--ent-coef", type=float, default=None)
+    parser.add_argument("--learning-rate", type=float, default=2e-4, dest="learning_rate", help="Начальный learning_rate (линейно аннилится до 0). По умолчанию 2e-4, для дообучения после BC рекомендуется 5e-5..1e-4")
+    parser.add_argument("--lr", type=float, default=None, dest="lr_alias", help="Алиас для --learning-rate")
     parser.add_argument("--pretrain-battles", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--dataset-path", type=str, default="models/heuristic_dataset.npz")
     parser.add_argument("--force-recollect", action="store_true", help="Пересобрать датасет заново, игнорируя кэш")
     args = parser.parse_args()
+
+    # поддержка алиаса --lr
+    if args.lr_alias is not None:
+        args.learning_rate = args.lr_alias
 
     run(
         resume_from=args.resume,
@@ -255,5 +267,6 @@ if __name__ == "__main__":
         epochs=args.epochs,
         dataset_path=args.dataset_path,
         force_recollect=args.force_recollect,
-        no_normalize_bc=args.no_normalize_bc
+        no_normalize_bc=args.no_normalize_bc,
+        learning_rate=args.learning_rate,
     )
