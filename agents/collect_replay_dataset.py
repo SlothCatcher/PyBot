@@ -730,11 +730,62 @@ def collect_replay_dataset(
     cache_dir: str = "models/replay_cache",
     max_workers: int = 4,
     only_winners: bool = False,
+    refresh: bool = False,
 ) -> List[Tuple[np.ndarray, np.ndarray, int, float]]:
     cache_path = Path(cache_dir)
     cache_path.mkdir(parents=True, exist_ok=True)
-    # берём с запасом: нужно `count` успешных, часть отфильтруется по рейтингу/парсингу
-    ids = search_replay_ids(fmt, min_rating, count*3)
+    # --- кэш-first: если в кэше уже есть достаточно реплеев под фильтр — берём их без поиска ---
+    def _format_match(entry_fmt: str, fmt_q: str) -> bool:
+        # entry_fmt: "[Gen 9] Random Battle" or "gen9randombattle"
+        norm = re.sub(r"[^a-z0-9]", "", entry_fmt.lower())
+        return fmt_q in norm or norm in fmt_q
+
+    fmt_q = re.sub(r"[^a-z0-9]", "", fmt.strip().lower()) if fmt.strip().lower().startswith("gen") else re.sub(r"[^a-z0-9]", "", fmt.lower())
+    cached_entries: List[Dict[str, Any]] = []
+    if not refresh and cache_path.exists():
+        for jp in cache_path.glob("*.json"):
+            # пропускаем inputlog json? только *.json реплеев (они содержат "id" и "log")
+            if jp.suffix != ".json" or jp.name.endswith(".inputlog"):
+                continue
+            try:
+                data = json.loads(jp.read_text(encoding="utf-8"))
+                # фильтр по формату
+                entry_fmt = data.get("format", "") or data.get("formatid", "")
+                if fmt and not _format_match(entry_fmt, fmt_q):
+                    continue
+                rating = data.get("rating")
+                if min_rating is not None:
+                    if rating is None or rating < min_rating:
+                        continue
+                # проверим что есть log
+                if not data.get("log"):
+                    continue
+                cached_entries.append({"id": data.get("id", jp.stem), "_data": data})
+                if len(cached_entries) >= count:
+                    break
+            except Exception:
+                continue
+        if len(cached_entries) >= count:
+            logger.info(f"Кэш хит: {len(cached_entries)} реплеев уже в {cache_path} под {fmt} {min_rating}+ — беру из кэша без поиска")
+            # преобразуем к виду search entries
+            ids = [{"id": e["id"], "rating": e["_data"].get("rating"), "format": e["_data"].get("format", fmt)} for e in cached_entries[:count]]
+            # дальше пойдёт ветка кэшированного download (download_replay вернёт из файла)
+        else:
+            if cached_entries:
+                logger.info(f"Кэш: {len(cached_entries)}/{count} подходят, докачаю ещё {count - len(cached_entries)}")
+            # берём с запасом: нужно `count` успешных, часть отфильтруется по рейтингу/парсингу
+            ids = search_replay_ids(fmt, min_rating, count*3)
+            # если нашли кэшированные — добавим их в начало, чтобы не качать дубликаты
+            if cached_entries:
+                cached_ids_set = {e["id"] for e in cached_entries}
+                # prepend cached
+                cached_search = [{"id": e["id"], "rating": e["_data"].get("rating"), "format": e["_data"].get("format", fmt)} for e in cached_entries]
+                # фильтруем дубликаты из search
+                ids = cached_search + [e for e in ids if e["id"] not in cached_ids_set]
+                ids = ids[:count*3]
+    else:
+        # берём с запасом: нужно `count` успешных, часть отфильтруется по рейтингу/парсингу
+        ids = search_replay_ids(fmt, min_rating, count*3)
     logger.info(f"Скачиваю {len(ids)} реплеев (цель {count})...")
     all_samples: List[Tuple[np.ndarray, np.ndarray, int, float]] = []
     ok_replays = 0
@@ -799,6 +850,7 @@ def main():
     ap.add_argument("--cache-dir", type=str, default="models/replay_cache")
     ap.add_argument("--max-workers", type=int, default=4, help="Не используется сейчас (синхронно), оставлен для совместимости")
     ap.add_argument("--only-winners", action="store_true", help="Брать только ходы победителей (иначе учим и проигравших). Рекомендуется для трансферa randombattle->fusion")
+    ap.add_argument("--refresh", action="store_true", help="Игнорировать кэш и перекачать (по умолчанию берёт из кэша если хватает)")
     args = ap.parse_args()
     min_rating = None if args.min_rating == 0 else args.min_rating
     collect_replay_dataset(
@@ -809,6 +861,7 @@ def main():
         cache_dir=args.cache_dir,
         max_workers=args.max_workers,
         only_winners=args.only_winners,
+        refresh=args.refresh,
     )
 
 if __name__ == "__main__":
