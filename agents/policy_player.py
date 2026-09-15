@@ -114,9 +114,10 @@ def run(
     use_ent_schedule = ent_coef is None  # если пользователь явно задал ent_coef — не аннилим
     if use_ent_schedule:
         counter_callback = StepCounterCallback(steps_done_holder, num_envs, ent_schedule=ent_schedule, ppo_ref=ppo)
-        print("Включён ent_coef annealing 0.05->0.001")
+        print("Включён ent_coef annealing 0.01->0.001 (мягкий, после BC не размывает)")
     else:
         counter_callback = StepCounterCallback(steps_done_holder, num_envs)
+        print(f"ent_coef фиксирован: {ent_coef}")
 
     # VecNormalize training flag
     if hasattr(env, "training"):

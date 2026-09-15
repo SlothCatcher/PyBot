@@ -46,14 +46,16 @@ def make_ent_schedule(total_timesteps: int, steps_holder: dict):
     def ent_schedule(progress_remaining: float) -> float:
         current_step = steps_holder["value"]
         progress = min(current_step / total_timesteps, 1.0)
+        # FIX: 0.05 было слишком агрессивно — после BC политика сразу размывалась и ep_rew 10→-10.
+        # Новый мягкий график: старт 0.01 (как дефолт PPO) → 0.005 → 0.001
         if progress <= 0.2:
-            return 0.05
+            return 0.01
         elif progress <= 0.7:
             phase_progress = (progress - 0.2) / 0.5
-            return 0.05 - phase_progress * (0.05 - 0.01)
+            return 0.01 - phase_progress * (0.01 - 0.005)
         else:
             phase_progress = (progress - 0.7) / 0.3
-            return 0.01 - phase_progress * (0.01 - 0.001)
+            return 0.005 - phase_progress * (0.005 - 0.001)
     return ent_schedule
 
 
@@ -239,13 +241,15 @@ def evaluate_win_rates(ppo, n_battles: int = 180) -> dict[str, float]:
 
 def pretrain_policy_bc(
     ppo: PPO, dataset: list, epochs: int = 50, batch_size: int = 256,
-    normalize: bool = False, value_coef: float = 0.25, val_frac: float = 0.1,
+    normalize: bool = False, value_coef: float = 0.0, val_frac: float = 0.1,
     patience: int = 5,
 ):
     """
     Behavioral Cloning на датасете эвристики.
     Исправления vs оригинал:
-    - value_coef снижен 0.5->0.25 чтобы value не доминировал (value scale ~30, policy scale ~logprob ~1-3)
+    - value_coef 0.0 по умолчанию (было 0.5→0.25) — value от BC масштаба ±30 конфликтует с
+      PPO+VecNormalize(norm_reward) где return нормируется к ~1, из-за этого первый PPO
+      апдейт давал advantage ~15 и policy коллапсировала 10→-10
     - градиенты клиппятся по норме 0.5 (иначе взрыв из-за большой value loss)
     - проверка размерности obs vs N_FEATURES
     - normalize теперь корректно warm-up'ит VecNormalize
