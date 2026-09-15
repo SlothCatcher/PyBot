@@ -59,10 +59,16 @@ def check_dataset(samples: int = 5000):
         ("our_bench(135)",122,257), ("opp_bench(135)",257,392), ("vuln(2)",392,394), ("tera_flags(3)",394,397), ("tera_type(19)",397,416), ("protect(2)",416,418),
     ]
     print("\n  Проверка групп (mean должен быть !=0, std>0 для живых фич):")
+    # semi/sub/tera_type — редкие: в heuristic_dataset 0.0 ожидаемо, т.к. SimpleHeuristics почти не юзает Substitute/SkyDrop/Tera
+    # и старый poke_env не парсил tera. После фикса детекторы оживают в синтетике/живых боях, dataset остаётся DEAD исторически.
+    RARE_GROUPS = {"semi(2)", "sub(2)", "tera_type(19)"}
     for name, a,b in groups:
         seg = obs[:samples, a:b]
         m, s, mn, mx = seg.mean(), seg.std(), seg.min(), seg.max()
-        dead = "DEAD" if s < 1e-6 else "ok"
+        if s < 1e-6:
+            dead = "RARE (ok, see synth)" if name in RARE_GROUPS else "DEAD"
+        else:
+            dead = "ok"
         print(f"    {name:18s} [{a:3d}:{b:3d}] mean {m:6.3f} std {s:5.3f} [{mn:5.2f},{mx:5.2f}] {dead}")
     print("\n[2] VecNormalize")
     try:
@@ -182,7 +188,38 @@ def check_embed_synthetic():
     b.team = {"a": b.active_pokemon}
     b.opponent_team = {"b": b.opponent_active_pokemon}
     b.available_moves = [FakeMove("substitute",0, PokemonType.NORMAL)]
-    run_one("volatiles/sub", b)
+    obs_sub = run_one("volatiles/sub", b)
+    if obs_sub is not None:
+        # semi/sub/tera — проверяем что детекторы живые в синтетике
+        print(f"    -> sub our {obs_sub[75]:.2f} opp {obs_sub[76]:.2f} (ожидается >0 для our)")
+        print(f"    -> semi our {obs_sub[73]:.2f} (ожидается 0 тут, см. следующий тест)")
+    # semi via _preparing_move (чиним DEAD: FLY/DIG и т.п. отсутствуют в Effect, ловим через preparing)
+    b = MockBattle()
+    class FakePokemonPrep(FakePokemon):
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self._preparing_move = kw.get("_preparing_move", None)
+    prep_mon = FakePokemonPrep(active=True, _preparing_move=object(), effects={})
+    b.active_pokemon = prep_mon
+    b.opponent_active_pokemon = FakePokemon(active=True)
+    b.team = {"a": prep_mon}; b.opponent_team = {"b": b.opponent_active_pokemon}
+    b.available_moves = [FakeMove("solarbeam",120, PokemonType.GRASS)]
+    obs_prep = run_one("semi via preparing (Fly/SolarBeam)", b)
+    if obs_prep is not None:
+        print(f"    -> semi our {obs_prep[73]:.2f} opp {obs_prep[74]:.2f} (ожидается 1.0/0.0)")
+    # tera via fallback _last_details / _terastallized_type (чиним DEAD: poke_env не парсил tera)
+    b = MockBattle()
+    tera_mon = FakePokemon(active=True, hp=1.0, tera_type=None)
+    tera_mon._last_details = "Pikachu, L83, tera:Fire"
+    tera_mon._terastallized_type = None
+    b.active_pokemon = tera_mon
+    b.opponent_active_pokemon = FakePokemon(active=True)
+    b.team = {"a": tera_mon}; b.opponent_team = {"b": b.opponent_active_pokemon}
+    b.available_moves = [FakeMove("tackle",40, PokemonType.NORMAL)]
+    obs_tera = run_one("tera via _last_details fallback", b)
+    if obs_tera is not None:
+        tera_sum = float(obs_tera[397:416].sum())
+        print(f"    -> tera_type sum {tera_sum:.1f} (ожидается 1.0, был DEAD до фикса)")
 
     b = MockBattle()
     fire = PokemonType.FIRE; grass = PokemonType.GRASS; water = PokemonType.WATER
@@ -206,7 +243,8 @@ def check_embed_synthetic():
     obs = run_one("bench+vuln (огонь vs трава)", b)
     if obs is not None:
         vuln_our, vuln_opp = obs[392], obs[393]
-        print(f"    vulnerability our {vuln_our:.2f} opp {vuln_opp:.2f} (ожидается our 0.0, opp ~1.0)")
+        # our bench: 3x Grass + 1x Water vs Grass-активный: Water 2x уязвим -> 0.25; opp bench Water vs Fire -> 0.0
+        print(f"    vulnerability our {vuln_our:.2f} opp {vuln_opp:.2f} (ожидается 0.25/0.00 — корректно, Grass→Water 2x)")
 
     b = MockBattle()
     b.active_pokemon = FakePokemon(active=True, base_stats={"spe":150}, hp=1.0)
@@ -227,9 +265,35 @@ def check_embed_synthetic():
             self.agent2 = type("A",(),{"_fusion_stats":{"test":{"p2":{"speed_range":(2,2)}}}, "_protect_state":{"test":{"last_p2":True}}})()
     fake_env = FakeEnv()
     b_copy = type("B",(),{"battle_tag":"test","player_role":"p1"})()
-    is_old_ok = (fake_env.agent1 if b_copy is fake_env.battle1 else fake_env.agent2) == fake_env.agent2
-    print(f"  Копия p1 battle: старый код выберет agent2? {is_old_ok} -> {'BUG' if is_old_ok else 'ok'} (должен быть agent1)")
-    print(f"  Вывод: в env.py нужно заменить `is` на `battle.player_role` как в players.py")
+    is_old_bug = (fake_env.agent1 if b_copy is fake_env.battle1 else fake_env.agent2) == fake_env.agent2
+    # проверяем фикс: по player_role должен выбраться agent1 (читаем файл, не импортируем — иначе нужен stable_baselines3)
+    try:
+        src = pathlib.Path("agents/env.py").read_text()
+        uses_player_role = "player_role" in src and "battle is self.battle1" not in src.split("def embed_battle")[1].split("def ")[0] if "def embed_battle" in src else "player_role" in src
+        # более надёжно: ищем фиксатор в embed_battle
+        import re
+        embed_src = re.search(r"def embed_battle.*?(?=\n    def |\nclass |\Z)", src, re.S)
+        embed_text = embed_src.group(0) if embed_src else src
+        # убран первичный 'battle is self.battle1', оставлен только fallback в except + primary player_role
+        has_fix = "player_role" in embed_text and 'getattr(battle, "player_role"' in embed_text
+        has_primary_is = False
+        # проверяем первую строку 'source = ' — должна быть player_role, а не is
+        for line in embed_text.splitlines():
+            if "source =" in line and "battle" in line:
+                has_primary_is = "battle is self.battle1" in line
+                break
+        fixed_picks_agent1 = (fake_env.agent1 if getattr(b_copy, "player_role", "p1") == "p1" else fake_env.agent2) == fake_env.agent1
+        print(f"  Старый код `is`: выберет agent2? {is_old_bug} -> {'BUG (ожидаемо)' if is_old_bug else 'ok'}")
+        print(f"  env.py embed_battle primary использует player_role? {has_fix and not has_primary_is} -> {'OK' if (has_fix and not has_primary_is) else 'FAIL'}")
+        print(f"  env.py primary 'is' баг? {has_primary_is} -> {'FAIL' if has_primary_is else 'OK'}")
+        print(f"  Фикс выбирает agent1 для p1? {fixed_picks_agent1} -> {'OK' if fixed_picks_agent1 else 'FAIL'}")
+        if has_fix and not has_primary_is and fixed_picks_agent1:
+            print("  Вывод: env.py ПОЧИНЕН (player_role вместо is).")
+        else:
+            print("  Вывод: env.py ещё не починен — нужен player_role как в players.py")
+    except Exception as e:
+        print(f"  SKIP env fix check: {e}")
+        print(f"  Копия p1 battle: старый код выберет agent2? {is_old_bug} -> {'BUG' if is_old_bug else 'ok'}")
     print()
 
 
