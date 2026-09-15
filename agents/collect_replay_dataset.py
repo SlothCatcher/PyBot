@@ -282,7 +282,7 @@ def download_inputlog(replay_id: str, cache_dir: Path = CACHE_DIR) -> str | None
         return text
     return None
 
-def parse_replay_to_samples(replay_json: Dict[str, Any], inputlog_text: str | None = None) -> List[Tuple[np.ndarray, np.ndarray, int, str, int]]:
+def parse_replay_to_samples(replay_json: Dict[str, Any], inputlog_text: str | None = None, only_winners: bool = False) -> List[Tuple[np.ndarray, np.ndarray, int, str, int]]:
     """
     Возвращает список (obs, mask, action, battle_tag, won_flag) для обоих игроков.
     won_flag — 1 если этот игрок выиграл, 0 если проиграл (для ret).
@@ -665,7 +665,11 @@ def parse_replay_to_samples(replay_json: Dict[str, Any], inputlog_text: str | No
     # gamma как в training._compute_bc_returns
     gamma = 0.99
     victory_value = 30.0
-    for traj, won, tag in [(p1_traj, p1_won, p1_tag), (p2_traj, p2_won, p2_tag)]:
+    if only_winners:
+        trajectories = [(traj, won, tag) for traj, won, tag in [(p1_traj, p1_won, p1_tag), (p2_traj, p2_won, p2_tag)] if won]
+    else:
+        trajectories = [(p1_traj, p1_won, p1_tag), (p2_traj, p2_won, p2_tag)]
+    for traj, won, tag in trajectories:
         if not traj:
             continue
         outcome = victory_value if won else -victory_value
@@ -686,6 +690,7 @@ def collect_replay_dataset(
     output: str,
     cache_dir: str = "models/replay_cache",
     max_workers: int = 4,
+    only_winners: bool = False,
 ) -> List[Tuple[np.ndarray, np.ndarray, int, float]]:
     cache_path = Path(cache_dir)
     cache_path.mkdir(parents=True, exist_ok=True)
@@ -707,7 +712,7 @@ def collect_replay_dataset(
             continue
         inputlog = download_inputlog(rid, cache_path)
         try:
-            samples = parse_replay_to_samples(replay_json, inputlog)
+            samples = parse_replay_to_samples(replay_json, inputlog, only_winners=only_winners)
         except Exception as e:
             logger.warning(f"parse {rid} failed: {e}")
             import traceback; traceback.print_exc()
@@ -754,6 +759,7 @@ def main():
     ap.add_argument("--output", type=str, default="models/replay_dataset.npz", help="Куда сохранить npz")
     ap.add_argument("--cache-dir", type=str, default="models/replay_cache")
     ap.add_argument("--max-workers", type=int, default=4, help="Не используется сейчас (синхронно), оставлен для совместимости")
+    ap.add_argument("--only-winners", action="store_true", help="Брать только ходы победителей (иначе учим и проигравших). Рекомендуется для трансферa randombattle->fusion")
     args = ap.parse_args()
     min_rating = None if args.min_rating == 0 else args.min_rating
     collect_replay_dataset(
@@ -763,6 +769,7 @@ def main():
         output=args.output,
         cache_dir=args.cache_dir,
         max_workers=args.max_workers,
+        only_winners=args.only_winners,
     )
 
 if __name__ == "__main__":
