@@ -1,6 +1,7 @@
 from poke_env.battle.pokemon_type import PokemonType
 from poke_env.environment.singles_env import SinglesEnv
 from poke_env.player import DefaultBattleOrder, Player
+import numpy as np
 
 BATTLE_FORMAT = "gen9fusionmonsrandombattle"
 N_FEATURES = 418
@@ -42,9 +43,14 @@ def _safe_action_to_order(action, battle, fake=False, strict=True):
     mask = SinglesEnv.get_action_mask(battle)
     if sum(mask) == 0:
         return DefaultBattleOrder()
+    # poke_env ожидает np.int64 с методом .item(), а PolicyPlayer отдаёт Python int
     try:
+        if isinstance(action, int) and not hasattr(action, "item"):
+            action = np.int64(action)
+        elif isinstance(action, np.ndarray) and action.ndim == 0:
+            action = np.int64(action.item())
         return _original_action_to_order(action, battle, fake=fake, strict=strict)
-    except ValueError:
+    except (ValueError, AttributeError, TypeError):
         return DefaultBattleOrder()
 
 SinglesEnv.action_to_order = staticmethod(_safe_action_to_order)
