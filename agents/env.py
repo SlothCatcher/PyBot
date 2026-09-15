@@ -124,7 +124,15 @@ class ExampleEnv(SinglesEnv):
         return super().action_to_order(action, battle, fake=fake, strict=strict)
 
     def embed_battle(self, battle: AbstractBattle):
-        source = self.agent1 if battle is self.battle1 else self.agent2
+        # FIX: 'battle is self.battle1' был сломан т.к. SinglesEnv передаёт копию, а не тот же объект
+        # (battle is battle1) -> False даже для p1, всегда выбирался agent2 -> терялись fusion/protect для p1
+        # Используем player_role как в players.py / poke_env : p1 -> agent1, p2 -> agent2
+        try:
+            # battle.player_role существует у AbstractBattle; 'p1' => agent1, иначе agent2
+            source = self.agent1 if getattr(battle, "player_role", "p1") == "p1" else self.agent2
+        except Exception:
+            # fallback на старый 'is' если player_role по какой-то причине отсутствует
+            source = self.agent1 if battle is self.battle1 else self.agent2
         fusion_entry = lambda is_ours: (
             source._fusion_stats.get(battle.battle_tag, {})
             .get(battle.player_role if is_ours else ("p2" if battle.player_role == "p1" else "p1"))

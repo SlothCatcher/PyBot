@@ -91,18 +91,58 @@ def _is_move_restricted(battle) -> float:
     return 1.0 if len(battle.available_moves) < len(pokemon.moves) else 0.0
 
 def _substitute_damaged(pokemon) -> float:
-    """1.0 если Substitute стоит и уже получал урон (если библиотека это отслеживает), иначе 0.0."""
-    if pokemon is None or Effect.SUBSTITUTE not in pokemon.effects:
+    """0.0 без куклы; >0 если Substitute стоит. 1.0 ~ 25 HP куклы, 0.5 если точное HP неизвестно."""
+    if pokemon is None:
         return 0.0
-    value = pokemon.effects.get(Effect.SUBSTITUTE)
+    # poke_env хранит Effect.SUBSTITUTE в pokemon.effects; значение может быть bool/int
+    if Effect.SUBSTITUTE not in pokemon.effects:
+        # fallback: некоторые версии могут хранить как строку 'substitute' в effects
+        try:
+            if not any(getattr(k, "name", str(k)).lower() == "substitute" for k in pokemon.effects.keys()):
+                return 0.0
+        except Exception:
+            return 0.0
+    value = pokemon.effects.get(Effect.SUBSTITUTE, None)
+    # если ключ был строковым, пробуем достать иначе
+    if value is None:
+        for k, v in list(pokemon.effects.items()):
+            if getattr(k, "name", str(k)).lower() == "substitute":
+                value = v
+                break
     if isinstance(value, (int, float)) and value > 0:
-        return min(value / 25.0, 1.0)  # нормализуем на примерный максимум HP куклы; 25 — грубая оценка
-    return 0.5  # кукла стоит, но точное состояние неизвестно — нейтральное значение вместо 0/1
+        return min(float(value) / 25.0, 1.0)
+    if value is True:
+        return 0.5
+    # кукла стоит, но точное состояние неизвестно — нейтральное значение вместо 0/1
+    # Effect.SUBSTITUTE in effects но value == 0/None -> всё равно кукла есть
+    return 0.5
 
 def _is_semi_invuln_or_charging(pokemon) -> float:
     if pokemon is None:
         return 0.0
-    return 1.0 if any(e in pokemon.effects for e in _SEMI_INVULN_CHARGE_EFFECTS) else 0.0
+    # основной путь: через Effect enum (из тех что существуют: PHANTOM_FORCE/SHADOW_FORCE/SKY_DROP)
+    if any(e in pokemon.effects for e in _SEMI_INVULN_CHARGE_EFFECTS):
+        return 1.0
+    # fallback1: preparing (двухходовые: Solar Beam, Fly на зарядке и т.п.) — poke_env кладёт в _preparing_move
+    try:
+        prep = getattr(pokemon, "_preparing_move", None) or getattr(pokemon, "preparing_move", None)
+        if prep is not None:
+            return 1.0
+    except Exception:
+        pass
+    # fallback2: проверка имени эффекта как строки (если будущая версия poke_env добавит FLY/DIG и т.п.)
+    try:
+        for eff in pokemon.effects.keys():
+            n = getattr(eff, "name", str(eff))
+            if n in _SEMI_INVULN_CHARGE_NAMES:
+                return 1.0
+            # также вариант lower без подчёркиваний
+            n2 = n.replace("_", "").lower()
+            if any(x.replace("_", "").lower() == n2 for x in _SEMI_INVULN_CHARGE_NAMES):
+                return 1.0
+    except Exception:
+        pass
+    return 0.0
 
 def _type_multi_hot(pokemon) -> np.ndarray:
     vec = np.zeros(len(_TYPE_LIST), dtype=np.float32)
@@ -114,11 +154,67 @@ def _type_multi_hot(pokemon) -> np.ndarray:
     return vec
 
 def _tera_type_vec(pokemon) -> np.ndarray:
-    """One-hot тера-типа покемона, нулевой вектор если неизвестен/не покемон."""
+    """One-hot тера-типа покемона. Чиним DEAD: poke_env 0.8.x не заполняет tera_type из request,
+    поэтому пробуем несколько источников (teambuilder, _terastallized_type, _last_details/request)."""
     vec = np.zeros(len(_TYPE_LIST), dtype=np.float32)
     if pokemon is None:
         return vec
-    tera_type = getattr(pokemon, "tera_type", None)
+    tera_type = None
+    # 1) основной путь — pokemon.tera_type ( == _terastallized_type, заполняется для teambuilder и после terastallize)
+    try:
+        v = getattr(pokemon, "tera_type", None)
+        if isinstance(v, PokemonType) and v in _TYPE_INDEX:
+            tera_type = v
+    except Exception:
+        pass
+    # 2) прямое поле _terastallized_type (на случай если property переопределят)
+    if tera_type is None:
+        try:
+            v = getattr(pokemon, "_terastallized_type", None)
+            if isinstance(v, PokemonType) and v in _TYPE_INDEX:
+                tera_type = v
+        except Exception:
+            pass
+    # 3) _last_details строка с 'tera:' (Showdown details: 'Pikachu, L83, tera:Flying' или 'super:tera:Flying')
+    if tera_type is None:
+        try:
+            details = getattr(pokemon, "_last_details", None) or getattr(pokemon, "_details", None) or getattr(pokemon, "details", None)
+            if isinstance(details, str) and "tera:" in details.lower():
+                m = re.search(r"tera:\s*([A-Za-z]+)", details, re.IGNORECASE)
+                if m:
+                    try:
+                        cand = PokemonType.from_name(m.group(1))
+                        if cand in _TYPE_INDEX:
+                            tera_type = cand
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    # 4) _last_request dict с полем 'teraType' (gen9 request) или 'details' с tera
+    if tera_type is None:
+        try:
+            req = getattr(pokemon, "_last_request", None)
+            if isinstance(req, dict):
+                if "teraType" in req and req["teraType"]:
+                    try:
+                        cand = PokemonType.from_name(str(req["teraType"]))
+                        if cand in _TYPE_INDEX:
+                            tera_type = cand
+                    except Exception:
+                        pass
+                # некоторые серверы кладут tera в details внутри request
+                d = req.get("details", "")
+                if isinstance(d, str) and "tera:" in d.lower():
+                    m = re.search(r"tera:\s*([A-Za-z]+)", d, re.IGNORECASE)
+                    if m:
+                        try:
+                            cand = PokemonType.from_name(m.group(1))
+                            if cand in _TYPE_INDEX:
+                                tera_type = cand
+                        except Exception:
+                            pass
+        except Exception:
+            pass
     if tera_type is not None and tera_type in _TYPE_INDEX:
         vec[_TYPE_INDEX[tera_type]] = 1.0
     return vec
