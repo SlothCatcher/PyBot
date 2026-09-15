@@ -38,6 +38,8 @@ def run(
     force_recollect: bool = False,
     no_normalize_bc: bool = False,
     learning_rate: float = 2e-4,
+    contrastive: bool = False,
+    neg_weight: float = 0.3,
 ):
     # phase_size должен делиться на n_steps*num_envs = 3072 для ровных роллаутов
     if phase_size % 3072 != 0:
@@ -82,13 +84,27 @@ def run(
             device="cpu",
             tensorboard_log="./tb_logs/",
         )
+        # BC: либо собираем с нуля (pretrain_battles>0), либо грузим готовый (replay_dataset.npz) даже при 0
+        need_bc = False
+        dataset = None
         if pretrain_battles > 0:
             print(f"Собираю датасет на {pretrain_battles} боях SimpleHeuristicsPlayer...")
             dataset = collect_or_load_dataset(
                 n_battles=pretrain_battles, path=dataset_path, force_recollect=force_recollect
             )
-            print("Претрейн через behavioral cloning...")
-            pretrain_policy_bc(ppo, dataset, epochs=epochs, normalize=not no_normalize_bc)
+            need_bc = True
+        elif dataset_path and os.path.isfile(dataset_path):
+            # пользователь явно указал готовый датасет (replay/heuristic) — грузим даже при pretrain_battles=0
+            from agents.training import load_dataset as _load_ds
+            try:
+                dataset = _load_ds(dataset_path)
+                need_bc = True
+                print(f"Загружен готовый датасет {dataset_path} ({len(dataset)} семплов) для BC")
+            except Exception as e:
+                print(f"Не удалось загрузить {dataset_path}: {e}")
+        if need_bc and dataset is not None:
+            print(f"Претрейн через behavioral cloning (epochs={epochs}, contrastive={contrastive}, neg_weight={neg_weight})...")
+            pretrain_policy_bc(ppo, dataset, epochs=epochs, normalize=not no_normalize_bc, contrastive=contrastive, neg_weight=neg_weight)
 
     # FIX: SB3 хранит расписание в ppo.lr_schedule (FloatSchedule), а не в learning_rate.
     # Раньше делали ppo.lr_schedule = schedule без обёртки или ppo.learning_rate = schedule —
@@ -258,6 +274,8 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--dataset-path", type=str, default="models/heuristic_dataset.npz")
     parser.add_argument("--force-recollect", action="store_true", help="Пересобрать датасет заново, игнорируя кэш")
+    parser.add_argument("--contrastive", action="store_true", help="Контрастивный BC: отталкиваться от ходов проигравшего (w=-neg_weight)")
+    parser.add_argument("--neg-weight", type=float, default=0.3, help="Вес лузер-ходов при --contrastive (0.3 слабее, 1.0 симметрично)")
     args = parser.parse_args()
 
     # поддержка алиаса --lr
@@ -277,4 +295,6 @@ if __name__ == "__main__":
         force_recollect=args.force_recollect,
         no_normalize_bc=args.no_normalize_bc,
         learning_rate=args.learning_rate,
+        contrastive=args.contrastive,
+        neg_weight=args.neg_weight,
     )

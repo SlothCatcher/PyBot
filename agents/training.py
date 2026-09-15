@@ -247,6 +247,7 @@ def pretrain_policy_bc(
     ppo: PPO, dataset: list, epochs: int = 50, batch_size: int = 256,
     normalize: bool = False, value_coef: float = 0.0, val_frac: float = 0.1,
     patience: int = 5,
+    contrastive: bool = False, neg_weight: float = 0.3,
 ):
     """
     Behavioral Cloning на датасете эвристики.
@@ -257,6 +258,9 @@ def pretrain_policy_bc(
     - градиенты клиппятся по норме 0.5 (иначе взрыв из-за большой value loss)
     - проверка размерности obs vs N_FEATURES
     - normalize теперь корректно warm-up'ит VecNormalize
+    - contrastive=True: учится НЕ делать как проигравший — policy_loss = -(w*logProb).mean(),
+      w=+1 для ret>0 (победитель), w=-neg_weight для ret<0 (проигравший). По умолчанию
+      выключено (чистый BC как раньше), включи --contrastive чтобы использовать оба исхода.
     """
     if len(dataset) == 0:
         print("BC: пустой датасет, пропускаю")
@@ -309,7 +313,14 @@ def pretrain_policy_bc(
             latent_pi, latent_vf = ppo.policy.mlp_extractor(features)
             ppo.policy._mask = obs_dict["action_mask"]
             distribution = ppo.policy._get_action_dist_from_latent(latent_pi)
-            policy_loss = -distribution.log_prob(action_batch).mean()
+            log_prob = distribution.log_prob(action_batch)
+            if contrastive:
+                # w = +1 победитель, -neg_weight проигравший → отталкиваем от лузер-ходов
+                # ret уже с gamma: +30..-30, знак = кто выиграл
+                weights = torch.where(return_batch > 0, torch.ones_like(return_batch), torch.full_like(return_batch, -neg_weight))
+                policy_loss = -(weights * log_prob).mean()
+            else:
+                policy_loss = -log_prob.mean()
             values = ppo.policy.value_net(latent_vf).flatten()
             # value loss может быть большой (scale 30), поэтому клип и coef 0.25
             value_loss = torch.nn.functional.mse_loss(values, return_batch)
@@ -334,7 +345,12 @@ def pretrain_policy_bc(
             latent_pi, latent_vf = ppo.policy.mlp_extractor(features)
             ppo.policy._mask = obs_dict["action_mask"]
             distribution = ppo.policy._get_action_dist_from_latent(latent_pi)
-            val_policy_loss = -distribution.log_prob(action_batch).mean().item()
+            log_prob = distribution.log_prob(action_batch)
+            if contrastive:
+                weights = torch.where(return_batch > 0, torch.ones_like(return_batch), torch.full_like(return_batch, -neg_weight))
+                val_policy_loss = -(weights * log_prob).mean().item()
+            else:
+                val_policy_loss = -log_prob.mean().item()
             values = ppo.policy.value_net(latent_vf).flatten()
             val_value_loss = torch.nn.functional.mse_loss(values, return_batch).item()
             val_loss = val_policy_loss + value_coef * val_value_loss
