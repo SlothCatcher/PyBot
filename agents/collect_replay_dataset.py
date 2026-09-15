@@ -773,8 +773,9 @@ def collect_replay_dataset(
         else:
             if cached_entries:
                 logger.info(f"Кэш: {len(cached_entries)}/{count} подходят, докачаю ещё {count - len(cached_entries)}")
-            # берём с запасом: нужно `count` успешных, часть отфильтруется по рейтингу/парсингу
-            ids = search_replay_ids(fmt, min_rating, count*3)
+            # берём с запасом 30% + 100 (раньше было ×3 → 50к → 150к и час поиска)
+            need = int((count - len(cached_entries)) * 1.3) + 100 if cached_entries else int(count * 1.3) + 100
+            ids = search_replay_ids(fmt, min_rating, need)
             # если нашли кэшированные — добавим их в начало, чтобы не качать дубликаты
             if cached_entries:
                 cached_ids_set = {e["id"] for e in cached_entries}
@@ -782,10 +783,11 @@ def collect_replay_dataset(
                 cached_search = [{"id": e["id"], "rating": e["_data"].get("rating"), "format": e["_data"].get("format", fmt)} for e in cached_entries]
                 # фильтруем дубликаты из search
                 ids = cached_search + [e for e in ids if e["id"] not in cached_ids_set]
-                ids = ids[:count*3]
+                ids = ids[:need + len(cached_entries)]
     else:
-        # берём с запасом: нужно `count` успешных, часть отфильтруется по рейтингу/парсингу
-        ids = search_replay_ids(fmt, min_rating, count*3)
+        # берём с запасом 30% + 100
+        need = int(count * 1.3) + 100
+        ids = search_replay_ids(fmt, min_rating, need)
     logger.info(f"Скачиваю {len(ids)} реплеев (цель {count})...")
     all_samples: List[Tuple[np.ndarray, np.ndarray, int, float]] = []
     ok_replays = 0
