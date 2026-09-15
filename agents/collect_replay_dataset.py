@@ -689,13 +689,15 @@ def collect_replay_dataset(
 ) -> List[Tuple[np.ndarray, np.ndarray, int, float]]:
     cache_path = Path(cache_dir)
     cache_path.mkdir(parents=True, exist_ok=True)
-    ids = search_replay_ids(fmt, min_rating, count*2)  # берём с запасом, часть отфильтруется
-    logger.info(f"Скачиваю {len(ids)} реплеев...")
+    # берём с запасом: нужно `count` успешных, часть отфильтруется по рейтингу/парсингу
+    ids = search_replay_ids(fmt, min_rating, count*3)
+    logger.info(f"Скачиваю {len(ids)} реплеев (цель {count})...")
     all_samples: List[Tuple[np.ndarray, np.ndarray, int, float]] = []
     ok_replays = 0
     failed = 0
     for idx, entry in enumerate(ids):
-        if len(all_samples) >= count*10:  # эвристика: на реплей ~10-15 ходов *2 игрока ~20-30 семплов → 1000 реплеев ~20k семплов
+        # основной стоп — по количеству реплеев, а не по семплам (раньше было count*10 -> обрезало 1000 до 210)
+        if ok_replays >= count:
             break
         rid = entry["id"]
         # скачка
@@ -717,11 +719,8 @@ def collect_replay_dataset(
         all_samples.extend([(obs, mask, act, ret) for (obs, mask, act, ret) in samples])
         ok_replays+=1
         if ok_replays % 20 == 0:
-            logger.info(f"  {ok_replays} реплеев ok, {len(all_samples)} семплов, failed {failed}")
-        # ранний стоп если набрали достаточно семплов для BC (эквивалент ~ heuristic_dataset 20k)
-        if len(all_samples) >= 25000 and ok_replays >= count:
-            break
-        time.sleep(0.1)
+            logger.info(f"  {ok_replays}/{count} реплеев ok, {len(all_samples)} семплов, failed {failed}")
+        time.sleep(0.05)
     logger.info(f"Итого: {ok_replays} реплеев, {len(all_samples)} семплов, {failed} failed")
     # семплы уже с ret, сохраняем как heuristic_dataset
     if not all_samples:
