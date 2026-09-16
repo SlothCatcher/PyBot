@@ -97,8 +97,33 @@ def _ensure_dir(p: str):
 def _count_raw_chunk_battles() -> int:
     if not os.path.isdir(HEURISTIC_RAW_CACHE_DIR):
         return 0
+    # быстрый путь: читаем .meta.json без загрузки тяжёлых pickle (каждый pickle 20-100MB с battle_copy)
+    total = 0
+    meta_files = glob.glob(os.path.join(HEURISTIC_RAW_CACHE_DIR, "raw_chunk_*.meta.json"))
+    if meta_files:
+        for mf in meta_files:
+            try:
+                import json
+                with open(mf, "r") as f:
+                    meta = json.load(f)
+                    total += int(meta.get("battles", 0))
+            except Exception:
+                pass
+        pkl_files = glob.glob(os.path.join(HEURISTIC_RAW_CACHE_DIR, "raw_chunk_*.pkl"))
+        if len(meta_files) == len(pkl_files):
+            return total
     total = 0
     for fn in glob.glob(os.path.join(HEURISTIC_RAW_CACHE_DIR, "raw_chunk_*.pkl")):
+        meta_fn = fn.replace(".pkl", ".meta.json")
+        if os.path.exists(meta_fn):
+            try:
+                import json
+                with open(meta_fn, "r") as f:
+                    meta = json.load(f)
+                    total += int(meta.get("battles", 0))
+                    continue
+            except Exception:
+                pass
         try:
             with open(fn, "rb") as f:
                 data = pickle.load(f)
@@ -124,6 +149,13 @@ def _save_raw_chunk(raw_dataset: list, battles: dict, chunk_idx: int):
     with open(tmp, "wb") as f:
         pickle.dump({"raw_dataset": raw_dataset, "battles": battles, "chunk_idx": chunk_idx}, f, protocol=pickle.HIGHEST_PROTOCOL)
     os.replace(tmp, path)
+    try:
+        import json
+        meta_path = path.replace(".pkl", ".meta.json")
+        with open(meta_path, "w") as mf:
+            json.dump({"battles": len(battles), "transitions": len(raw_dataset), "chunk_idx": chunk_idx}, mf)
+    except Exception:
+        pass
     print(f"  Сырой чанк {chunk_idx} сохранён: {path} ({len(raw_dataset)} переходов, {len(battles)} боёв)")
 
 def _save_dataset_chunk(dataset_with_ret: list, chunk_idx: int, tmp_dir: str = HEURISTIC_DATASET_TMP_DIR):
@@ -624,7 +656,7 @@ def collect_heuristic_dataset(n_battles: int = 200, force_recollect: bool = Fals
             pass
     if force_recollect:
         print(f"force_recollect: очищаю чанки {HEURISTIC_RAW_CACHE_DIR} и {HEURISTIC_DATASET_TMP_DIR}")
-        for f in glob.glob(os.path.join(HEURISTIC_RAW_CACHE_DIR, "raw_chunk_*.pkl")):
+        for f in glob.glob(os.path.join(HEURISTIC_RAW_CACHE_DIR, "raw_chunk_*.pkl")) + glob.glob(os.path.join(HEURISTIC_RAW_CACHE_DIR, "raw_chunk_*.meta.json")):
             try:
                 os.remove(f)
             except:
