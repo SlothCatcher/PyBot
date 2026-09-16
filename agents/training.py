@@ -356,12 +356,40 @@ def _recompute_from_chunked_cache(n_battles: int) -> list:
     # cleanup recompute tmp? Keep for debug
     return dataset
 
+def _get_npz_obs_dim(path: str):
+    """Быстро достаёт obs_dim из .npz без загрузки всего массива (3.6GB для 50k)."""
+    try:
+        import zipfile
+        with zipfile.ZipFile(path, 'r') as z:
+            # obs хранится как obs.npy внутри zip
+            with z.open('obs.npy') as f:
+                version = np.lib.format.read_magic(f)
+                if version == (1, 0):
+                    shape, fortran, dtype = np.lib.format.read_array_header_1_0(f)
+                elif version == (2, 0):
+                    shape, fortran, dtype = np.lib.format.read_array_header_2_0(f)
+                else:
+                    # fallback
+                    shape, fortran, dtype = np.lib.format.read_array_header_1_0(f)
+                if len(shape) >= 2:
+                    return int(shape[1])
+                return None
+    except Exception:
+        pass
+    # fallback: mmap (не грузит в RAM)
+    try:
+        data = np.load(path, mmap_mode='r')
+        if "obs" in data:
+            return int(data["obs"].shape[1])
+    except Exception:
+        pass
+    return None
+
 def collect_or_load_dataset(n_battles: int, path: str, force_recollect: bool = False) -> list:
     # если датасет есть и размерность совпадает — грузим, иначе пробуем пересобрать из сырого кэша без боёв
     if os.path.exists(path) and not force_recollect:
         try:
-            data = np.load(path)
-            obs_dim = data["obs"].shape[1] if "obs" in data else None
+            obs_dim = _get_npz_obs_dim(path)
             from .config import N_FEATURES
             if obs_dim is not None and obs_dim != N_FEATURES:
                 print(f"Датасет {path} dim {obs_dim} != N_FEATURES {N_FEATURES} — пересобираю из сырого кэша без новых боёв")
