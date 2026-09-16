@@ -60,12 +60,18 @@ def run(
             print(f"Переопределяю ent_coef: {ppo.ent_coef} -> {ent_coef}")
             ppo.ent_coef = ent_coef
         # прокидываем остальные рекомендательные гиперпараметры и на resume
+        from stable_baselines3.common.utils import get_schedule_fn
         for attr, val in [("clip_range", clip_range), ("n_epochs", n_epochs), ("batch_size", batch_size), ("vf_coef", vf_coef)]:
             if hasattr(ppo, attr):
                 old = getattr(ppo, attr)
-                if old != val:
-                    print(f"Переопределяю {attr}: {old} -> {val}")
-                    setattr(ppo, attr, val)
+                # clip_range в SB3 - это schedule-функция, сравниваем по значению при progress=1.0
+                old_val = old(1.0) if attr == "clip_range" and callable(old) else old
+                if old_val != val:
+                    print(f"Переопределяю {attr}: {old_val} -> {val}")
+                    if attr == "clip_range":
+                        setattr(ppo, attr, get_schedule_fn(val))
+                    else:
+                        setattr(ppo, attr, val)
         # создаём env заново; если был VecNormalize — загружаем
         base_env = SubprocVecEnv([ExampleEnv.create_env for _ in range(num_envs)])
         if not no_normalize_bc:
