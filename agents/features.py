@@ -87,6 +87,8 @@ _HAZARD_CLEAR_MAP = {
     "defog": (1.0, 1.0),
     "courtchange": (1.0, 1.0),
 }
+_PHAZE_MOVES = {"roar","whirlwind","dragontail","circlethrow","yawn"}  # yawn not phaze but force switch later
+_SCREEN_SIDE = [SideCondition.REFLECT, SideCondition.LIGHT_SCREEN, SideCondition.AURORA_VEIL]
 
 def _revealed_moves_frac(pokemon) -> float:
     if pokemon is None:
@@ -365,29 +367,23 @@ def _move_status_prob(move) -> float:
     if move is None:
         return 0.0
     try:
-        # direct status
         status = getattr(move, "status", None)
         if status is not None:
             return 1.0
-        # check entry for status without chance
         entry = getattr(move, "entry", {}) or {}
         if "status" in entry and entry["status"]:
             return 1.0
-        # secondary status
         max_prob = 0.0
         for sec in getattr(move, "secondary", []) or []:
             if not isinstance(sec, dict):
                 continue
             if "status" in sec:
-                # chance may be in sec["chance"] else 100
                 chance = sec.get("chance", 100)
                 try:
                     prob = float(chance) / 100.0 if chance > 1 else float(chance)
                 except Exception:
                     prob = 1.0
                 max_prob = max(max_prob, prob)
-            # also volatileStatus like confusion etc counts as status-like, but we treat separately; keep 0
-        # also check entry secondaries
         if max_prob == 0.0 and entry:
             for sec in entry.get("secondaries", []) or []:
                 if "status" in sec:
@@ -397,10 +393,69 @@ def _move_status_prob(move) -> float:
                     except Exception:
                         prob = 1.0
                     max_prob = max(max_prob, prob)
-            # also "secondaries" may have status in nested
         return float(np.clip(max_prob, 0, 1))
     except Exception:
         return 0.0
+
+def _move_priority(move) -> float:
+    if move is None:
+        return 0.0
+    try:
+        p = getattr(move, "priority", 0)
+        # normalize -7..+5 -> -1..0.71, clip to -1..1
+        return float(np.clip(p / 7.0, -1, 1))
+    except Exception:
+        return 0.0
+
+def _move_stab_flag(move, pokemon) -> float:
+    if move is None or pokemon is None:
+        return 0.0
+    try:
+        mtype = getattr(move, "type", None)
+        if mtype is None:
+            return 0.0
+        # tera stab not counted here (would need tera_type), just base types
+        if mtype == getattr(pokemon, "type_1", None) or mtype == getattr(pokemon, "type_2", None):
+            return 1.0
+        # also check tera if terastallized
+        tera = getattr(pokemon, "tera_type", None) or getattr(pokemon, "_terastallized_type", None)
+        if tera is not None and mtype == tera:
+            return 1.0
+    except Exception:
+        pass
+    return 0.0
+
+def _move_recoil_pct(move) -> float:
+    if move is None:
+        return 0.0
+    try:
+        r = getattr(move, "recoil", 0.0)
+        if isinstance(r, (int,float)) and r>0:
+            return float(np.clip(r,0,1))
+        entry = getattr(move, "entry", {}) or {}
+        if "recoil" in entry:
+            rec = entry["recoil"]
+            if isinstance(rec, (list,tuple)) and len(rec)==2 and rec[1]:
+                return float(rec[0]/rec[1])
+    except Exception:
+        pass
+    return 0.0
+
+def _move_phaze_flag(move) -> float:
+    if move is None:
+        return 0.0
+    try:
+        if getattr(move, "force_switch", False):
+            return 1.0
+        mid = (getattr(move,"id","") or "").lower()
+        if mid in _PHAZE_MOVES:
+            return 1.0
+        entry = getattr(move,"entry",{}) or {}
+        if entry.get("forceSwitch"):
+            return 1.0
+    except Exception:
+        pass
+    return 0.0
 
 def _base_stats_vec(mon, fusion_entry: dict | None = None) -> np.ndarray:
     """6 base stats normalized 0..1 (hp/atk/def/spa/spd/spe /255). Для fusion берём из чата если есть."""
@@ -489,7 +544,50 @@ def _bench_moves_vec(mon, opp_active, type_chart) -> np.ndarray:
         pass
     return vec
 
-_RESERVE_SLOT_SIZE = len(_TYPE_LIST) + 1 + len(_STATUSES) + 6 + 1 + 5  # типы + HP + статус + base_stats(6) + weakness(1) + bench_moves(5)
+def _trick_room_flag(battle) -> float:
+    try:
+        # poke_env: battle.fields may contain pseudo weather? check side conditions and battle attribute
+        if getattr(battle, "trick_room", False):
+            return 1.0
+        # fallback: check in fields dict keys as string
+        for k in list(getattr(battle, "fields", {}).keys()) + list(getattr(battle, "pseudo_weather", {}).keys() if hasattr(battle, "pseudo_weather") else []):
+            n = getattr(k, "name", str(k)).lower()
+            if "trick" in n:
+                return 1.0
+        # check side_conditions for trick room
+        for k in battle.side_conditions.keys():
+            if "trick" in getattr(k, "name", str(k)).lower():
+                return 1.0
+        for k in battle.opponent_side_conditions.keys():
+            if "trick" in getattr(k, "name", str(k)).lower():
+                return 1.0
+    except Exception:
+        pass
+    return 0.0
+
+def _tailwind_flags(side_conditions: dict) -> float:
+    try:
+        # SideCondition.TAILWIND if exists
+        for k in side_conditions.keys():
+            n = getattr(k,"name",str(k)).lower()
+            if "tailwind" in n:
+                return 1.0
+    except Exception:
+        pass
+    return 0.0
+
+def _screens_vec(side_conditions: dict) -> np.ndarray:
+    return np.array([1.0 if sc in side_conditions else 0.0 for sc in _SCREEN_SIDE], dtype=np.float32)
+
+def _bench_item_flag(mon) -> float:
+    if mon is None or mon.fainted:
+        return 0.0
+    try:
+        return 1.0 if getattr(mon, "item", None) else 0.0
+    except Exception:
+        return 0.0
+
+_RESERVE_SLOT_SIZE = len(_TYPE_LIST) + 1 + len(_STATUSES) + 6 + 1 + 5 + 1  # типы + HP + статус + base_stats(6) + weakness(1) + bench_moves(5) + item_flag(1)
 
 
 def _reserve_slot_vec(mon, opp_active=None, type_chart=None, fusion_entry: dict | None = None) -> np.ndarray:
@@ -499,7 +597,8 @@ def _reserve_slot_vec(mon, opp_active=None, type_chart=None, fusion_entry: dict 
     base_vec = _base_stats_vec(mon, fusion_entry)
     weak = np.array([_weakness_score(mon, opp_active, type_chart) if opp_active is not None and type_chart is not None else 0.0], dtype=np.float32)
     moves_vec = _bench_moves_vec(mon, opp_active, type_chart)
-    return np.concatenate([type_vec, [hp], status_vec, base_vec, weak, moves_vec]).astype(np.float32)
+    item_flag = np.array([_bench_item_flag(mon)], dtype=np.float32)
+    return np.concatenate([type_vec, [hp], status_vec, base_vec, weak, moves_vec, item_flag]).astype(np.float32)
 
 
 def _bench_vec(team: dict, opp_active=None, type_chart=None, fusion_map: dict | None = None) -> np.ndarray:
@@ -664,12 +763,15 @@ def embed_battle_with_fusion(battle, our_fusion, opp_fusion, our_protected_last_
     moves_wasted = np.zeros(4, dtype=np.float32)
     moves_accuracy = np.ones(4, dtype=np.float32)
     moves_pp_frac = np.ones(4, dtype=np.float32)
-    # новые флаги приёмов
     moves_boost_own = np.zeros((4, 5), dtype=np.float32)
     moves_drop_opp = np.zeros((4, 5), dtype=np.float32)
     moves_hazard_clear = np.zeros((4, 2), dtype=np.float32)
     moves_heal = np.zeros(4, dtype=np.float32)
     moves_status_prob = np.zeros(4, dtype=np.float32)
+    moves_priority = np.zeros(4, dtype=np.float32)
+    moves_stab = np.zeros(4, dtype=np.float32)
+    moves_recoil = np.zeros(4, dtype=np.float32)
+    moves_phaze = np.zeros(4, dtype=np.float32)
     type_chart = GenData.from_gen(battle.gen).type_chart
 
     for i, move in enumerate(battle.available_moves):
@@ -692,12 +794,15 @@ def embed_battle_with_fusion(battle, our_fusion, opp_fusion, our_protected_last_
                 )
             except KeyError:
                 moves_dmg_multiplier[i] = 1.0
-        # новые флаги
         moves_boost_own[i] = _move_boost_flags(move, "own")
         moves_drop_opp[i] = _move_boost_flags(move, "opp")
         moves_hazard_clear[i] = _move_hazard_clear_flags(move)
         moves_heal[i] = _move_heal_pct(move)
         moves_status_prob[i] = _move_status_prob(move)
+        moves_priority[i] = _move_priority(move)
+        moves_stab[i] = _move_stab_flag(move, battle.active_pokemon)
+        moves_recoil[i] = _move_recoil_pct(move)
+        moves_phaze[i] = _move_phaze_flag(move)
 
     fainted_mon_team = len([mon for mon in battle.team.values() if mon.fainted]) / 6
     fainted_mon_opponent = len([mon for mon in battle.opponent_team.values() if mon.fainted]) / 6
@@ -748,7 +853,11 @@ def embed_battle_with_fusion(battle, our_fusion, opp_fusion, our_protected_last_
     our_used_tera = _team_used_tera(battle.team)
     opp_used_tera = _team_used_tera(battle.opponent_team)
     our_tera_type = _tera_type_vec(battle.active_pokemon)
-    # flatten новые мув-флаги
+    trick_room = _trick_room_flag(battle)
+    our_tailwind = _tailwind_flags(battle.side_conditions)
+    opp_tailwind = _tailwind_flags(battle.opponent_side_conditions)
+    our_screens = _screens_vec(battle.side_conditions)
+    opp_screens = _screens_vec(battle.opponent_side_conditions)
     moves_boost_own_flat = moves_boost_own.flatten()
     moves_drop_opp_flat = moves_drop_opp.flatten()
     moves_hazard_clear_flat = moves_hazard_clear.flatten()
@@ -756,9 +865,11 @@ def embed_battle_with_fusion(battle, our_fusion, opp_fusion, our_protected_last_
         [
             moves_base_power, moves_dmg_multiplier, moves_wasted, moves_accuracy, moves_pp_frac,
             moves_boost_own_flat, moves_drop_opp_flat, moves_hazard_clear_flat, moves_heal, moves_status_prob,
+            moves_priority, moves_stab, moves_recoil, moves_phaze,
             [fainted_mon_team, fainted_mon_opponent, our_hp, opp_hp],
             our_status, opp_status, our_hazards, opp_hazards, our_switches, opp_switches,
             our_boosts, opp_boosts, weather_vec, field_vec,
+            [trick_room, our_tailwind, opp_tailwind], our_screens, opp_screens,
             [speed_advantage],
             [our_revealed, opp_revealed],
             [our_semi_invuln, opp_semi_invuln],
