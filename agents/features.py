@@ -457,6 +457,61 @@ def _move_phaze_flag(move) -> float:
         pass
     return 0.0
 
+def _move_contact_flag(move) -> float:
+    if move is None:
+        return 0.0
+    try:
+        flags = getattr(move, "flags", set()) or set()
+        if "contact" in flags:
+            return 1.0
+        entry = getattr(move, "entry", {}) or {}
+        if "contact" in entry.get("flags", {}):
+            return 1.0
+        # fallback: check entry flags dict
+        if isinstance(entry.get("flags"), set) and "contact" in entry["flags"]:
+            return 1.0
+        if isinstance(entry.get("flags"), dict) and entry["flags"].get("contact"):
+            return 1.0
+    except Exception:
+        pass
+    return 0.0
+
+def _move_sound_flag(move) -> float:
+    if move is None:
+        return 0.0
+    try:
+        flags = getattr(move, "flags", set()) or set()
+        if "sound" in flags:
+            return 1.0
+        entry = getattr(move, "entry", {}) or {}
+        if "sound" in str(entry.get("flags", "")):
+            return 1.0
+        # check flags set
+        eff = getattr(move, "flags", set())
+        # flags may contain "sound"
+        if any("sound" == f.lower() for f in eff):
+            return 1.0
+    except Exception:
+        pass
+    return 0.0
+
+def _move_multihit_flag(move) -> float:
+    if move is None:
+        return 0.0
+    try:
+        n = getattr(move, "n_hit", (1,1))
+        if isinstance(n, (tuple, list)) and len(n)==2:
+            if n[0] != 1 or n[1] != 1:
+                return 1.0
+        entry = getattr(move, "entry", {}) or {}
+        if "multihit" in entry:
+            return 1.0
+        if getattr(move, "expected_hits", 1) > 1.1:
+            return 1.0
+    except Exception:
+        pass
+    return 0.0
+
 def _base_stats_vec(mon, fusion_entry: dict | None = None) -> np.ndarray:
     """6 base stats normalized 0..1 (hp/atk/def/spa/spd/spe /255). Для fusion берём из чата если есть."""
     vec = np.zeros(6, dtype=np.float32)
@@ -772,6 +827,9 @@ def embed_battle_with_fusion(battle, our_fusion, opp_fusion, our_protected_last_
     moves_stab = np.zeros(4, dtype=np.float32)
     moves_recoil = np.zeros(4, dtype=np.float32)
     moves_phaze = np.zeros(4, dtype=np.float32)
+    moves_contact = np.zeros(4, dtype=np.float32)
+    moves_sound = np.zeros(4, dtype=np.float32)
+    moves_multihit = np.zeros(4, dtype=np.float32)
     type_chart = GenData.from_gen(battle.gen).type_chart
 
     for i, move in enumerate(battle.available_moves):
@@ -803,6 +861,9 @@ def embed_battle_with_fusion(battle, our_fusion, opp_fusion, our_protected_last_
         moves_stab[i] = _move_stab_flag(move, battle.active_pokemon)
         moves_recoil[i] = _move_recoil_pct(move)
         moves_phaze[i] = _move_phaze_flag(move)
+        moves_contact[i] = _move_contact_flag(move)
+        moves_sound[i] = _move_sound_flag(move)
+        moves_multihit[i] = _move_multihit_flag(move)
 
     fainted_mon_team = len([mon for mon in battle.team.values() if mon.fainted]) / 6
     fainted_mon_opponent = len([mon for mon in battle.opponent_team.values() if mon.fainted]) / 6
@@ -865,7 +926,7 @@ def embed_battle_with_fusion(battle, our_fusion, opp_fusion, our_protected_last_
         [
             moves_base_power, moves_dmg_multiplier, moves_wasted, moves_accuracy, moves_pp_frac,
             moves_boost_own_flat, moves_drop_opp_flat, moves_hazard_clear_flat, moves_heal, moves_status_prob,
-            moves_priority, moves_stab, moves_recoil, moves_phaze,
+            moves_priority, moves_stab, moves_recoil, moves_phaze, moves_contact, moves_sound, moves_multihit,
             [fainted_mon_team, fainted_mon_opponent, our_hp, opp_hp],
             our_status, opp_status, our_hazards, opp_hazards, our_switches, opp_switches,
             our_boosts, opp_boosts, weather_vec, field_vec,

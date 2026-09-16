@@ -4,7 +4,7 @@ from poke_env.player import DefaultBattleOrder, Player
 import numpy as np
 
 BATTLE_FORMAT = "gen9fusionmonsrandombattle"
-N_FEATURES = 629  # 92 moves(4*23) +4 faint/hp +14 status +8 hazards +4 switches +10 boosts +10 weather/field +9 trick/tailwind/screens +1 speed +2 revealed +2 semi +2 sub +1 restr +22 volatiles +22 items +400 bench(2*5*40) +2 vuln +3 tera flags +19 tera_type +2 protect
+N_FEATURES = 641  # 104 moves(4*26) +4 faint/hp +14 status +8 hazards +4 switches +10 boosts +10 weather/field +9 trick/tailwind/screens +1 speed +2 revealed +2 semi +2 sub +1 restr +22 volatiles +22 items +400 bench(2*5*40) +2 vuln +3 tera flags +19 tera_type +2 protect
 VECNORM_PATH = "models/vecnormalize.pkl"
 SELF_PLAY_PATH = "models/self_play_snapshot"
 QUALIFIED_PREFIX = "self_play_qualified_"
