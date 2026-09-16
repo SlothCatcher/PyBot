@@ -525,8 +525,6 @@ def _base_stats_vec(mon, fusion_entry: dict | None = None) -> np.ndarray:
             stats = getattr(mon, "base_stats", None)
         if stats is None:
             return vec
-        # stats may be dict with keys hp,atk,def,spa,spd,spe or at,df etc.
-        # normalize standard poke_env keys
         keys = ["hp", "atk", "def", "spa", "spd", "spe"]
         vals = []
         for k in keys:
@@ -534,6 +532,43 @@ def _base_stats_vec(mon, fusion_entry: dict | None = None) -> np.ndarray:
             if v is None:
                 v = 0
             vals.append(float(v) / 255.0)
+        vec = np.array(vals, dtype=np.float32)
+    except Exception:
+        pass
+    return vec
+
+def _actual_stats_vec(mon, fusion_entry: dict | None = None) -> np.ndarray:
+    """6 реальных статов с учётом уровня / IV/EV. Нормируем /600 (макс ~714 HP, ~500 осталь)."""
+    vec = np.zeros(6, dtype=np.float32)
+    if mon is None:
+        return vec
+    try:
+        base = None
+        if fusion_entry and "base_stats" in fusion_entry:
+            base = fusion_entry["base_stats"]
+        else:
+            base = getattr(mon, "base_stats", None)
+        if base is None:
+            return vec
+        level = getattr(mon, "level", 100) or 100
+        # random battles: IV 31, EV 85 *6 =510 total ~85 each, nature neutral 1.0
+        IV = 31
+        EV = 85
+        def calc(b, is_hp=False):
+            b = float(b)
+            if is_hp:
+                return int(((2*b + IV + EV/4)*level/100) + level + 10)
+            else:
+                return int(((2*b + IV + EV/4)*level/100 + 5) * 1.0)
+        keys = ["hp", "atk", "def", "spa", "spd", "spe"]
+        vals = []
+        for i, k in enumerate(keys):
+            bv = base.get(k, base.get(k.upper(), 80)) or 80
+            is_hp = (i==0)
+            real = calc(bv, is_hp)
+            # нормируем: HP /714 (max), остальные /500
+            norm = real / 714.0 if is_hp else real / 500.0
+            vals.append(float(np.clip(norm, 0, 1)))
         vec = np.array(vals, dtype=np.float32)
     except Exception:
         pass
@@ -649,11 +684,11 @@ def _reserve_slot_vec(mon, opp_active=None, type_chart=None, fusion_entry: dict 
     type_vec = _type_multi_hot(mon)
     hp = 0.0 if mon.fainted else mon.current_hp_fraction
     status_vec = _status_one_hot(mon.status)
-    base_vec = _base_stats_vec(mon, fusion_entry)
+    actual_vec = _actual_stats_vec(mon, fusion_entry)
     weak = np.array([_weakness_score(mon, opp_active, type_chart) if opp_active is not None and type_chart is not None else 0.0], dtype=np.float32)
     moves_vec = _bench_moves_vec(mon, opp_active, type_chart)
     item_flag = np.array([_bench_item_flag(mon)], dtype=np.float32)
-    return np.concatenate([type_vec, [hp], status_vec, base_vec, weak, moves_vec, item_flag]).astype(np.float32)
+    return np.concatenate([type_vec, [hp], status_vec, actual_vec, weak, moves_vec, item_flag]).astype(np.float32)
 
 
 def _bench_vec(team: dict, opp_active=None, type_chart=None, fusion_map: dict | None = None) -> np.ndarray:
@@ -919,6 +954,8 @@ def embed_battle_with_fusion(battle, our_fusion, opp_fusion, our_protected_last_
     opp_tailwind = _tailwind_flags(battle.opponent_side_conditions)
     our_screens = _screens_vec(battle.side_conditions)
     opp_screens = _screens_vec(battle.opponent_side_conditions)
+    our_actual_stats = _actual_stats_vec(battle.active_pokemon, our_fusion)
+    opp_actual_stats = _actual_stats_vec(battle.opponent_active_pokemon, opp_fusion)
     moves_boost_own_flat = moves_boost_own.flatten()
     moves_drop_opp_flat = moves_drop_opp.flatten()
     moves_hazard_clear_flat = moves_hazard_clear.flatten()
@@ -929,7 +966,7 @@ def embed_battle_with_fusion(battle, our_fusion, opp_fusion, our_protected_last_
             moves_priority, moves_stab, moves_recoil, moves_phaze, moves_contact, moves_sound, moves_multihit,
             [fainted_mon_team, fainted_mon_opponent, our_hp, opp_hp],
             our_status, opp_status, our_hazards, opp_hazards, our_switches, opp_switches,
-            our_boosts, opp_boosts, weather_vec, field_vec,
+            our_boosts, opp_boosts, our_actual_stats, opp_actual_stats, weather_vec, field_vec,
             [trick_room, our_tailwind, opp_tailwind], our_screens, opp_screens,
             [speed_advantage],
             [our_revealed, opp_revealed],
