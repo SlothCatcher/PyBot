@@ -518,46 +518,82 @@ def collect_heuristic_dataset(n_battles: int = 200, force_recollect: bool = Fals
                     return final_dataset
                 print("Кэш дал 0 примеров, пересобираю боями...")
             elif n_cached_battles > 0:
-                print(f"Кэш: {n_cached_battles}/{n_battles} боёв — доберу {n_battles - n_cached_battles} новых боёв (legacy, без чанков)")
-                # доберём недостающие бои и объединим (старый путь, для совместимости, но тоже может быть большим — используем chunked для добора)
-                # Переходим в chunked добор: сохраним legacy в chunked формат и продолжим чанками
-                # Мигрируем legacy в chunked dir (разобьём на чанки)
-                print("  Мигрирую legacy кэш в chunked формат для добора пачками...")
-                _ensure_dir(HEURISTIC_RAW_CACHE_DIR)
-                _ensure_dir(HEURISTIC_DATASET_TMP_DIR)
-                # Очистим chunked если force? Нет
-                # Конвертируем legacy raw_dataset+battles в чанки по chunk_size боёв
-                from collections import defaultdict as dd
-                grouped_raw = dd(list)
-                for entry in raw_cached:
-                    if len(entry) == 8:
-                        grouped_raw[entry[3]].append(entry)
-                tags = list(grouped_raw.keys())
-                # Сохраним по чанкам
-                for idx in range(0, len(tags), chunk_size):
-                    chunk_tags = tags[idx: idx+chunk_size]
-                    chunk_raw = []
-                    chunk_battles = {}
-                    for t in chunk_tags:
-                        chunk_raw.extend(grouped_raw[t])
-                        if t in battles_cached:
-                            chunk_battles[t] = battles_cached[t]
-                    # найдём свободный индекс
-                    existing = _list_raw_chunk_files()
-                    # Use next index after existing
-                    next_idx = len(existing)
-                    # Actually we need to ensure we don't overwrite
-                    _save_raw_chunk(chunk_raw, chunk_battles, next_idx)
-                    # also save dataset chunk for these battles (recompute)
-                    recomputed = _recompute_dataset_from_raw(chunk_raw, chunk_battles)
-                    dataset_for_chunk = [(obs, mask, action, tag) for obs, mask, action, tag in recomputed]
-                    final_for_chunk = _compute_bc_returns(dataset_for_chunk, chunk_battles)
-                    _save_dataset_chunk(final_for_chunk, next_idx)
-                    del chunk_raw, chunk_battles, recomputed, final_for_chunk
-                    gc.collect()
-                # теперь n_cached_chunked обновится
-                n_cached_chunked = _count_raw_chunk_battles()
-                print(f"  Миграция завершена, chunked теперь {n_cached_chunked} боёв")
+                # если chunked уже есть — не мигрируем legacy повторно (избегаем дублей после прерванной миграции)
+                if _count_raw_chunk_battles() > 0:
+                    print(f"Кэш: {n_cached_battles}/{n_battles} боёв legacy, но chunked уже содержит {_count_raw_chunk_battles()} боёв — пропускаю миграцию (избегаю дублей)")
+                    # проверяем, что для каждого raw чанка есть dataset чанк, иначе пересобираем
+                    raw_files = _list_raw_chunk_files()
+                    dataset_files = set(_list_dataset_chunk_files())
+                    missing = []
+                    for rf in raw_files:
+                        try:
+                            idx = int(os.path.basename(rf).split("_")[-1].split(".")[0])
+                        except:
+                            continue
+                        df = os.path.join(HEURISTIC_DATASET_TMP_DIR, f"dataset_chunk_{idx:04d}.npz")
+                        if df not in dataset_files and not os.path.exists(df):
+                            missing.append((rf, idx))
+                    if missing:
+                        print(f"  Найдены raw чанки без dataset ({len(missing)}), пересобираю...")
+                        for rf, idx in missing:
+                            try:
+                                with open(rf, "rb") as f:
+                                    data = pickle.load(f)
+                                raw_dataset = data.get("raw_dataset", [])
+                                battles = data.get("battles", {})
+                                recomputed = _recompute_dataset_from_raw(raw_dataset, battles)
+                                dataset_for_chunk = [(obs, mask, action, tag) for obs, mask, action, tag in recomputed]
+                                final_for_chunk = _compute_bc_returns(dataset_for_chunk, battles)
+                                _save_dataset_chunk(final_for_chunk, idx)
+                                del raw_dataset, battles, recomputed, dataset_for_chunk, final_for_chunk
+                                gc.collect()
+                                # удаляем битые .tmp если остались
+                                for leftover in glob.glob(os.path.join(HEURISTIC_DATASET_TMP_DIR, "*.tmp.npz")) + glob.glob(os.path.join(HEURISTIC_DATASET_TMP_DIR, "*.tmp")):
+                                    try:
+                                        os.remove(leftover)
+                                    except:
+                                        pass
+                            except Exception as e:
+                                print(f"  Не удалось пересобрать dataset для raw {rf}: {e}")
+                    # чистим остатки .tmp.npz от прошлого падения
+                    for leftover in glob.glob(os.path.join(HEURISTIC_DATASET_TMP_DIR, "*.tmp.npz")) + glob.glob(os.path.join(HEURISTIC_RAW_CACHE_DIR, "*.tmp")):
+                        try:
+                            os.remove(leftover)
+                        except:
+                            pass
+                    n_cached_chunked = _count_raw_chunk_battles()
+                    print(f"  Chunked теперь {n_cached_chunked} боёв, продолжаю добор пачками...")
+                else:
+                    print(f"Кэш: {n_cached_battles}/{n_battles} боёв — доберу {n_battles - n_cached_battles} новых боёв (legacy, без чанков)")
+                    # Переходим в chunked добор: сохраним legacy в chunked формат и продолжим чанками
+                    print("  Мигрирую legacy кэш в chunked формат для добора пачками...")
+                    _ensure_dir(HEURISTIC_RAW_CACHE_DIR)
+                    _ensure_dir(HEURISTIC_DATASET_TMP_DIR)
+                    from collections import defaultdict as dd
+                    grouped_raw = dd(list)
+                    for entry in raw_cached:
+                        if len(entry) == 8:
+                            grouped_raw[entry[3]].append(entry)
+                    tags = list(grouped_raw.keys())
+                    for idx in range(0, len(tags), chunk_size):
+                        chunk_tags = tags[idx: idx+chunk_size]
+                        chunk_raw = []
+                        chunk_battles = {}
+                        for t in chunk_tags:
+                            chunk_raw.extend(grouped_raw[t])
+                            if t in battles_cached:
+                                chunk_battles[t] = battles_cached[t]
+                        existing = _list_raw_chunk_files()
+                        next_idx = len(existing)
+                        _save_raw_chunk(chunk_raw, chunk_battles, next_idx)
+                        recomputed = _recompute_dataset_from_raw(chunk_raw, chunk_battles)
+                        dataset_for_chunk = [(obs, mask, action, tag) for obs, mask, action, tag in recomputed]
+                        final_for_chunk = _compute_bc_returns(dataset_for_chunk, chunk_battles)
+                        _save_dataset_chunk(final_for_chunk, next_idx)
+                        del chunk_raw, chunk_battles, recomputed, final_for_chunk
+                        gc.collect()
+                    n_cached_chunked = _count_raw_chunk_battles()
+                    print(f"  Миграция завершена, chunked теперь {n_cached_chunked} боёв")
                 # продолжим добор как chunked (ниже)
                 # не возвращаем, падаем в chunked сбор
     # 2) Если n_battles маленький и нет chunked кэша — старый быстрый путь без чанков (совместимость)
@@ -580,6 +616,12 @@ def collect_heuristic_dataset(n_battles: int = 200, force_recollect: bool = Fals
     # 3) Chunked путь для больших n_battles (50k) — пачками по 1000, с записью на диск и resume
     _ensure_dir(HEURISTIC_RAW_CACHE_DIR)
     _ensure_dir(HEURISTIC_DATASET_TMP_DIR)
+    # чистим битые .tmp от прошлого падения (Windows np.savez добавлял .npz)
+    for leftover in glob.glob(os.path.join(HEURISTIC_DATASET_TMP_DIR, "*.tmp")) + glob.glob(os.path.join(HEURISTIC_DATASET_TMP_DIR, "*.tmp.npz")) + glob.glob(os.path.join(HEURISTIC_RAW_CACHE_DIR, "*.tmp")):
+        try:
+            os.remove(leftover)
+        except:
+            pass
     if force_recollect:
         print(f"force_recollect: очищаю чанки {HEURISTIC_RAW_CACHE_DIR} и {HEURISTIC_DATASET_TMP_DIR}")
         for f in glob.glob(os.path.join(HEURISTIC_RAW_CACHE_DIR, "raw_chunk_*.pkl")):
