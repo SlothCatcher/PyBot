@@ -62,11 +62,10 @@ class ExampleEnv(SinglesEnv):
     @classmethod
     def create_env(cls, opponent_weights: dict[str, float] | None = None) -> Monitor:
         env = cls(battle_format=BATTLE_FORMAT, log_level=40, open_timeout=None)
-        # FIX: раньше был только SimpleHeuristicsPlayer, из-за чего агент не видел
-        # Random/MaxBase во время тренировки, но оценивался против них -> заниженный винрейт.
+        # Тренируем только против сильного соперника: Random/Max слишком легкие,
+        # агент находит читерскую стратегию против них и забывает эвристику (31% -> 13%).
+        # Оставляем их только в evaluate_win_rates для проверки, что не деградировал.
         heuristics = [
-            RandomPlayer(start_listening=False),
-            MaxBasePowerPlayer(start_listening=False),
             SimpleHeuristicsPlayer(start_listening=False),
         ]
         self_play_opp = _make_self_play_opponents()
