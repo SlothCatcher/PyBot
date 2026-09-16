@@ -87,7 +87,13 @@ _HAZARD_CLEAR_MAP = {
     "defog": (1.0, 1.0),
     "courtchange": (1.0, 1.0),
 }
-_PHAZE_MOVES = {"roar","whirlwind","dragontail","circlethrow","yawn"}  # yawn not phaze but force switch later
+_KEY_ABILITIES = [
+    "intimidate","unaware","magicbounce","regenerator","protean","libero",
+    "sheerforce","contrary","speedboost","levitate","flashfire","voltabsorb",
+    "waterabsorb","stormdrain","sapsipper","prankster","guts","chlorophyll","swiftswim","sandrush"
+]
+_ABILITY_INDEX = {a:i for i,a in enumerate(_KEY_ABILITIES)}
+_PHAZE_MOVES = {"roar","whirlwind","dragontail","circlethrow","yawn"}
 _SCREEN_SIDE = [SideCondition.REFLECT, SideCondition.LIGHT_SCREEN, SideCondition.AURORA_VEIL]
 
 def _revealed_moves_frac(pokemon) -> float:
@@ -457,6 +463,71 @@ def _move_phaze_flag(move) -> float:
         pass
     return 0.0
 
+def _ability_vec(pokemon) -> np.ndarray:
+    vec = np.zeros(len(_KEY_ABILITIES), dtype=np.float32)
+    if pokemon is None:
+        return vec
+    try:
+        ab = getattr(pokemon, "ability", None)
+        if ab:
+            ab = str(ab).lower().replace(" ", "").replace("-", "")
+            if ab in _ABILITY_INDEX:
+                vec[_ABILITY_INDEX[ab]] = 1.0
+    except Exception:
+        pass
+    return vec
+
+def _move_type_scalar(move) -> float:
+    if move is None:
+        return 0.0
+    try:
+        mtype = getattr(move, "type", None)
+        if mtype is not None and mtype in _TYPE_INDEX:
+            return float(_TYPE_INDEX[mtype] / max(1, len(_TYPE_LIST)-1))
+        entry = getattr(move, "entry", {}) or {}
+        tname = entry.get("type", "")
+        if tname:
+            try:
+                cand = PokemonType.from_name(tname)
+                if cand in _TYPE_INDEX:
+                    return float(_TYPE_INDEX[cand] / max(1, len(_TYPE_LIST)-1))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return 0.0
+
+def _move_category_vec(move) -> np.ndarray:
+    vec = np.zeros(3, dtype=np.float32)  # PHYS, SPECIAL, STATUS
+    if move is None:
+        return vec
+    try:
+        cat = getattr(move, "category", None)
+        if cat is not None:
+            n = getattr(cat, "name", str(cat)).upper()
+            if n == "PHYSICAL":
+                vec[0]=1.0
+            elif n == "SPECIAL":
+                vec[1]=1.0
+            elif n == "STATUS":
+                vec[2]=1.0
+            return vec
+        entry = getattr(move, "entry", {}) or {}
+        c = entry.get("category", "").upper()
+        if c == "PHYSICAL":
+            vec[0]=1.0
+        elif c == "SPECIAL":
+            vec[1]=1.0
+        elif c == "STATUS":
+            vec[2]=1.0
+    except Exception:
+        pass
+    return vec
+
+def _boosts_vec(boosts: dict) -> np.ndarray:
+    keys = ["atk", "def", "spa", "spd", "spe", "accuracy", "evasion"]
+    return np.array([boosts.get(k, 0) / 6.0 for k in keys], dtype=np.float32)
+
 def _move_contact_flag(move) -> float:
     if move is None:
         return 0.0
@@ -758,11 +829,6 @@ def _volatile_vec(pokemon) -> np.ndarray:
     return np.array([1.0 if v in pokemon.effects else 0.0 for v in _VOLATILES], dtype=np.float32)
 
 
-def _boosts_vec(boosts: dict) -> np.ndarray:
-    keys = ["atk", "def", "spa", "spd", "spe"]
-    return np.array([boosts.get(k, 0) / 6.0 for k in keys], dtype=np.float32)
-
-
 def _item_vec(pokemon) -> np.ndarray:
     if pokemon is None or not pokemon.item:
         return np.zeros(len(_KEY_ITEMS) + 1, dtype=np.float32)
@@ -865,6 +931,8 @@ def embed_battle_with_fusion(battle, our_fusion, opp_fusion, our_protected_last_
     moves_contact = np.zeros(4, dtype=np.float32)
     moves_sound = np.zeros(4, dtype=np.float32)
     moves_multihit = np.zeros(4, dtype=np.float32)
+    moves_type = np.zeros(4, dtype=np.float32)
+    moves_category = np.zeros((4, 3), dtype=np.float32)
     type_chart = GenData.from_gen(battle.gen).type_chart
 
     for i, move in enumerate(battle.available_moves):
@@ -899,6 +967,8 @@ def embed_battle_with_fusion(battle, our_fusion, opp_fusion, our_protected_last_
         moves_contact[i] = _move_contact_flag(move)
         moves_sound[i] = _move_sound_flag(move)
         moves_multihit[i] = _move_multihit_flag(move)
+        moves_type[i] = _move_type_scalar(move)
+        moves_category[i] = _move_category_vec(move)
 
     fainted_mon_team = len([mon for mon in battle.team.values() if mon.fainted]) / 6
     fainted_mon_opponent = len([mon for mon in battle.opponent_team.values() if mon.fainted]) / 6
@@ -956,17 +1026,21 @@ def embed_battle_with_fusion(battle, our_fusion, opp_fusion, our_protected_last_
     opp_screens = _screens_vec(battle.opponent_side_conditions)
     our_actual_stats = _actual_stats_vec(battle.active_pokemon, our_fusion)
     opp_actual_stats = _actual_stats_vec(battle.opponent_active_pokemon, opp_fusion)
+    our_ability = _ability_vec(battle.active_pokemon)
+    opp_ability = _ability_vec(battle.opponent_active_pokemon)
     moves_boost_own_flat = moves_boost_own.flatten()
     moves_drop_opp_flat = moves_drop_opp.flatten()
     moves_hazard_clear_flat = moves_hazard_clear.flatten()
+    moves_category_flat = moves_category.flatten()
     obs = np.concatenate(
         [
             moves_base_power, moves_dmg_multiplier, moves_wasted, moves_accuracy, moves_pp_frac,
             moves_boost_own_flat, moves_drop_opp_flat, moves_hazard_clear_flat, moves_heal, moves_status_prob,
             moves_priority, moves_stab, moves_recoil, moves_phaze, moves_contact, moves_sound, moves_multihit,
+            moves_type, moves_category_flat,
             [fainted_mon_team, fainted_mon_opponent, our_hp, opp_hp],
             our_status, opp_status, our_hazards, opp_hazards, our_switches, opp_switches,
-            our_boosts, opp_boosts, our_actual_stats, opp_actual_stats, weather_vec, field_vec,
+            our_boosts, opp_boosts, our_actual_stats, opp_actual_stats, our_ability, opp_ability, weather_vec, field_vec,
             [trick_room, our_tailwind, opp_tailwind], our_screens, opp_screens,
             [speed_advantage],
             [our_revealed, opp_revealed],
