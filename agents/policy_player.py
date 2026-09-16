@@ -176,11 +176,23 @@ def run(
     # опциональный прогрев value-сети после BC (лечит -3 -> -29 просадку из-за random value)
     warmup_remaining = value_warmup_steps
     if warmup_remaining and resume_from:
-        print(f"Включен value warmup {warmup_remaining} шагов: замораживаю policy-сеть, учу только value")
-        # замораживаем policy-голову
-        ppo.policy.action_net.requires_grad_(False)
+        print(f"Включен value warmup {warmup_remaining} шагов: замораживаю policy+extractor, учу только value")
+        # Замораживаем ВСЁ кроме value-головы, иначе shared FeaturesExtractor поедет от value loss
+        # и policy деградирует даже с замороженным action_net (было 31% -> 13% после 50k warmup)
+        for p in ppo.policy.parameters():
+            p.requires_grad = False
+        # размораживаем только value-часть
+        for p in ppo.policy.value_net.parameters():
+            p.requires_grad = True
         try:
-            ppo.policy.mlp_extractor.policy_net.requires_grad_(False)
+            for p in ppo.policy.mlp_extractor.value_net.parameters():
+                p.requires_grad = True
+        except Exception:
+            pass
+        # альтернативный путь для старых SB3 где mlp_extractor хранит value_net как список
+        try:
+            # на всякий: если extractor - Sequential, просто оставляем value_net выше
+            pass
         except Exception:
             pass
 
@@ -194,17 +206,16 @@ def run(
         if warmup_remaining > 0:
             warmup_remaining -= cur_phase
             if warmup_remaining <= 0:
-                print("[warmup] размораживаю policy-сеть")
-                ppo.policy.action_net.requires_grad_(True)
-                try:
-                    ppo.policy.mlp_extractor.policy_net.requires_grad_(True)
-                except Exception:
-                    pass
+                print("[warmup] размораживаю policy+extractor")
+                for p in ppo.policy.parameters():
+                    p.requires_grad = True
                 # сбрасываем оптимизатор чтобы не тянуть моменты с warmup'а
                 try:
                     ppo.policy.optimizer.state.clear()
                 except Exception:
                     pass
+                # также сбрасываем clip/n_epochs к нормальным после warmup если были занижены
+                # оставляем как есть - пользователь уже задал 0.1/3
 
         ppo.save(f"{SELF_PLAY_PATH}_{counter}")
 
