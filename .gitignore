@@ -2,6 +2,9 @@
 !agents/config.py
 tb_logs
 venv
+# heuristic raw cache (перегенерация датасета без боёв при смене N_FEATURES)
+models/heuristic_raw_cache.pkl
+models/replay_cache/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

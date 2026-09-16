@@ -55,11 +55,15 @@ class PolicyPlayer(FusionInfoParser, Player):
 
 
 class HeuristicRecorder(FusionInfoParser, SimpleHeuristicsPlayer):
-    """Играет как SimpleHeuristicsPlayer, попутно записывая (obs, mask, action) для BC."""
+    """Играет как SimpleHeuristicsPlayer, попутно записывая (obs, mask, action) для BC.
+    Также сохраняет сырые снапшоты битв для кэша: raw_dataset = (battle_copy, mask, action, tag, fusion, protect)
+    чтобы при смене N_FEATURES пересобирать датасет без новых боёв.
+    """
 
-    def __init__(self, *args, dataset: list, **kwargs):
+    def __init__(self, *args, dataset: list, raw_dataset: list | None = None, **kwargs):
         super().__init__(*args, **kwargs)
         self.dataset = dataset
+        self.raw_dataset = raw_dataset if raw_dataset is not None else []
 
     def choose_move(self, battle: AbstractBattle):
         order = super().choose_move(battle)
@@ -70,18 +74,23 @@ class HeuristicRecorder(FusionInfoParser, SimpleHeuristicsPlayer):
             opp_fusion = self.get_fusion_entry(battle, is_ours=False)
             our_protect = self.get_protected_last_turn(battle, is_ours=True)
             opp_protect = self.get_protected_last_turn(battle, is_ours=False)
-            obs = embed_battle_with_fusion(
-                battle, our_fusion, opp_fusion,
-                our_protected_last_turn=our_protect,
-                opp_protected_last_turn=opp_protect,
-            )
             mask = np.array(SinglesEnv.get_action_mask(battle))
-            # order_to_action может бросить если order невалиден (например Forfeit)
             action = SinglesEnv.order_to_action(order, battle, fake=False, strict=False)
-            # action может быть -1/-2 (forfeit/default) — такие переходы не учим
             if action is not None and action >= 0:
+                # сырой кэш: deepcopy battle для последующей перегенерации obs при смене признаков
+                try:
+                    import copy
+                    battle_copy = copy.deepcopy(battle)
+                except Exception:
+                    battle_copy = battle  # fallback: shallow (лучше чем ничего)
+                self.raw_dataset.append((battle_copy, mask, action, battle.battle_tag, our_fusion, opp_fusion, our_protect, opp_protect))
+                # сразу считаем obs для текущей сессии (чтобы не пересчитывать)
+                obs = embed_battle_with_fusion(
+                    battle, our_fusion, opp_fusion,
+                    our_protected_last_turn=our_protect,
+                    opp_protected_last_turn=opp_protect,
+                )
                 self.dataset.append((obs, mask, action, battle.battle_tag))
         except Exception as e:
-            # не падаем из-за одного битого перехода
             pass
         return order

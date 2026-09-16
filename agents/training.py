@@ -87,12 +87,40 @@ def load_dataset(path: str) -> list:
     return dataset
 
 def collect_or_load_dataset(n_battles: int, path: str, force_recollect: bool = False) -> list:
+    # если датасет есть и размерность совпадает — грузим, иначе пробуем пересобрать из сырого кэша без боёв
     if os.path.exists(path) and not force_recollect:
         try:
-            return load_dataset(path)
+            data = np.load(path)
+            obs_dim = data["obs"].shape[1] if "obs" in data else None
+            from .config import N_FEATURES
+            if obs_dim is not None and obs_dim != N_FEATURES:
+                print(f"Датасет {path} dim {obs_dim} != N_FEATURES {N_FEATURES} — пересобираю из сырого кэша без новых боёв")
+                # пробуем пересобрать из сырого кэша
+                try:
+                    raw_cached, battles_cached = _load_heuristic_raw_cache()
+                    if raw_cached is not None and len(battles_cached) >= n_battles:
+                        recomputed = _recompute_dataset_from_raw(raw_cached, battles_cached)
+                        # фильтруем до n_battles
+                        from collections import defaultdict
+                        grouped = defaultdict(list)
+                        for obs, mask, action, tag in recomputed:
+                            grouped[tag].append((obs, mask, action))
+                        tags = list(grouped.keys())[:n_battles]
+                        filtered = []
+                        for tag in tags:
+                            for obs, mask, action in grouped[tag]:
+                                filtered.append((obs, mask, action, tag))
+                        filtered_battles = {tag: battles_cached[tag] for tag in tags if tag in battles_cached}
+                        dataset = _compute_bc_returns(filtered, filtered_battles)
+                        save_dataset(dataset, path)
+                        return dataset
+                except Exception as e:
+                    print(f"Пересбор из кэша не удался: {e}, пересобираю боями...")
+            else:
+                return load_dataset(path)
         except Exception as e:
             print(f"Не удалось загрузить датасет {path}: {e}, пересобираю...")
-    dataset = collect_heuristic_dataset(n_battles=n_battles)
+    dataset = collect_heuristic_dataset(n_battles=n_battles, force_recollect=force_recollect)
     save_dataset(dataset, path)
     return dataset
 
@@ -133,12 +161,111 @@ def _compute_bc_returns(raw_dataset: list, battles: dict, gamma: float = 0.99, v
             final.append((obs, mask, action, ret))
     return final
 
-def collect_heuristic_dataset(n_battles: int = 200) -> list:
+HEURISTIC_RAW_CACHE = "models/heuristic_raw_cache.pkl"
+
+def _save_heuristic_raw_cache(raw_dataset: list, battles: dict, n_battles: int):
+    try:
+        import pickle
+        os.makedirs(os.path.dirname(HEURISTIC_RAW_CACHE), exist_ok=True)
+        with open(HEURISTIC_RAW_CACHE, "wb") as f:
+            pickle.dump({"raw_dataset": raw_dataset, "battles": battles, "n_battles": n_battles}, f, protocol=pickle.HIGHEST_PROTOCOL)
+        print(f"Сырой кэш эвристики сохранён: {HEURISTIC_RAW_CACHE} ({len(raw_dataset)} переходов, {len(battles)} боёв)")
+    except Exception as e:
+        print(f"Не удалось сохранить сырой кэш: {e}")
+
+def _load_heuristic_raw_cache():
+    try:
+        import pickle
+        if not os.path.exists(HEURISTIC_RAW_CACHE):
+            return None, None
+        with open(HEURISTIC_RAW_CACHE, "rb") as f:
+            data = pickle.load(f)
+        return data.get("raw_dataset"), data.get("battles")
+    except Exception as e:
+        print(f"Не удалось загрузить сырой кэш: {e}")
+        return None, None
+
+def _recompute_dataset_from_raw(raw_dataset: list, battles: dict) -> list:
+    """Пересобирает (obs, mask, action, tag) из сырого кэша с текущими признаками (N_FEATURES)."""
+    from .features import embed_battle_with_fusion
+    recomputed = []
+    for entry in raw_dataset:
+        # raw_dataset entries: (battle_copy, mask, action, tag, our_fusion, opp_fusion, our_protect, opp_protect)
+        if len(entry) == 8:
+            battle_copy, mask, action, tag, our_fusion, opp_fusion, our_protect, opp_protect = entry
+        elif len(entry) == 4:
+            # старый кэш без raw (только obs) — не можем пересчитать, пропускаем
+            continue
+        else:
+            continue
+        try:
+            obs = embed_battle_with_fusion(battle_copy, our_fusion, opp_fusion, our_protected_last_turn=our_protect, opp_protected_last_turn=opp_protect)
+            recomputed.append((obs, mask, action, tag))
+        except Exception as e:
+            continue
+    return recomputed
+
+def collect_heuristic_dataset(n_battles: int = 200, force_recollect: bool = False, use_cache: bool = True) -> list:
+    # 1) пробуем взять из сырого кэша (пересчёт без новых боёв при смене признаков)
+    if use_cache and not force_recollect:
+        raw_cached, battles_cached = _load_heuristic_raw_cache()
+        if raw_cached is not None and battles_cached is not None:
+            # сколько боёв в кэше?
+            n_cached_battles = len(battles_cached)
+            if n_cached_battles >= n_battles:
+                print(f"Кэш хит: {n_cached_battles} боёв в {HEURISTIC_RAW_CACHE} >= {n_battles} запрошено — пересобираю obs без новых боёв")
+                recomputed = _recompute_dataset_from_raw(raw_cached, battles_cached)
+                # обрезаем до n_battles по тегам (группируем по tag, берём первые n_battles тегов)
+                from collections import defaultdict
+                grouped = defaultdict(list)
+                for obs, mask, action, tag in recomputed:
+                    grouped[tag].append((obs, mask, action))
+                # берём первые n_battles тегов
+                tags = list(grouped.keys())[:n_battles]
+                filtered_recomputed = []
+                for tag in tags:
+                    for obs, mask, action in grouped[tag]:
+                        filtered_recomputed.append((obs, mask, action, tag))
+                # battles для return тоже фильтруем
+                filtered_battles = {tag: battles_cached[tag] for tag in tags if tag in battles_cached}
+                final_dataset = _compute_bc_returns(filtered_recomputed, filtered_battles)
+                print(f"Собрано {len(final_dataset)} примеров (с return) из кэша {n_battles} боёв, исходно {len(filtered_recomputed)} переходов (без новых боёв)")
+                if len(final_dataset) > 0:
+                    return final_dataset
+                print("Кэш дал 0 примеров, пересобираю боями...")
+            else:
+                print(f"Кэш: {n_cached_battles}/{n_battles} боёв — доберу {n_battles - n_cached_battles} новых боёв")
+                # доберём недостающие бои и объединим
+                dataset: list = []
+                raw_dataset: list = []
+                recorder = HeuristicRecorder(dataset=dataset, raw_dataset=raw_dataset, battle_format=BATTLE_FORMAT, max_concurrent_battles=10)
+                opponent = SimpleHeuristicsPlayer(battle_format=BATTLE_FORMAT, max_concurrent_battles=10)
+                need = n_battles - n_cached_battles
+                asyncio.run(recorder.battle_against(opponent, n_battles=need))
+                battles_new = getattr(recorder, "battles", None) or getattr(recorder, "_battles", {})
+                # recomputed старые
+                recomputed = _recompute_dataset_from_raw(raw_cached, battles_cached)
+                # новые уже с obs
+                # объединяем raw
+                combined_raw = raw_cached + raw_dataset
+                combined_battles = {**battles_cached, **battles_new}
+                # сохраняем обновлённый кэш
+                _save_heuristic_raw_cache(combined_raw, combined_battles, n_battles)
+                # пересобираем финальный датасет из всех raw (чтобы obs были консистентны с новыми признаками)
+                all_recomputed = _recompute_dataset_from_raw(combined_raw, combined_battles)
+                final_dataset = _compute_bc_returns(all_recomputed, combined_battles)
+                print(f"Собрано {len(final_dataset)} примеров (с return) из {n_battles} боёв (кэш+добор), исходно {len(all_recomputed)} переходов")
+                return final_dataset
+    # 2) обычный путь: новые бои
     dataset: list = []
-    recorder = HeuristicRecorder(dataset=dataset, battle_format=BATTLE_FORMAT, max_concurrent_battles=10)
+    raw_dataset: list = []
+    recorder = HeuristicRecorder(dataset=dataset, raw_dataset=raw_dataset, battle_format=BATTLE_FORMAT, max_concurrent_battles=10)
     opponent = SimpleHeuristicsPlayer(battle_format=BATTLE_FORMAT, max_concurrent_battles=10)
     asyncio.run(recorder.battle_against(opponent, n_battles=n_battles))
     battles = getattr(recorder, "battles", None) or getattr(recorder, "_battles", {})
+    # сохраняем сырой кэш
+    if use_cache:
+        _save_heuristic_raw_cache(raw_dataset, battles, n_battles)
     final_dataset = _compute_bc_returns(dataset, battles)
     print(f"Собрано {len(final_dataset)} примеров (с return) из {n_battles} боёв, исходно {len(dataset)} переходов")
     if len(final_dataset) == 0 and len(dataset) > 0:
