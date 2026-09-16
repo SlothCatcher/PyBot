@@ -78,6 +78,15 @@ _TYPE_LIST = sorted(
 _TYPE_INDEX = {t: i for i, t in enumerate(_TYPE_LIST)}
 
 MAX_RESERVES = 5  # 6 покемонов в команде минус 1 активный
+_BOOST_KEYS = ["atk", "def", "spa", "spd", "spe"]
+# hazard clear: [own, opp]
+_HAZARD_CLEAR_MAP = {
+    "rapidspin": (1.0, 0.0),
+    "mortalspin": (1.0, 0.0),
+    "tidyup": (1.0, 0.0),
+    "defog": (1.0, 1.0),
+    "courtchange": (1.0, 1.0),
+}
 
 def _revealed_moves_frac(pokemon) -> float:
     if pokemon is None:
@@ -94,16 +103,13 @@ def _substitute_damaged(pokemon) -> float:
     """0.0 без куклы; >0 если Substitute стоит. 1.0 ~ 25 HP куклы, 0.5 если точное HP неизвестно."""
     if pokemon is None:
         return 0.0
-    # poke_env хранит Effect.SUBSTITUTE в pokemon.effects; значение может быть bool/int
     if Effect.SUBSTITUTE not in pokemon.effects:
-        # fallback: некоторые версии могут хранить как строку 'substitute' в effects
         try:
             if not any(getattr(k, "name", str(k)).lower() == "substitute" for k in pokemon.effects.keys()):
                 return 0.0
         except Exception:
             return 0.0
     value = pokemon.effects.get(Effect.SUBSTITUTE, None)
-    # если ключ был строковым, пробуем достать иначе
     if value is None:
         for k, v in list(pokemon.effects.items()):
             if getattr(k, "name", str(k)).lower() == "substitute":
@@ -113,30 +119,24 @@ def _substitute_damaged(pokemon) -> float:
         return min(float(value) / 25.0, 1.0)
     if value is True:
         return 0.5
-    # кукла стоит, но точное состояние неизвестно — нейтральное значение вместо 0/1
-    # Effect.SUBSTITUTE in effects но value == 0/None -> всё равно кукла есть
     return 0.5
 
 def _is_semi_invuln_or_charging(pokemon) -> float:
     if pokemon is None:
         return 0.0
-    # основной путь: через Effect enum (из тех что существуют: PHANTOM_FORCE/SHADOW_FORCE/SKY_DROP)
     if any(e in pokemon.effects for e in _SEMI_INVULN_CHARGE_EFFECTS):
         return 1.0
-    # fallback1: preparing (двухходовые: Solar Beam, Fly на зарядке и т.п.) — poke_env кладёт в _preparing_move
     try:
         prep = getattr(pokemon, "_preparing_move", None) or getattr(pokemon, "preparing_move", None)
         if prep is not None:
             return 1.0
     except Exception:
         pass
-    # fallback2: проверка имени эффекта как строки (если будущая версия poke_env добавит FLY/DIG и т.п.)
     try:
         for eff in pokemon.effects.keys():
             n = getattr(eff, "name", str(eff))
             if n in _SEMI_INVULN_CHARGE_NAMES:
                 return 1.0
-            # также вариант lower без подчёркиваний
             n2 = n.replace("_", "").lower()
             if any(x.replace("_", "").lower() == n2 for x in _SEMI_INVULN_CHARGE_NAMES):
                 return 1.0
@@ -154,20 +154,17 @@ def _type_multi_hot(pokemon) -> np.ndarray:
     return vec
 
 def _tera_type_vec(pokemon) -> np.ndarray:
-    """One-hot тера-типа покемона. Чиним DEAD: poke_env 0.8.x не заполняет tera_type из request,
-    поэтому пробуем несколько источников (teambuilder, _terastallized_type, _last_details/request)."""
+    """One-hot тера-типа покемона."""
     vec = np.zeros(len(_TYPE_LIST), dtype=np.float32)
     if pokemon is None:
         return vec
     tera_type = None
-    # 1) основной путь — pokemon.tera_type ( == _terastallized_type, заполняется для teambuilder и после terastallize)
     try:
         v = getattr(pokemon, "tera_type", None)
         if isinstance(v, PokemonType) and v in _TYPE_INDEX:
             tera_type = v
     except Exception:
         pass
-    # 2) прямое поле _terastallized_type (на случай если property переопределят)
     if tera_type is None:
         try:
             v = getattr(pokemon, "_terastallized_type", None)
@@ -175,7 +172,6 @@ def _tera_type_vec(pokemon) -> np.ndarray:
                 tera_type = v
         except Exception:
             pass
-    # 3) _last_details строка с 'tera:' (Showdown details: 'Pikachu, L83, tera:Flying' или 'super:tera:Flying')
     if tera_type is None:
         try:
             details = getattr(pokemon, "_last_details", None) or getattr(pokemon, "_details", None) or getattr(pokemon, "details", None)
@@ -190,7 +186,6 @@ def _tera_type_vec(pokemon) -> np.ndarray:
                         pass
         except Exception:
             pass
-    # 4) _last_request dict с полем 'teraType' (gen9 request) или 'details' с tera
     if tera_type is None:
         try:
             req = getattr(pokemon, "_last_request", None)
@@ -202,7 +197,6 @@ def _tera_type_vec(pokemon) -> np.ndarray:
                             tera_type = cand
                     except Exception:
                         pass
-                # некоторые серверы кладут tera в details внутри request
                 d = req.get("details", "")
                 if isinstance(d, str) and "tera:" in d.lower():
                     m = re.search(r"tera:\s*([A-Za-z]+)", d, re.IGNORECASE)
@@ -226,30 +220,309 @@ def _is_terastallized(pokemon) -> float:
 
 
 def _can_tera_now(battle) -> float:
-    """Доступна ли терастализация прямо сейчас как опция хода (только для своей стороны — poke-env не палит доступность у оппонента)."""
     can_tera = getattr(battle, "can_tera", None)
     return 1.0 if can_tera else 0.0
 
 def _team_used_tera(team: dict) -> float:
-    """Использовал ли кто-либо в команде терастал за весь бой (тера остаётся на моне даже после свитча)."""
     return 1.0 if any(getattr(mon, "is_terastallized", False) for mon in team.values()) else 0.0
 
-_RESERVE_SLOT_SIZE = len(_TYPE_LIST) + 1 + len(_STATUSES)  # типы + HP + статус
+# ---------------- Новые хелперы для флагов приёмов ----------------
+
+def _move_boost_flags(move, kind: str = "own") -> np.ndarray:
+    """5 флагов atk/def/spa/spd/spe: 1 если мув бустит свой (kind=own) или дропает чужой (kind=opp)."""
+    vec = np.zeros(5, dtype=np.float32)
+    if move is None:
+        return vec
+    try:
+        boosts = None
+        self_boost = None
+        entry = getattr(move, "entry", None)
+        # poke-env properties
+        try:
+            boosts = move.boosts  # target boosts
+        except Exception:
+            boosts = None
+        try:
+            self_boost = move.self_boost
+        except Exception:
+            self_boost = None
+        # fallback to entry dict
+        if entry is not None:
+            if boosts is None:
+                boosts = entry.get("boosts")
+            if self_boost is None:
+                # self может быть в entry["self"] или entry["selfBoost"]
+                if "self" in entry and isinstance(entry["self"], dict):
+                    self_boost = entry["self"].get("boosts")
+                if self_boost is None and "selfBoost" in entry:
+                    self_boost = entry["selfBoost"].get("boosts") if isinstance(entry["selfBoost"], dict) else entry["selfBoost"]
+            # also check secondaries for boost flags
+            sec_boosts = []
+            for sec in getattr(move, "secondary", []) or []:
+                if isinstance(sec, dict):
+                    if "boosts" in sec:
+                        # need to distinguish self vs opp — if sec has "self" key, it's self
+                        if "self" in sec and isinstance(sec["self"], dict) and "boosts" in sec["self"]:
+                            sec_boosts.append(("own", sec["self"]["boosts"]))
+                        else:
+                            sec_boosts.append(("opp", sec["boosts"]))
+                    if "self" in sec and isinstance(sec["self"], dict) and "boosts" in sec["self"] and "boosts" not in sec:
+                        # already handled
+                        pass
+            # merge secondary opp boosts into boosts for opp detection
+            # for own we also check sec_boosts own
+            if kind == "own":
+                # self_boost + secondary self
+                candidates = []
+                if self_boost:
+                    candidates.append(self_boost)
+                for k, b in sec_boosts:
+                    if k == "own":
+                        candidates.append(b)
+                for b in candidates:
+                    if not isinstance(b, dict):
+                        continue
+                    for i, key in enumerate(_BOOST_KEYS):
+                        if b.get(key, 0) > 0:
+                            vec[i] = 1.0
+            else:  # opp
+                candidates = []
+                if boosts:
+                    candidates.append(boosts)
+                for k, b in sec_boosts:
+                    if k == "opp":
+                        candidates.append(b)
+                # also check entry secondaries directly if secondary property empty
+                if not candidates and entry is not None:
+                    for sec in entry.get("secondaries", []) or []:
+                        if "boosts" in sec and isinstance(sec["boosts"], dict):
+                            # assume opp if no self wrapper
+                            if "self" not in sec:
+                                candidates.append(sec["boosts"])
+                for b in candidates:
+                    if not isinstance(b, dict):
+                        continue
+                    for i, key in enumerate(_BOOST_KEYS):
+                        if b.get(key, 0) < 0:
+                            vec[i] = 1.0
+        else:
+            # no entry, use what we have
+            if kind == "own" and self_boost:
+                for i, key in enumerate(_BOOST_KEYS):
+                    if self_boost.get(key, 0) > 0:
+                        vec[i] = 1.0
+            if kind == "opp" and boosts:
+                for i, key in enumerate(_BOOST_KEYS):
+                    if boosts.get(key, 0) < 0:
+                        vec[i] = 1.0
+    except Exception:
+        pass
+    return vec
+
+def _move_hazard_clear_flags(move) -> np.ndarray:
+    vec = np.zeros(2, dtype=np.float32)  # [own, opp]
+    if move is None:
+        return vec
+    try:
+        mid = getattr(move, "id", "") or getattr(move, "_id", "")
+        mid = mid.lower().replace(" ", "").replace("-", "")
+        if mid in _HAZARD_CLEAR_MAP:
+            vec[0], vec[1] = _HAZARD_CLEAR_MAP[mid]
+    except Exception:
+        pass
+    return vec
+
+def _move_heal_pct(move) -> float:
+    if move is None:
+        return 0.0
+    try:
+        # poke-env Move.heal is 0..1
+        h = getattr(move, "heal", 0.0)
+        if isinstance(h, (int, float)) and h > 0:
+            return float(np.clip(h, 0, 1))
+        # also check drain
+        d = getattr(move, "drain", 0.0)
+        if isinstance(d, (int, float)) and d > 0:
+            # drain 0.5 = 50% of damage, treat as heal flag
+            return float(np.clip(d, 0, 1))
+        # fallback to entry
+        entry = getattr(move, "entry", {}) or {}
+        if "heal" in entry:
+            heal = entry["heal"]
+            if isinstance(heal, (list, tuple)) and len(heal) == 2:
+                return float(heal[0] / heal[1]) if heal[1] else 0.0
+            if isinstance(heal, (int, float)):
+                return float(heal)
+        if "drain" in entry:
+            drain = entry["drain"]
+            if isinstance(drain, (list, tuple)) and len(drain) == 2:
+                return float(drain[0] / drain[1]) if drain[1] else 0.0
+    except Exception:
+        pass
+    return 0.0
+
+def _move_status_prob(move) -> float:
+    if move is None:
+        return 0.0
+    try:
+        # direct status
+        status = getattr(move, "status", None)
+        if status is not None:
+            return 1.0
+        # check entry for status without chance
+        entry = getattr(move, "entry", {}) or {}
+        if "status" in entry and entry["status"]:
+            return 1.0
+        # secondary status
+        max_prob = 0.0
+        for sec in getattr(move, "secondary", []) or []:
+            if not isinstance(sec, dict):
+                continue
+            if "status" in sec:
+                # chance may be in sec["chance"] else 100
+                chance = sec.get("chance", 100)
+                try:
+                    prob = float(chance) / 100.0 if chance > 1 else float(chance)
+                except Exception:
+                    prob = 1.0
+                max_prob = max(max_prob, prob)
+            # also volatileStatus like confusion etc counts as status-like, but we treat separately; keep 0
+        # also check entry secondaries
+        if max_prob == 0.0 and entry:
+            for sec in entry.get("secondaries", []) or []:
+                if "status" in sec:
+                    chance = sec.get("chance", 100)
+                    try:
+                        prob = float(chance) / 100.0 if chance > 1 else float(chance)
+                    except Exception:
+                        prob = 1.0
+                    max_prob = max(max_prob, prob)
+            # also "secondaries" may have status in nested
+        return float(np.clip(max_prob, 0, 1))
+    except Exception:
+        return 0.0
+
+def _base_stats_vec(mon, fusion_entry: dict | None = None) -> np.ndarray:
+    """6 base stats normalized 0..1 (hp/atk/def/spa/spd/spe /255). Для fusion берём из чата если есть."""
+    vec = np.zeros(6, dtype=np.float32)
+    if mon is None:
+        return vec
+    try:
+        stats = None
+        if fusion_entry and "base_stats" in fusion_entry:
+            stats = fusion_entry["base_stats"]
+        else:
+            stats = getattr(mon, "base_stats", None)
+        if stats is None:
+            return vec
+        # stats may be dict with keys hp,atk,def,spa,spd,spe or at,df etc.
+        # normalize standard poke_env keys
+        keys = ["hp", "atk", "def", "spa", "spd", "spe"]
+        vals = []
+        for k in keys:
+            v = stats.get(k, stats.get(k.upper(), 0))
+            if v is None:
+                v = 0
+            vals.append(float(v) / 255.0)
+        vec = np.array(vals, dtype=np.float32)
+    except Exception:
+        pass
+    return vec
+
+def _weakness_score(mon, opp_active, type_chart) -> float:
+    """0..1: max effectiveness of opp_active vs mon. 1.0 = x1, 2.0->0.5 normalized as (mult-1)/3 capped? We use 1 for弱, 0 for neutral/resist."""
+    if mon is None or opp_active is None:
+        return 0.0
+    atk_types = [t for t in (opp_active.type_1, opp_active.type_2) if t is not None]
+    if not atk_types:
+        return 0.0
+    max_mult = 1.0
+    for atk in atk_types:
+        try:
+            mult = atk.damage_multiplier(mon.type_1, mon.type_2, type_chart=type_chart)
+        except Exception:
+            mult = 1.0
+        max_mult = max(max_mult, mult)
+    # map 1->0, 2->0.5, 4->1
+    if max_mult >= 4:
+        return 1.0
+    if max_mult >= 2:
+        return 0.5 + (max_mult - 2) * 0.25  # 2->0.5, 4->1
+    if max_mult > 1:
+        return (max_mult - 1) * 0.5
+    return 0.0
+
+def _bench_moves_vec(mon, opp_active, type_chart) -> np.ndarray:
+    """5 dims per reserve: [n_revealed/4, avg_bp/100, max_eff/4, has_heal, max_status_prob]"""
+    vec = np.zeros(5, dtype=np.float32)
+    if mon is None or mon.fainted:
+        return vec
+    try:
+        moves = list(getattr(mon, "moves", {}).values())
+        if not moves:
+            return vec
+        n = len(moves)
+        vec[0] = n / 4.0
+        # avg base power
+        bps = [getattr(m, "base_power", 0) or 0 for m in moves]
+        # filter 0 (status moves)
+        if bps:
+            # avg over non-zero? use all
+            vec[1] = float(np.mean([b for b in bps if b > 0]) / 100.0) if any(b > 0 for b in bps) else 0.0
+        # max effectiveness vs opp_active if opp known
+        if opp_active is not None:
+            max_eff = 1.0
+            for m in moves:
+                try:
+                    eff = m.type.damage_multiplier(opp_active.type_1, opp_active.type_2, type_chart=type_chart) if getattr(m, "type", None) else 1.0
+                    max_eff = max(max_eff, eff)
+                except Exception:
+                    pass
+            vec[2] = float(np.clip(max_eff / 4.0, 0, 1))
+        # has_heal
+        has_heal = any(_move_heal_pct(m) > 0 for m in moves)
+        vec[3] = 1.0 if has_heal else 0.0
+        # max status prob
+        max_sp = max([_move_status_prob(m) for m in moves], default=0.0)
+        vec[4] = float(max_sp)
+    except Exception:
+        pass
+    return vec
+
+_RESERVE_SLOT_SIZE = len(_TYPE_LIST) + 1 + len(_STATUSES) + 6 + 1 + 5  # типы + HP + статус + base_stats(6) + weakness(1) + bench_moves(5)
 
 
-def _reserve_slot_vec(mon) -> np.ndarray:
+def _reserve_slot_vec(mon, opp_active=None, type_chart=None, fusion_entry: dict | None = None) -> np.ndarray:
     type_vec = _type_multi_hot(mon)
     hp = 0.0 if mon.fainted else mon.current_hp_fraction
     status_vec = _status_one_hot(mon.status)
-    return np.concatenate([type_vec, [hp], status_vec]).astype(np.float32)
+    base_vec = _base_stats_vec(mon, fusion_entry)
+    weak = np.array([_weakness_score(mon, opp_active, type_chart) if opp_active is not None and type_chart is not None else 0.0], dtype=np.float32)
+    moves_vec = _bench_moves_vec(mon, opp_active, type_chart)
+    return np.concatenate([type_vec, [hp], status_vec, base_vec, weak, moves_vec]).astype(np.float32)
 
 
-def _bench_vec(team: dict) -> np.ndarray:
+def _bench_vec(team: dict, opp_active=None, type_chart=None, fusion_map: dict | None = None) -> np.ndarray:
     reserves = [mon for mon in team.values() if not mon.active]
     slots = []
     for i in range(MAX_RESERVES):
         if i < len(reserves):
-            slots.append(_reserve_slot_vec(reserves[i]))
+            mon = reserves[i]
+            # fusion entry per mon if available (key by species id)
+            f_entry = None
+            if fusion_map:
+                # try species id
+                try:
+                    from poke_env.data.normalize import to_id_str
+                    sid = to_id_str(getattr(mon, "species", "") or getattr(mon, "base_species", ""))
+                    f_entry = fusion_map.get(sid)
+                    if f_entry is None:
+                        # try base_species
+                        sid2 = to_id_str(getattr(mon, "base_species", ""))
+                        f_entry = fusion_map.get(sid2)
+                except Exception:
+                    pass
+            slots.append(_reserve_slot_vec(mon, opp_active, type_chart, f_entry))
         else:
             slots.append(np.zeros(_RESERVE_SLOT_SIZE, dtype=np.float32))
     return np.concatenate(slots)
@@ -264,7 +537,6 @@ def _vulnerability_frac(reserves: list, opponent_active, type_chart) -> float:
     atk_types = [t for t in (opponent_active.type_1, opponent_active.type_2) if t is not None]
     if not atk_types:
         return 0.0
-
     vulnerable = 0
     for mon in alive:
         max_mult = 1.0
@@ -384,7 +656,7 @@ def _move_wasted_flag(move, battle) -> float:
     return 0.0
 
 
-def embed_battle_with_fusion(battle, our_fusion, opp_fusion, our_protected_last_turn=0.0, opp_protected_last_turn=0.0):
+def embed_battle_with_fusion(battle, our_fusion, opp_fusion, our_protected_last_turn=0.0, opp_protected_last_turn=0.0, our_team_fusions: dict | None = None, opp_team_fusions: dict | None = None):
     from poke_env.data import GenData
 
     moves_base_power = -np.ones(4)
@@ -392,6 +664,12 @@ def embed_battle_with_fusion(battle, our_fusion, opp_fusion, our_protected_last_
     moves_wasted = np.zeros(4, dtype=np.float32)
     moves_accuracy = np.ones(4, dtype=np.float32)
     moves_pp_frac = np.ones(4, dtype=np.float32)
+    # новые флаги приёмов
+    moves_boost_own = np.zeros((4, 5), dtype=np.float32)
+    moves_drop_opp = np.zeros((4, 5), dtype=np.float32)
+    moves_hazard_clear = np.zeros((4, 2), dtype=np.float32)
+    moves_heal = np.zeros(4, dtype=np.float32)
+    moves_status_prob = np.zeros(4, dtype=np.float32)
     type_chart = GenData.from_gen(battle.gen).type_chart
 
     for i, move in enumerate(battle.available_moves):
@@ -400,7 +678,7 @@ def embed_battle_with_fusion(battle, our_fusion, opp_fusion, our_protected_last_
         if raw_acc is True:
             moves_accuracy[i] = 1.0
         elif raw_acc is None:
-            moves_accuracy[i] = 1.0  # на случай отсутствия данных
+            moves_accuracy[i] = 1.0
         else:
             moves_accuracy[i] = raw_acc / 100.0 if raw_acc > 1.0 else raw_acc
         moves_pp_frac[i] = move.current_pp / max(move.max_pp, 1)
@@ -414,6 +692,12 @@ def embed_battle_with_fusion(battle, our_fusion, opp_fusion, our_protected_last_
                 )
             except KeyError:
                 moves_dmg_multiplier[i] = 1.0
+        # новые флаги
+        moves_boost_own[i] = _move_boost_flags(move, "own")
+        moves_drop_opp[i] = _move_boost_flags(move, "opp")
+        moves_hazard_clear[i] = _move_hazard_clear_flags(move)
+        moves_heal[i] = _move_heal_pct(move)
+        moves_status_prob[i] = _move_status_prob(move)
 
     fainted_mon_team = len([mon for mon in battle.team.values() if mon.fainted]) / 6
     fainted_mon_opponent = len([mon for mon in battle.opponent_team.values() if mon.fainted]) / 6
@@ -455,19 +739,23 @@ def embed_battle_with_fusion(battle, our_fusion, opp_fusion, our_protected_last_
     our_reserves = [mon for mon in battle.team.values() if not mon.active]
     opp_reserves = [mon for mon in battle.opponent_team.values() if not mon.active]
 
-    our_bench = _bench_vec(battle.team)
-    opp_bench = _bench_vec(battle.opponent_team)
+    our_bench = _bench_vec(battle.team, battle.opponent_active_pokemon, type_chart, our_team_fusions)
+    opp_bench = _bench_vec(battle.opponent_team, battle.active_pokemon, type_chart, opp_team_fusions)
 
     our_vulnerability = _vulnerability_frac(our_reserves, battle.opponent_active_pokemon, type_chart)
     opp_vulnerability = _vulnerability_frac(opp_reserves, battle.active_pokemon, type_chart)
-    # --- новое: терастал ---
     our_can_tera_now = _can_tera_now(battle)
     our_used_tera = _team_used_tera(battle.team)
     opp_used_tera = _team_used_tera(battle.opponent_team)
     our_tera_type = _tera_type_vec(battle.active_pokemon)
+    # flatten новые мув-флаги
+    moves_boost_own_flat = moves_boost_own.flatten()
+    moves_drop_opp_flat = moves_drop_opp.flatten()
+    moves_hazard_clear_flat = moves_hazard_clear.flatten()
     obs = np.concatenate(
         [
             moves_base_power, moves_dmg_multiplier, moves_wasted, moves_accuracy, moves_pp_frac,
+            moves_boost_own_flat, moves_drop_opp_flat, moves_hazard_clear_flat, moves_heal, moves_status_prob,
             [fainted_mon_team, fainted_mon_opponent, our_hp, opp_hp],
             our_status, opp_status, our_hazards, opp_hazards, our_switches, opp_switches,
             our_boosts, opp_boosts, weather_vec, field_vec,
@@ -478,10 +766,10 @@ def embed_battle_with_fusion(battle, our_fusion, opp_fusion, our_protected_last_
             [our_restricted],
             our_volatiles, opp_volatiles,
             our_item, opp_item,
-            our_bench, opp_bench,                          # <-- новое, по 5×_RESERVE_SLOT_SIZE на сторону
-            [our_vulnerability, opp_vulnerability],         # <-- новое, 2 скаляра
-            [our_can_tera_now, our_used_tera, opp_used_tera],   # <-- новое, 3 скаляра
-            our_tera_type,                                       # <-- новое, len(_TYPE_LIST)
+            our_bench, opp_bench,
+            [our_vulnerability, opp_vulnerability],
+            [our_can_tera_now, our_used_tera, opp_used_tera],
+            our_tera_type,
             [our_protected_last_turn, opp_protected_last_turn]
         ],
         dtype=np.float32,
