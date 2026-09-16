@@ -129,11 +129,16 @@ def _save_raw_chunk(raw_dataset: list, battles: dict, chunk_idx: int):
 def _save_dataset_chunk(dataset_with_ret: list, chunk_idx: int, tmp_dir: str = HEURISTIC_DATASET_TMP_DIR):
     _ensure_dir(tmp_dir)
     path = os.path.join(tmp_dir, f"dataset_chunk_{chunk_idx:04d}.npz")
-    tmp = path + ".tmp"
+    # np.savez_compressed добавляет .npz если путь не заканчивается на .npz, поэтому используем .tmp.npz
+    tmp = path.replace(".npz", ".tmp.npz") if path.endswith(".npz") else path + ".tmp.npz"
     # dataset_with_ret is list of (obs, mask, action, ret)
     save_dataset(dataset_with_ret, tmp)
-    os.replace(tmp, path)
-    print(f"  Датасет чанк {chunk_idx} сохранён: {path} ({len(dataset_with_ret)} примеров)")
+    # save_dataset мог не создать файл если список пустой
+    if os.path.exists(tmp):
+        os.replace(tmp, path)
+        print(f"  Датасет чанк {chunk_idx} сохранён: {path} ({len(dataset_with_ret)} примеров)")
+    else:
+        print(f"  Датасет чанк {chunk_idx} пустой, пропускаю сохранение")
 
 def _merge_dataset_chunks(chunk_files: list, final_path: str):
     if not chunk_files:
@@ -185,7 +190,11 @@ def _merge_dataset_chunks(chunk_files: list, final_path: str):
         del d
         gc.collect()
     _ensure_dir(os.path.dirname(final_path) or ".")
-    tmp = final_path + ".tmp"
+    # атомарная запись: временный файл должен заканчиваться на .npz чтобы np.savez не добавил суффикс
+    if final_path.endswith(".npz"):
+        tmp = final_path.replace(".npz", ".tmp.npz")
+    else:
+        tmp = final_path + ".tmp.npz"
     if has_ret:
         np.savez_compressed(tmp, obs=obs_arr, mask=mask_arr, action=action_arr, ret=ret_arr)
     else:
