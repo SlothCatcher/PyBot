@@ -40,6 +40,12 @@ def run(
     learning_rate: float = 2e-4,
     contrastive: bool = False,
     neg_weight: float = 0.3,
+    clip_range: float = 0.2,
+    n_epochs: int = 10,
+    batch_size: int = 128,
+    vf_coef: float = 0.5,
+    bc_value_coef: float = 0.0,
+    value_warmup_steps: int = 0,
 ):
     # phase_size должен делиться на n_steps*num_envs = 3072 для ровных роллаутов
     if phase_size % 3072 != 0:
@@ -53,6 +59,13 @@ def run(
         if ent_coef is not None:
             print(f"Переопределяю ent_coef: {ppo.ent_coef} -> {ent_coef}")
             ppo.ent_coef = ent_coef
+        # прокидываем остальные рекомендательные гиперпараметры и на resume
+        for attr, val in [("clip_range", clip_range), ("n_epochs", n_epochs), ("batch_size", batch_size), ("vf_coef", vf_coef)]:
+            if hasattr(ppo, attr):
+                old = getattr(ppo, attr)
+                if old != val:
+                    print(f"Переопределяю {attr}: {old} -> {val}")
+                    setattr(ppo, attr, val)
         # создаём env заново; если был VecNormalize — загружаем
         base_env = SubprocVecEnv([ExampleEnv.create_env for _ in range(num_envs)])
         if not no_normalize_bc:
@@ -76,11 +89,12 @@ def run(
             ent_coef=ent_coef if ent_coef is not None else 0.01,
             learning_rate=learning_rate,
             n_steps=3072 // num_envs,
-            batch_size=128,
-            n_epochs=10,
+            batch_size=batch_size,
+            n_epochs=n_epochs,
             gamma=0.99,
             gae_lambda=0.95,
-            clip_range=0.2,
+            clip_range=clip_range,
+            vf_coef=vf_coef,
             device="cpu",
             tensorboard_log="./tb_logs/",
         )
@@ -103,8 +117,8 @@ def run(
             except Exception as e:
                 print(f"Не удалось загрузить {dataset_path}: {e}")
         if need_bc and dataset is not None:
-            print(f"Претрейн через behavioral cloning (epochs={epochs}, contrastive={contrastive}, neg_weight={neg_weight})...")
-            pretrain_policy_bc(ppo, dataset, epochs=epochs, normalize=not no_normalize_bc, contrastive=contrastive, neg_weight=neg_weight)
+            print(f"Претрейн через behavioral cloning (epochs={epochs}, contrastive={contrastive}, neg_weight={neg_weight}, bc_value_coef={bc_value_coef})...")
+            pretrain_policy_bc(ppo, dataset, epochs=epochs, normalize=not no_normalize_bc, contrastive=contrastive, neg_weight=neg_weight, value_coef=bc_value_coef)
 
     # FIX: SB3 хранит расписание в ppo.lr_schedule (FloatSchedule), а не в learning_rate.
     # Раньше делали ppo.lr_schedule = schedule без обёртки или ppo.learning_rate = schedule —
@@ -153,8 +167,38 @@ def run(
     # для адаптации opponent_weights: запомним последний словарь весов
     current_weights: dict[str, float] | None = None
 
+    # опциональный прогрев value-сети после BC (лечит -3 -> -29 просадку из-за random value)
+    warmup_remaining = value_warmup_steps
+    if warmup_remaining and resume_from:
+        print(f"Включен value warmup {warmup_remaining} шагов: замораживаю policy-сеть, учу только value")
+        # замораживаем policy-голову
+        ppo.policy.action_net.requires_grad_(False)
+        try:
+            ppo.policy.mlp_extractor.policy_net.requires_grad_(False)
+        except Exception:
+            pass
+
     while steps_done_holder["value"] < total_timesteps:
-        ppo.learn(phase_size, callback=counter_callback, reset_num_timesteps=False, tb_log_name=run_name)
+        # если warmup еще не отработан - режем phase_size до warmup_remaining
+        cur_phase = phase_size
+        if warmup_remaining > 0:
+            cur_phase = min(phase_size, warmup_remaining)
+            print(f"[warmup] phase {counter} учим {cur_phase} шагов только value (осталось {warmup_remaining})")
+        ppo.learn(cur_phase, callback=counter_callback, reset_num_timesteps=False, tb_log_name=run_name)
+        if warmup_remaining > 0:
+            warmup_remaining -= cur_phase
+            if warmup_remaining <= 0:
+                print("[warmup] размораживаю policy-сеть")
+                ppo.policy.action_net.requires_grad_(True)
+                try:
+                    ppo.policy.mlp_extractor.policy_net.requires_grad_(True)
+                except Exception:
+                    pass
+                # сбрасываем оптимизатор чтобы не тянуть моменты с warmup'а
+                try:
+                    ppo.policy.optimizer.state.clear()
+                except Exception:
+                    pass
 
         ppo.save(f"{SELF_PLAY_PATH}_{counter}")
 
@@ -276,6 +320,12 @@ if __name__ == "__main__":
     parser.add_argument("--force-recollect", action="store_true", help="Пересобрать датасет заново, игнорируя кэш")
     parser.add_argument("--contrastive", action="store_true", help="Контрастивный BC: отталкиваться от ходов проигравшего (w=-neg_weight)")
     parser.add_argument("--neg-weight", type=float, default=0.3, help="Вес лузер-ходов при --contrastive (0.3 слабее, 1.0 симметрично)")
+    parser.add_argument("--clip-range", type=float, default=0.2, help="PPO clip_range (0.2 по умолчанию, после BC ставить 0.1 чтобы не снести BC)")
+    parser.add_argument("--n-epochs", type=int, default=10, help="PPO n_epochs на один роллаут (10 по умолчанию, после BC ставить 3)")
+    parser.add_argument("--batch-size", type=int, default=128, help="PPO batch_size (128 по умолчанию, после BC ставить 256)")
+    parser.add_argument("--vf-coef", type=float, default=0.5, help="PPO vf_coef вес value loss (0.5 по умолчанию)")
+    parser.add_argument("--bc-value-coef", type=float, default=0.0, help="BC value_coef вес value loss при претреине (0.0 только policy, 0.5 учит и value)")
+    parser.add_argument("--value-warmup-steps", type=int, default=0, help="Сколько шагов после resume учить только value (заморозить policy) чтобы вылечить просадку -3->-29. Рекомендую 50000")
     args = parser.parse_args()
 
     # поддержка алиаса --lr
@@ -297,4 +347,10 @@ if __name__ == "__main__":
         learning_rate=args.learning_rate,
         contrastive=args.contrastive,
         neg_weight=args.neg_weight,
+        clip_range=args.clip_range,
+        n_epochs=args.n_epochs,
+        batch_size=args.batch_size,
+        vf_coef=args.vf_coef,
+        bc_value_coef=args.bc_value_coef,
+        value_warmup_steps=args.value_warmup_steps,
     )
