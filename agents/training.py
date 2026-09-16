@@ -75,14 +75,36 @@ def save_dataset(dataset: list, path: str):
     print(f"Датасет сохранён: {path} ({len(dataset)} примеров)")
 
 def load_dataset(path: str) -> list:
-    data = np.load(path)
+    # Лёгкая обёртка для совместимости — для больших файлов лучше использовать load_dataset_arrays (mmap)
+    data = np.load(path, mmap_mode='r') if os.path.getsize(path) > 500_000_000 else np.load(path)
     if "ret" in data:
+        # для больших файлов не делаем list(zip) — это дублирует память (1.2M туплов ~10GB), возвращаем ленивый вид
+        # но для совместимости со старым кодом пока делаем list только для маленьких файлов
+        if data["obs"].shape[0] > 200_000:
+            print(f"Датасет {path} большой ({data['obs'].shape[0]} примеров), возвращаю mmap-вид (без list) — используйте pretrain_policy_bc с путём")
+            # вернём специальный объект-обёртку, который pretrain поймёт
+            return _DatasetView(data)
         dataset = list(zip(data["obs"], data["mask"], data["action"], data["ret"]))
     else:
         dataset = list(zip(data["obs"], data["mask"], data["action"]))
         print(f"WARNING: датасет {path} без поля ret (старый формат). BC без ret невозможен — нужен пересбор.")
     print(f"Датасет загружен: {path} ({len(dataset)} примеров)")
     return dataset
+
+class _DatasetView:
+    """Лёгкий view на npz без копирования — для больших датасетов, чтобы проверка кэша не ела RAM."""
+    def __init__(self, npz):
+        self.npz = npz
+        self.obs = npz["obs"]
+        self.mask = npz["mask"]
+        self.action = npz["action"]
+        self.ret = npz["ret"] if "ret" in npz else None
+    def __len__(self):
+        return int(self.obs.shape[0])
+    def __getitem__(self, idx):
+        if self.ret is not None:
+            return (self.obs[idx], self.mask[idx], int(self.action[idx]), float(self.ret[idx]))
+        return (self.obs[idx], self.mask[idx], int(self.action[idx]))
 
 # ---------------- Chunked / streaming helpers (fix 61GB swap on 50k) ----------------
 
@@ -361,7 +383,6 @@ def _get_npz_obs_dim(path: str):
     try:
         import zipfile
         with zipfile.ZipFile(path, 'r') as z:
-            # obs хранится как obs.npy внутри zip
             with z.open('obs.npy') as f:
                 version = np.lib.format.read_magic(f)
                 if version == (1, 0):
@@ -369,14 +390,12 @@ def _get_npz_obs_dim(path: str):
                 elif version == (2, 0):
                     shape, fortran, dtype = np.lib.format.read_array_header_2_0(f)
                 else:
-                    # fallback
                     shape, fortran, dtype = np.lib.format.read_array_header_1_0(f)
                 if len(shape) >= 2:
                     return int(shape[1])
                 return None
     except Exception:
         pass
-    # fallback: mmap (не грузит в RAM)
     try:
         data = np.load(path, mmap_mode='r')
         if "obs" in data:
@@ -385,23 +404,78 @@ def _get_npz_obs_dim(path: str):
         pass
     return None
 
+def _get_npz_n_transitions(path: str):
+    """Быстро достаёт количество переходов (shape[0]) без загрузки массива."""
+    try:
+        import zipfile
+        with zipfile.ZipFile(path, 'r') as z:
+            with z.open('obs.npy') as f:
+                version = np.lib.format.read_magic(f)
+                if version == (1, 0):
+                    shape, fortran, dtype = np.lib.format.read_array_header_1_0(f)
+                elif version == (2, 0):
+                    shape, fortran, dtype = np.lib.format.read_array_header_2_0(f)
+                else:
+                    shape, fortran, dtype = np.lib.format.read_array_header_1_0(f)
+                if len(shape) >= 1:
+                    return int(shape[0])
+                return None
+    except Exception:
+        pass
+    try:
+        data = np.load(path, mmap_mode='r')
+        if "obs" in data:
+            return int(data["obs"].shape[0])
+    except Exception:
+        pass
+    return None
+
+def _get_legacy_battle_count_fast() -> int:
+    """Быстро узнаёт количество боёв в legacy pkl без загрузки raw_dataset (через .meta или только battles)."""
+    meta_path = HEURISTIC_RAW_CACHE + ".meta.json"
+    if os.path.exists(meta_path):
+        try:
+            import json
+            with open(meta_path, "r") as f:
+                return int(json.load(f).get("battles", 0))
+        except Exception:
+            pass
+    # fallback: пробуем загрузить только battles без raw_dataset через pickle streaming
+    # pickle не поддерживает частичную загрузку, поэтому читаем файл и ищем количество через быстрый парсинг
+    # но для 100 боёв это быстро, для 50k — всё равно тяжело, поэтому лучше сразу вернуть 0 и идти в chunked
+    if os.path.exists(HEURISTIC_RAW_CACHE):
+        try:
+            # пробуем быстро: читаем первые 1MB и ищем b'battles'
+            # но надёжнее просто загрузить с mmap: всё равно для 100 боёв это 100MB, не критично
+            # для больших legacy (50k) — лучше не грузить, а считать что 0 и идти в chunked
+            size = os.path.getsize(HEURISTIC_RAW_CACHE)
+            if size > 500_000_000:  # >500MB — считаем слишком большим для проверки кэша, пропускаем
+                print(f"Legacy кэш слишком большой ({size//1024//1024}MB), пропускаю проверку (иди в chunked)")
+                return 0
+            with open(HEURISTIC_RAW_CACHE, "rb") as f:
+                data = pickle.load(f)
+                return len(data.get("battles", {}))
+        except Exception:
+            pass
+    return 0
+
 def collect_or_load_dataset(n_battles: int, path: str, force_recollect: bool = False) -> list:
-    # если датасет есть и размерность совпадает — грузим, иначе пробуем пересобрать из сырого кэша без боёв
+    # если датасет есть, dim совпадает и хватает переходов — грузим, иначе доберём/допересоберём
     if os.path.exists(path) and not force_recollect:
         try:
             obs_dim = _get_npz_obs_dim(path)
+            n_trans = _get_npz_n_transitions(path)
             from .config import N_FEATURES
-            if obs_dim is not None and obs_dim != N_FEATURES:
-                print(f"Датасет {path} dim {obs_dim} != N_FEATURES {N_FEATURES} — пересобираю из сырого кэша без новых боёв")
-                # пробуем пересобрать из chunked кэша сначала
+            need_trans = n_battles * 8  # минимум 8 переходов на бой
+            has_enough = n_trans is not None and n_trans >= need_trans
+            dim_mismatch = obs_dim is not None and obs_dim != N_FEATURES
+            if dim_mismatch:
+                print(f"Датасет {path} dim {obs_dim} != {N_FEATURES} — пересобираю из сырого кэша без новых боёв")
                 try:
-                    # check chunked cache
                     if os.path.isdir(HEURISTIC_RAW_CACHE_DIR) and _count_raw_chunk_battles() >= n_battles:
                         dataset = _recompute_from_chunked_cache(n_battles)
                         if dataset is not None and len(dataset) > 0:
                             _ensure_dir(os.path.dirname(path) or ".")
-                            # save merged dataset (we already have merged in recompute tmp, need to save to path)
-                            # _recompute_from_chunked_cache currently merges to recompute_tmp/_merged.npz, we should copy it
                             import shutil
                             recompute_merged = os.path.join(HEURISTIC_DATASET_TMP_DIR + "_recompute", "_merged.npz")
                             if os.path.exists(recompute_merged):
@@ -410,31 +484,48 @@ def collect_or_load_dataset(n_battles: int, path: str, force_recollect: bool = F
                             else:
                                 save_dataset(dataset, path)
                             return dataset
-                    # fallback legacy single cache
-                    raw_cached, battles_cached = _load_heuristic_raw_cache()
-                    if raw_cached is not None and len(battles_cached) >= n_battles:
-                        recomputed = _recompute_dataset_from_raw(raw_cached, battles_cached)
-                        from collections import defaultdict
-                        grouped = defaultdict(list)
-                        for obs, mask, action, tag in recomputed:
-                            grouped[tag].append((obs, mask, action))
-                        tags = list(grouped.keys())[:n_battles]
-                        filtered = []
-                        for tag in tags:
-                            for obs, mask, action in grouped[tag]:
-                                filtered.append((obs, mask, action, tag))
-                        filtered_battles = {tag: battles_cached[tag] for tag in tags if tag in battles_cached}
-                        dataset = _compute_bc_returns(filtered, filtered_battles)
-                        save_dataset(dataset, path)
-                        return dataset
+                    # legacy — только если не огромный (иначе chunked уже покрыл)
+                    n_legacy = _get_legacy_battle_count_fast()
+                    if n_legacy >= n_battles:
+                        # размер guard уже внутри _get_legacy_battle_count_fast, но перепроверим
+                        try:
+                            if os.path.getsize(HEURISTIC_RAW_CACHE) <= 500_000_000:
+                                raw_cached, battles_cached = _load_heuristic_raw_cache()
+                                if raw_cached is not None and len(battles_cached) >= n_battles:
+                                    recomputed = _recompute_dataset_from_raw(raw_cached, battles_cached)
+                                    from collections import defaultdict
+                                    grouped = defaultdict(list)
+                                    for obs, mask, action, tag in recomputed:
+                                        grouped[tag].append((obs, mask, action))
+                                    tags = list(grouped.keys())[:n_battles]
+                                    filtered = []
+                                    for tag in tags:
+                                        for obs, mask, action in grouped[tag]:
+                                            filtered.append((obs, mask, action, tag))
+                                    filtered_battles = {tag: battles_cached[tag] for tag in tags if tag in battles_cached}
+                                    dataset = _compute_bc_returns(filtered, filtered_battles)
+                                    save_dataset(dataset, path)
+                                    return dataset
+                        except Exception as e2:
+                            print(f"Legacy пересбор не удался: {e2}")
                 except Exception as e:
                     print(f"Пересбор из кэша не удался: {e}, пересобираю боями...")
                     import traceback
                     traceback.print_exc()
-            else:
-                return load_dataset(path)
+                # если пересбор не удался — падаем в collect
+                raise ValueError(f"dim mismatch {obs_dim} != {N_FEATURES}")
+            if not has_enough and n_trans is not None:
+                print(f"Датасет {path} имеет {n_trans} переходов, нужно ~{need_trans} для {n_battles} боёв — доберу")
+                raise ValueError(f"not enough transitions {n_trans} < {need_trans}")
+            # dim ok и хватает данных — возвращаем
+            return load_dataset(path)
+        except ValueError as ve:
+            # not enough или dim mismatch — идём в сбор, не считаем ошибкой
+            print(f"  -> добор через collect_heuristic_dataset: {ve}")
         except Exception as e:
             print(f"Не удалось загрузить датасет {path}: {e}, пересобираю...")
+            import traceback
+            traceback.print_exc()
     dataset = collect_heuristic_dataset(n_battles=n_battles, force_recollect=force_recollect)
     # collect_heuristic_dataset in chunked mode already saved merged file to path? Check if path exists and dataset is None?
     # If collect returned list, save it
@@ -497,14 +588,18 @@ def _compute_bc_returns(raw_dataset: list, battles: dict, gamma: float = 0.99, v
             final.append((obs, mask, action, ret))
     return final
 
-HEURISTIC_RAW_CACHE = "models/heuristic_raw_cache.pkl"
-
 def _save_heuristic_raw_cache(raw_dataset: list, battles: dict, n_battles: int):
     try:
-        import pickle
+        import pickle, json
         os.makedirs(os.path.dirname(HEURISTIC_RAW_CACHE), exist_ok=True)
         with open(HEURISTIC_RAW_CACHE, "wb") as f:
             pickle.dump({"raw_dataset": raw_dataset, "battles": battles, "n_battles": n_battles}, f, protocol=pickle.HIGHEST_PROTOCOL)
+        # лёгкий meta для быстрой проверки без загрузки pickle
+        try:
+            with open(HEURISTIC_RAW_CACHE + ".meta.json", "w") as mf:
+                json.dump({"battles": len(battles), "transitions": len(raw_dataset), "n_battles": n_battles}, mf)
+        except Exception:
+            pass
         print(f"Сырой кэш эвристики сохранён: {HEURISTIC_RAW_CACHE} ({len(raw_dataset)} переходов, {len(battles)} боёв)")
     except Exception as e:
         print(f"Не удалось сохранить сырой кэш: {e}")
@@ -555,8 +650,29 @@ def collect_heuristic_dataset(n_battles: int = 200, force_recollect: bool = Fals
             if ds is not None and len(ds) > 0:
                 return ds
             print("Chunked кэш дал 0 примеров, пробую legacy...")
-        # legacy single
-        raw_cached, battles_cached = _load_heuristic_raw_cache()
+        # legacy single — сначала быстрая проверка без загрузки 5GB pickle
+        n_cached_battles_fast = _get_legacy_battle_count_fast()
+        # только если быстро нашли что достаточно и legacy не огромный — грузим
+        if n_cached_battles_fast > 0:
+            # проверяем размер прежде чем грузить
+            try:
+                if os.path.getsize(HEURISTIC_RAW_CACHE) > 500_000_000:
+                    print(f"Legacy кэш большой, пропускаю legacy-путь (иди в chunked добор)")
+                    n_cached_battles_fast = 0
+                    raw_cached = battles_cached = None
+                else:
+                    raw_cached, battles_cached = _load_heuristic_raw_cache()
+                    if raw_cached is None or battles_cached is None:
+                        n_cached_battles_fast = 0
+                    else:
+                        n_cached_battles = len(battles_cached)
+                        # переопределим fast для дальнейшего elif
+                        n_cached_battles_fast = n_cached_battles
+            except Exception:
+                raw_cached = battles_cached = None
+                n_cached_battles_fast = 0
+        else:
+            raw_cached = battles_cached = None
         if raw_cached is not None and battles_cached is not None:
             n_cached_battles = len(battles_cached)
             if n_cached_battles >= n_battles:
@@ -823,7 +939,24 @@ _MAX_WEIGHT = 0.45
 def warm_up_vec_normalize(vec_normalize, dataset):
     if len(dataset) == 0:
         return
-    obs_arr = np.stack([d[0] for d in dataset]).astype(np.float32)
+    # поддержка _DatasetView: у него obs уже массив (mmap)
+    if isinstance(dataset, _DatasetView):
+        obs_arr = np.asarray(dataset.obs, dtype=np.float32)
+    elif isinstance(dataset, str) and os.path.exists(dataset):
+        data = np.load(dataset, mmap_mode='r')
+        obs_arr = np.asarray(data["obs"], dtype=np.float32)
+    else:
+        # list path — для больших датасетов делаем батчевую оценку чтобы не stack 3.6GB сразу
+        if len(dataset) > 200_000:
+            # считаем среднее по батчам 10k
+            batch = 10000
+            # возьмём первые 50000 для warmup чтобы не грузить всё
+            sample_n = min(len(dataset), 50000)
+            obs_sample = np.stack([dataset[i][0] for i in range(sample_n)]).astype(np.float32)
+            if "observation" in vec_normalize.obs_rms:
+                vec_normalize.obs_rms["observation"].update(obs_sample)
+            return
+        obs_arr = np.stack([d[0] for d in dataset]).astype(np.float32)
     if "observation" in vec_normalize.obs_rms:
         vec_normalize.obs_rms["observation"].update(obs_arr)
 
@@ -887,35 +1020,108 @@ def evaluate_win_rates(ppo, n_battles: int = 180) -> dict[str, float]:
     return rates
 
 def pretrain_policy_bc(
-    ppo: PPO, dataset: list, epochs: int = 50, batch_size: int = 256,
+    ppo: PPO, dataset, epochs: int = 50, batch_size: int = 256,
     normalize: bool = False, value_coef: float = 0.0, val_frac: float = 0.1,
     patience: int = 5,
     contrastive: bool = False, neg_weight: float = 0.3,
 ):
-    if len(dataset) == 0:
-        print("BC: пустой датасет, пропускаю")
-        return
-    if len(dataset[0]) == 3:
-        raise ValueError("Датасет без ret: соберите заново с _compute_bc_returns (нужен victory_value).")
-    obs_arr = np.stack([d[0] for d in dataset]).astype(np.float32)
-    mask_arr = np.stack([d[1] for d in dataset]).astype(np.float32)
-    action_arr = np.array([d[2] for d in dataset], dtype=np.int64)
-    return_arr = np.array([d[3] for d in dataset], dtype=np.float32)
+    # dataset может быть list, _DatasetView (mmap) или путь к .npz
+    if isinstance(dataset, str) and os.path.exists(dataset):
+        # путь — грузим mmap
+        print(f"BC: гружу датасет по пути {dataset} (mmap)")
+        data = np.load(dataset, mmap_mode='r') if os.path.getsize(dataset) > 200_000_000 else np.load(dataset)
+        if "ret" not in data:
+            raise ValueError("Датасет без ret: соберите заново с _compute_bc_returns (нужен victory_value).")
+        # используем mmap напрямую без list(zip)
+        obs_arr = data["obs"]
+        mask_arr = data["mask"]
+        action_arr = data["action"]
+        return_arr = data["ret"]
+        # для совместимости создаём view
+        dataset_len = int(obs_arr.shape[0])
+        # проверим dim
+        from .config import N_FEATURES
+        if obs_arr.shape[1] != N_FEATURES:
+            raise ValueError(f"BC obs dim {obs_arr.shape[1]} != N_FEATURES {N_FEATURES}. Пересоберите датасет или обновите config.")
+        # normalize
+        n = dataset_len
+        # делаем пермутацию без копирования всего массива в RAM? используем индексы
+        # для экономии RAM не делаем np.stack — уже массивы
+        is_mmap = True
+    else:
+        if len(dataset) == 0:
+            print("BC: пустой датасет, пропускаю")
+            return
+        # проверка на _DatasetView
+        if isinstance(dataset, _DatasetView):
+            if dataset.ret is None:
+                raise ValueError("Датасет без ret: соберите заново с _compute_bc_returns (нужен victory_value).")
+            obs_arr = dataset.obs
+            mask_arr = dataset.mask
+            action_arr = dataset.action
+            return_arr = dataset.ret
+            dataset_len = len(dataset)
+            is_mmap = True
+            from .config import N_FEATURES
+            if obs_arr.shape[1] != N_FEATURES:
+                raise ValueError(f"BC obs dim {obs_arr.shape[1]} != N_FEATURES {N_FEATURES}. Пересоберите датасет или обновите config.")
+            n = dataset_len
+        else:
+            # обычный list
+            if len(dataset[0]) == 3:
+                raise ValueError("Датасет без ret: соберите заново с _compute_bc_returns (нужен victory_value).")
+            # для больших list (>200k) не делаем один большой stack — это 3.6GB, делаем через mmap view если можно
+            if len(dataset) > 200_000:
+                print(f"BC: датасет большой ({len(dataset)}), делаю временный stack по частям")
+            obs_arr = np.stack([d[0] for d in dataset]).astype(np.float32)
+            mask_arr = np.stack([d[1] for d in dataset]).astype(np.float32)
+            action_arr = np.array([d[2] for d in dataset], dtype=np.int64)
+            return_arr = np.array([d[3] for d in dataset], dtype=np.float32)
+            from .config import N_FEATURES
+            if obs_arr.shape[1] != N_FEATURES:
+                raise ValueError(f"BC obs dim {obs_arr.shape[1]} != N_FEATURES {N_FEATURES}. Пересоберите датасет или обновите config.")
+            n = len(dataset)
+            is_mmap = False
+            dataset_len = n
 
-    from .config import N_FEATURES
-    if obs_arr.shape[1] != N_FEATURES:
-        raise ValueError(f"BC obs dim {obs_arr.shape[1]} != N_FEATURES {N_FEATURES}. Пересоберите датасет или обновите config.")
+    # дальнейшая логика общая — используем obs_arr/mask_arr/action_arr/return_arr как массивы
+    # для mmap это уже np.memmap, для list — обычные ndarray
+    # dim уже проверен выше, повторная проверка не нужна
 
     if normalize:
         vec_normalize = ppo.get_vec_normalize_env()
         if vec_normalize is not None:
-            warm_up_vec_normalize(vec_normalize, dataset)
-            obs_arr = vec_normalize.normalize_obs({"observation": obs_arr})["observation"]
-            print(f"BC: нормализовал {len(obs_arr)} obs через VecNormalize (mean {vec_normalize.obs_rms['observation'].mean[:3]})")
+            # warm_up: для пути dataset это data view, для _DatasetView — сам объект
+            warm_arg = dataset
+            if isinstance(dataset, str) and 'data' in locals():
+                # создаём view для warm_up
+                try:
+                    warm_arg = _DatasetView(data)
+                except Exception:
+                    warm_arg = dataset
+            warm_up_vec_normalize(vec_normalize, warm_arg)
+            if is_mmap and obs_arr.shape[0] > 200_000:
+                print(f"BC: нормализую большой mmap ({obs_arr.shape[0]}) по частям")
+                normed = np.empty(obs_arr.shape, dtype=np.float32)
+                chunk = 50000
+                for s in range(0, obs_arr.shape[0], chunk):
+                    e = min(s+chunk, obs_arr.shape[0])
+                    normed[s:e] = vec_normalize.normalize_obs({"observation": np.asarray(obs_arr[s:e], dtype=np.float32)})["observation"]
+                obs_arr = normed
+                print(f"BC: нормализовал {len(obs_arr)} obs через VecNormalize (mean {vec_normalize.obs_rms['observation'].mean[:3]})")
+            else:
+                obs_arr = vec_normalize.normalize_obs({"observation": np.asarray(obs_arr, dtype=np.float32)})["observation"]
+                print(f"BC: нормализовал {len(obs_arr)} obs через VecNormalize (mean {vec_normalize.obs_rms['observation'].mean[:3]})")
         else:
             print("BC: normalize=True но VecNormalize не найден — обучаю на сырых obs")
 
-    n = len(dataset)
+    # n уже определён выше (dataset_len), не переопределяем len(dataset) для пути-строки
+    # если вдруг n не определён (старый путь), fallback
+    if 'n' not in locals() or n is None:
+        try:
+            n = len(dataset)
+        except Exception:
+            n = int(obs_arr.shape[0])
     n_val = max(1, int(n * val_frac))
     perm = np.random.permutation(n)
     val_idx, train_idx = perm[:n_val], perm[n_val:]
