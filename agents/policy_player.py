@@ -23,6 +23,109 @@ from agents.training import (
     pretrain_policy_bc,
 )
 import asyncio
+import torch
+import torch.nn as nn
+
+def _migrate_ppo_713_to_715(ppp_path: str):
+    """Грузит старый 713 снапшот через временный N_FEATURES=713 и расширяет веса на 715 (2 is_tera флага нулями)."""
+    import agents.config as cfg
+    from agents.config import N_FEATURES as NEW_N
+    OLD_N = 713
+    if NEW_N != 715:
+        # защита — если конфиг уже не 715, просто грузим как есть
+        return PPO.load(ppp_path, device="cpu")
+    orig_n = cfg.N_FEATURES
+    try:
+        cfg.N_FEATURES = OLD_N
+        # нужно переимпортировать FeaturesExtractor чтобы он подхватил OLD_N? Он читает cfg.N_FEATURES в __init__, так что достаточно cfg
+        # но модуль policy уже импортирован с NEW_N — форсим переустановку через reload? проще напрямую грузим зип и паддим
+        # Пробуем простой путь: грузим с OLD_N, затем расширяем линеиры
+        ppo_old = PPO.load(ppp_path, device="cpu")
+    finally:
+        cfg.N_FEATURES = orig_n
+    # расширяем каждый features_extractor с 713->715
+    for attr in ["features_extractor", "pi_features_extractor", "vf_features_extractor"]:
+        if not hasattr(ppo_old.policy, attr):
+            continue
+        extr = getattr(ppo_old.policy, attr)
+        try:
+            old_linear = extr.net[0]
+            if not isinstance(old_linear, nn.Linear):
+                continue
+            if old_linear.in_features == NEW_N:
+                continue
+            if old_linear.in_features != OLD_N:
+                print(f"  {attr} in_features {old_linear.in_features} != {OLD_N}, пропускаю миграцию")
+                continue
+            old_w = old_linear.weight.data
+            old_b = old_linear.bias.data if old_linear.bias is not None else None
+            new_linear = nn.Linear(NEW_N, old_linear.out_features)
+            # копируем ортогональную инициализацию как в FeaturesExtractor
+            nn.init.orthogonal_(new_linear.weight, gain=nn.init.calculate_gain("relu"))
+            if new_linear.bias is not None:
+                nn.init.zeros_(new_linear.bias)
+            with torch.no_grad():
+                new_linear.weight.data[:, :OLD_N] = old_w
+                new_linear.weight.data[:, OLD_N:] = 0.0
+                if old_b is not None and new_linear.bias is not None:
+                    new_linear.bias.data.copy_(old_b)
+            extr.net[0] = new_linear
+            print(f"  Мигрировал {attr}.net.0.weight {list(old_w.shape)} -> {list(new_linear.weight.shape)} (last 2 cols нули)")
+        except Exception as e:
+            print(f"  Не удалось мигрировать {attr}: {e}")
+    # правим observation_space с 713 на 715
+    try:
+        from gymnasium.spaces import Box, Dict
+        # action_mask размер берём из старого space если есть
+        try:
+            old_obs_space = ppo_old.observation_space
+            if isinstance(old_obs_space, Dict) and "action_mask" in old_obs_space.spaces:
+                am_space = old_obs_space.spaces["action_mask"]
+            else:
+                am_space = Box(0, 1, shape=(9,), dtype=bool)
+        except Exception:
+            from gymnasium.spaces import Box as _Box
+            am_space = _Box(0, 1, shape=(9,), dtype=bool)
+        new_obs_space = Dict({
+            "observation": Box(-1, 4, shape=(NEW_N,), dtype="float32"),
+            "action_mask": am_space,
+        })
+        ppo_old.observation_space = new_obs_space
+        ppo_old.policy.observation_space = new_obs_space
+        # также env observation_space пачить не нужно — создастся заново с 715
+    except Exception as e:
+        print(f"  Не удалось пропатчить observation_space: {e}")
+    return ppo_old
+
+def _migrate_vecnormalize_713_to_715(vec_path: str, base_env):
+    """Грузит VecNormalize с 713 статистикой и расширяет obs_rms до 715 (mean 0, var 1 для новых 2 признаков)."""
+    try:
+        vec = VecNormalize.load(vec_path, base_env)
+        # проверяем размер
+        try:
+            mean = vec.obs_rms["observation"].mean
+            if len(mean) == 713 and base_env.observation_spaces[base_env.possible_agents[0]].shape[0] == 715:
+                import numpy as np
+                print(f"  Мигрирую VecNormalize 713->715 (mean {mean.shape} -> 715)")
+                new_mean = np.zeros(715, dtype=mean.dtype)
+                new_mean[:713] = mean
+                # new_var по умолчанию 1 для новых признаков (ненормализованные)
+                old_var = vec.obs_rms["observation"].var
+                new_var = np.ones(715, dtype=old_var.dtype)
+                new_var[:713] = old_var
+                vec.obs_rms["observation"].mean = new_mean
+                vec.obs_rms["observation"].var = new_var
+                # count остаётся прежним
+        except Exception as e:
+            print(f"  VecNormalize миграция 713->715 не удалась: {e}")
+        return vec
+    except Exception as e:
+        msg = str(e)
+        if "713" in msg or "715" in msg or "shape" in msg.lower():
+            print(f"  VecNormalize.load упал из-за 713->715, создаю новый VecNormalize (статистика сброшена): {e}")
+            return VecNormalize(base_env, norm_obs=True, norm_reward=False, gamma=0.99, norm_obs_keys=["observation"])
+        raise
+
 
 
 def run(
@@ -59,7 +162,21 @@ def run(
     run_name = f"{'retrain' if resume_from else 'train'}_{time.strftime('%Y%m%d_%H%M%S')}"
 
     if resume_from:
-        ppo = PPO.load(resume_from, device="cpu")
+        try:
+            ppo = PPO.load(resume_from, device="cpu")
+        except RuntimeError as e:
+            if "713" in str(e) and "715" in str(e):
+                print(f"Старый снапшот {resume_from} с 713 признаками — мигрирую на 715...")
+                ppo = _migrate_ppo_713_to_715(resume_from)
+            else:
+                raise
+        except Exception as e:
+            # SB3 иногда оборачивает RuntimeError
+            if "713" in str(e) and "715" in str(e):
+                print(f"Старый снапшот {resume_from} с 713 признаками — мигрирую на 715...")
+                ppo = _migrate_ppo_713_to_715(resume_from)
+            else:
+                raise
         if reset_schedules:
             print(f"Сбрасываю счетчики lr/ent: было {ppo.num_timesteps} шагов -> 0 (модель {resume_from})")
             steps_done_holder = {"value": 0}
@@ -83,11 +200,11 @@ def run(
                         setattr(ppo, attr, get_schedule_fn(val))
                     else:
                         setattr(ppo, attr, val)
-        # создаём env заново; если был VecNormalize — загружаем
+        # создаём env заново; если был VecNormalize — загружаем (с миграцией 713->715 если нужно)
         base_env = SubprocVecEnv([ExampleEnv.create_env for _ in range(num_envs)])
         if not no_normalize_bc:
             if os.path.isfile(VECNORM_PATH):
-                env = VecNormalize.load(VECNORM_PATH, base_env)
+                env = _migrate_vecnormalize_713_to_715(VECNORM_PATH, base_env)
                 print(f"Загрузил VecNormalize из {VECNORM_PATH}")
             else:
                 env = VecNormalize(base_env, norm_obs=True, norm_reward=norm_reward, gamma=0.99, norm_obs_keys=["observation"])
@@ -296,7 +413,7 @@ def run(
                 [partial(ExampleEnv.create_env, opponent_weights=current_weights) for _ in range(num_envs)]
             )
             try:
-                env = VecNormalize.load(VECNORM_PATH, raw_env)
+                env = _migrate_vecnormalize_713_to_715(VECNORM_PATH, raw_env)
             except Exception as e:
                 print(f"Не удалось загрузить VecNormalize, создаю новый: {e}")
                 env = VecNormalize(raw_env, norm_obs=True, norm_reward=norm_reward, gamma=0.99, norm_obs_keys=["observation"])
