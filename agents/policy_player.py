@@ -34,7 +34,7 @@ def run(
     pretrain_battles: int = 0,
     ent_coef: float | None = None,
     epochs: int = 5,
-    dataset_path: str = "models/heuristic_dataset.npz",
+    dataset_path: str | None = None,
     force_recollect: bool = False,
     no_normalize_bc: bool = False,
     learning_rate: float = 2e-4,
@@ -51,9 +51,10 @@ def run(
     eval_battles: int = 20,
     skip_eval: bool = False,
 ):
-    # phase_size должен делиться на n_steps*num_envs = 3072 для ровных роллаутов
-    if phase_size % 3072 != 0:
-        print(f"WARNING: phase_size {phase_size} не кратен 3072 (n_steps*num_envs). Будет обрезка последнего роллаута.")
+    # phase_size должен делиться на фактический размер роллаута n_steps*num_envs (с учётом целочисленного деления)
+    rollout_size = (3072 // num_envs) * num_envs
+    if phase_size % rollout_size != 0:
+        print(f"WARNING: phase_size {phase_size} не кратен фактическому размеру роллаута {rollout_size} (n_steps {3072 // num_envs} * num_envs {num_envs}). Будет обрезка последнего роллаута.")
 
     run_name = f"{'retrain' if resume_from else 'train'}_{time.strftime('%Y%m%d_%H%M%S')}"
 
@@ -114,13 +115,15 @@ def run(
             device="cpu",
             tensorboard_log="./tb_logs/",
         )
-        # BC: либо собираем с нуля (pretrain_battles>0), либо грузим готовый (replay_dataset.npz) даже при 0
+        # BC: либо собираем с нуля (pretrain_battles>0), либо грузим готовый только если пользователь ЯВНО указал --dataset-path
+        # dataset_path по умолчанию None — чтобы наличие models/heuristic_dataset.npz от прошлого прогона не включало BC неожиданно
         need_bc = False
         dataset = None
         if pretrain_battles > 0:
-            print(f"Собираю датасет на {pretrain_battles} боях SimpleHeuristicsPlayer...")
+            actual_path = dataset_path or "models/heuristic_dataset.npz"
+            print(f"Собираю датасет на {pretrain_battles} боях SimpleHeuristicsPlayer -> {actual_path}...")
             dataset = collect_or_load_dataset(
-                n_battles=pretrain_battles, path=dataset_path, force_recollect=force_recollect
+                n_battles=pretrain_battles, path=actual_path, force_recollect=force_recollect
             )
             need_bc = True
         elif dataset_path and os.path.isfile(dataset_path):
@@ -247,7 +250,7 @@ def run(
             # дополнительно проверяем что файл не перезапишет существующий qualified
             save_path = f"models/{QUALIFIED_PREFIX}{counter}"
             ppo.save(save_path)
-            print(f"[phase {counter}] снапшот прошёл порог ({heuristics_rate}% >= {MIN_WINRATE_TO_QUALIFY}%) -> {save_path}")
+            print(f"[phase {counter}] снапшот прошёл порог ({heuristics_rate}% >= {min_winrate}%) -> {save_path}")
         else:
             print(f"[phase {counter}] снапшот НЕ прошёл порог ({heuristics_rate}% < {min_winrate}%) -> пропущен")
 
@@ -357,7 +360,7 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=None, dest="lr_alias", help="Алиас для --learning-rate")
     parser.add_argument("--pretrain-battles", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--dataset-path", type=str, default="models/heuristic_dataset.npz")
+    parser.add_argument("--dataset-path", type=str, default=None, help="Путь к готовому датасету для BC; если указан и файл существует — BC включится даже без --pretrain-battles. По умолчанию None, чтобы старый models/heuristic_dataset.npz не включал BC неявно")
     parser.add_argument("--force-recollect", action="store_true", help="Пересобрать датасет заново, игнорируя кэш")
     parser.add_argument("--contrastive", action="store_true", help="Контрастивный BC: отталкиваться от ходов проигравшего (w=-neg_weight)")
     parser.add_argument("--neg-weight", type=float, default=0.3, help="Вес лузер-ходов при --contrastive (0.3 слабее, 1.0 симметрично)")
