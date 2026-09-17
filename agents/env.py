@@ -89,11 +89,16 @@ class ExampleEnv(SinglesEnv):
             SimpleHeuristicsPlayer(start_listening=False),
         ]
         self_play_opp = _make_self_play_opponents()
-
-        # Убрали хак с подменой _fusion_stats:
-        # каждый игрок парсит сообщения самостоятельно, общий dict ломал pending и protect.
-        # Для наблюдения агента (env.agent1) достаточно его собственного парсера,
-        # он видит обе стороны боя.
+        # self-play оппоненты с start_listening=False не получают _handle_battle_message —
+        # их _fusion_stats/_protect_state всегда пустые. Шэрим готовые словари с agent1
+        # (только чтение), но НЕ шэрим _pending_stats_side — это промежуточное состояние
+        # которое ломалось при общем dict. Агент (agent1) единственный парсит поток.
+        for opp in self_play_opp:
+            try:
+                opp._fusion_stats = env.agent1._fusion_stats  # type: ignore
+                opp._protect_state = env.agent1._protect_state  # type: ignore
+            except Exception:
+                pass
 
         all_opponents = heuristics + self_play_opp
 
@@ -143,15 +148,24 @@ class ExampleEnv(SinglesEnv):
         return super().action_to_order(action, battle, fake=fake, strict=strict)
 
     def embed_battle(self, battle: AbstractBattle):
-        # FIX: 'battle is self.battle1' был сломан т.к. SinglesEnv передаёт копию, а не тот же объект
-        # (battle is battle1) -> False даже для p1, всегда выбирался agent2 -> терялись fusion/protect для p1
-        # Используем player_role как в players.py / poke_env : p1 -> agent1, p2 -> agent2
+        # Надёжный выбор источника по battle_tag (а не по is и не по player_role).
+        # is ломался: SinglesEnv передаёт копию battle, p1!=agent1 по идентичности.
+        # player_role==p1 -> agent1 — эвристика, может сломаться при реконнекте.
+        # battle_tag — стабильный id боя, единственный надёжный ключ.
         try:
-            # battle.player_role существует у AbstractBattle; 'p1' => agent1, иначе agent2
-            source = self.agent1 if getattr(battle, "player_role", "p1") == "p1" else self.agent2
+            # сначала пробуем по тегу (работает даже если player_role переприсвоили)
+            if self.battle1 is not None and getattr(battle, "battle_tag", None) == getattr(self.battle1, "battle_tag", None):
+                source = self.agent1
+            elif self.battle2 is not None and getattr(battle, "battle_tag", None) == getattr(self.battle2, "battle_tag", None):
+                source = self.agent2
+            else:
+                # fallback: player_role (покрывает случай когда battle1/2 ещё None в начале боя)
+                source = self.agent1 if getattr(battle, "player_role", "p1") == "p1" else self.agent2
         except Exception:
-            # fallback на старый 'is' если player_role по какой-то причине отсутствует
-            source = self.agent1 if battle is self.battle1 else self.agent2
+            try:
+                source = self.agent1 if getattr(battle, "player_role", "p1") == "p1" else self.agent2
+            except Exception:
+                source = self.agent1 if battle is self.battle1 else self.agent2
         fusion_entry = lambda is_ours: (
             source._fusion_stats.get(battle.battle_tag, {})
             .get(battle.player_role if is_ours else ("p2" if battle.player_role == "p1" else "p1"))
