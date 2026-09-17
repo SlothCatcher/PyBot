@@ -48,6 +48,8 @@ def run(
     value_warmup_steps: int = 0,
     min_winrate: int = 25,
     reset_schedules: bool = False,
+    eval_battles: int = 20,
+    skip_eval: bool = False,
 ):
     # phase_size должен делиться на n_steps*num_envs = 3072 для ровных роллаутов
     if phase_size % 3072 != 0:
@@ -228,7 +230,17 @@ def run(
         ppo.save(f"{SELF_PLAY_PATH}_{counter}")
 
         # оценка — теперь с нормализацией (см. training.evaluate_win_rates)
-        win_rates = evaluate_win_rates(ppo, n_battles=60)
+        if skip_eval:
+            print(f"[phase {counter}] skip eval (--skip-eval)")
+            win_rates = {"SimpleHeuristicsPlayer": 0, "RandomPlayer": 0, "MaxBasePowerPlayer": 0, "self_play": 0}
+        else:
+            print(f"[phase {counter}] оценка {eval_battles} боев vs каждого бота (может занять 2-4 мин)...")
+            try:
+                win_rates = evaluate_win_rates(ppo, n_battles=eval_battles)
+            except Exception as e:
+                print(f"[phase {counter}] eval упал: {e}, ставлю 0")
+                import traceback; traceback.print_exc()
+                win_rates = {"SimpleHeuristicsPlayer": 0, "RandomPlayer": 0, "MaxBasePowerPlayer": 0, "self_play": 0}
         heuristics_rate = win_rates.get("SimpleHeuristicsPlayer", 0)
         # иногда ключа нет если оценка упала — fallback
         if heuristics_rate >= min_winrate:
@@ -309,7 +321,11 @@ def run(
     from agents.training import evaluate_win_rates as eval2
     # быстрый прогон без нормализации патча — evaluate уже патчит
     # для финального вывода используем evaluate
-    final_rates = evaluate_win_rates(ppo, n_battles=60)
+    if skip_eval:
+        final_rates = {"skipped": 0}
+    else:
+        print(f"Финальная оценка {eval_battles} боев...")
+        final_rates = evaluate_win_rates(ppo, n_battles=eval_battles)
     print("--- Final win rates (eval) ---")
     for k, v in final_rates.items():
         print(f"{k}: {v}%")
@@ -353,6 +369,8 @@ if __name__ == "__main__":
     parser.add_argument("--value-warmup-steps", type=int, default=0, help="Сколько шагов после resume учить только value (заморозить policy) чтобы вылечить просадку -3->-29. Рекомендую 50000")
     parser.add_argument("--min-winrate", type=int, default=25, help="Порог %% vs Heuristics для сохранения qualified снапшота в self-play (было 50 -> 25, + fallback на обычные снапшоты когда нет qualified)")
     parser.add_argument("--reset-schedules", action="store_true", help="Сбросить счетчик шагов для lr/ent расписаний при resume (lr 3e-5 снова с начала, ent 0.01). Нужно когда берешь фазу 300k и хочешь доучивать как с нуля)")
+    parser.add_argument("--eval-battles", type=int, default=20, help="Сколько боев на каждого бота в оценке между фазами (было 60 -> 20, 60*4=240 боев виснет на 5-10 мин)")
+    parser.add_argument("--skip-eval", action="store_true", help="Пропустить оценку winrate между фазами (самый быстрый, если виснет на 60 боев)")
     args = parser.parse_args()
 
     # поддержка алиаса --lr
@@ -382,4 +400,6 @@ if __name__ == "__main__":
         value_warmup_steps=args.value_warmup_steps,
         min_winrate=args.min_winrate,
         reset_schedules=args.reset_schedules,
+        eval_battles=args.eval_battles,
+        skip_eval=args.skip_eval,
     )
