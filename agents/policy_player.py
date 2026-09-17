@@ -27,75 +27,146 @@ import torch
 import torch.nn as nn
 
 def _migrate_ppo_713_to_715(ppp_path: str):
-    """Грузит старый 713 снапшот через временный N_FEATURES=713 и расширяет веса на 715 (2 is_tera флага нулями)."""
-    import agents.config as cfg
-    from agents.config import N_FEATURES as NEW_N
+    """Надёжная миграция 713->715 через паддинг весов в zip. Не зависит от глобального N_FEATURES."""
+    import torch
+    import tempfile
+    import os
     OLD_N = 713
-    if NEW_N != 715:
-        # защита — если конфиг уже не 715, просто грузим как есть
-        return PPO.load(ppp_path, device="cpu")
-    orig_n = cfg.N_FEATURES
+    NEW_N = 715
+    print(f"  Миграция 713->715 для {ppp_path}...")
     try:
-        cfg.N_FEATURES = OLD_N
-        # нужно переимпортировать FeaturesExtractor чтобы он подхватил OLD_N? Он читает cfg.N_FEATURES в __init__, так что достаточно cfg
-        # но модуль policy уже импортирован с NEW_N — форсим переустановку через reload? проще напрямую грузим зип и паддим
-        # Пробуем простой путь: грузим с OLD_N, затем расширяем линеиры
-        ppo_old = PPO.load(ppp_path, device="cpu")
-    finally:
-        cfg.N_FEATURES = orig_n
-    # расширяем каждый features_extractor с 713->715
-    for attr in ["features_extractor", "pi_features_extractor", "vf_features_extractor"]:
-        if not hasattr(ppo_old.policy, attr):
-            continue
-        extr = getattr(ppo_old.policy, attr)
-        try:
-            old_linear = extr.net[0]
-            if not isinstance(old_linear, nn.Linear):
-                continue
-            if old_linear.in_features == NEW_N:
-                continue
-            if old_linear.in_features != OLD_N:
-                print(f"  {attr} in_features {old_linear.in_features} != {OLD_N}, пропускаю миграцию")
-                continue
-            old_w = old_linear.weight.data
-            old_b = old_linear.bias.data if old_linear.bias is not None else None
-            new_linear = nn.Linear(NEW_N, old_linear.out_features)
-            # копируем ортогональную инициализацию как в FeaturesExtractor
-            nn.init.orthogonal_(new_linear.weight, gain=nn.init.calculate_gain("relu"))
-            if new_linear.bias is not None:
-                nn.init.zeros_(new_linear.bias)
-            with torch.no_grad():
-                new_linear.weight.data[:, :OLD_N] = old_w
-                new_linear.weight.data[:, OLD_N:] = 0.0
-                if old_b is not None and new_linear.bias is not None:
-                    new_linear.bias.data.copy_(old_b)
-            extr.net[0] = new_linear
-            print(f"  Мигрировал {attr}.net.0.weight {list(old_w.shape)} -> {list(new_linear.weight.shape)} (last 2 cols нули)")
-        except Exception as e:
-            print(f"  Не удалось мигрировать {attr}: {e}")
-    # правим observation_space с 713 на 715
-    try:
+        from stable_baselines3.common.save_util import load_from_zip_file, save_to_zip_file
         from gymnasium.spaces import Box, Dict
-        # action_mask размер берём из старого space если есть
-        try:
-            old_obs_space = ppo_old.observation_space
-            if isinstance(old_obs_space, Dict) and "action_mask" in old_obs_space.spaces:
-                am_space = old_obs_space.spaces["action_mask"]
+        data, params, pytorch_variables = load_from_zip_file(ppp_path, device=torch.device("cpu"))
+        # params: dict like {"policy": OrderedDict, "policy.optimizer": ...} или {"policy": state_dict}
+        # находим policy state dict
+        policy_state = None
+        policy_key = None
+        # SB3 stores params as dict {name: state_dict}
+        for k, v in list(params.items()):
+            if isinstance(v, dict) and any("features_extractor" in kk for kk in v.keys()):
+                policy_state = v
+                policy_key = k
+                break
+            # также может быть flat: params itself contains weights directly? тогда policy_state = params
+        if policy_state is None:
+            # fallback: assume params itself is policy state dict
+            if any("features_extractor" in k for k in params.keys()):
+                policy_state = params
+                policy_key = None
             else:
-                am_space = Box(0, 1, shape=(9,), dtype=bool)
-        except Exception:
-            from gymnasium.spaces import Box as _Box
-            am_space = _Box(0, 1, shape=(9,), dtype=bool)
-        new_obs_space = Dict({
-            "observation": Box(-1, 4, shape=(NEW_N,), dtype="float32"),
-            "action_mask": am_space,
-        })
-        ppo_old.observation_space = new_obs_space
-        ppo_old.policy.observation_space = new_obs_space
-        # также env observation_space пачить не нужно — создастся заново с 715
+                # try first dict value
+                for k, v in params.items():
+                    if isinstance(v, dict):
+                        policy_state = v
+                        policy_key = k
+                        break
+        if policy_state is None:
+            raise RuntimeError(f"Не нашёл policy state dict в {list(params.keys())[:5]}")
+
+        padded = 0
+        for key in list(policy_state.keys()):
+            tensor = policy_state[key]
+            if isinstance(tensor, torch.Tensor) and tensor.dim() == 2 and tensor.shape[1] == OLD_N and tensor.shape[0] == 512:
+                if "features_extractor" in key and "weight" in key:
+                    new_tensor = torch.zeros((tensor.shape[0], NEW_N), dtype=tensor.dtype, device=tensor.device)
+                    new_tensor[:, :OLD_N] = tensor
+                    # последние 2 колонки — нули (is_tera флаги)
+                    policy_state[key] = new_tensor
+                    padded += 1
+                    print(f"    паддинг {key} {list(tensor.shape)} -> {list(new_tensor.shape)}")
+        if padded == 0:
+            print("    WARN: не нашёл весов [512,713] для паддинга — возможно уже 715 или другая архитектура")
+
+        # обновляем observation_space в data если есть
+        try:
+            if isinstance(data, dict) and "observation_space" in data:
+                obs_space = data["observation_space"]
+                if hasattr(obs_space, "spaces") and "observation" in obs_space.spaces:
+                    old_shape = obs_space.spaces["observation"].shape
+                    if old_shape == (OLD_N,):
+                        am_space = obs_space.spaces.get("action_mask", Box(0, 1, shape=(9,), dtype=bool))
+                        new_obs_space = Dict({"observation": Box(-1, 4, shape=(NEW_N,), dtype="float32"), "action_mask": am_space})
+                        data["observation_space"] = new_obs_space
+                        print(f"    обновил data['observation_space'] {old_shape} -> {(NEW_N,)}")
+        except Exception as e:
+            print(f"    не удалось обновить observation_space в data: {e}")
+
+        # сбрасываем optimizer state чтобы не тянуть 713 моменты
+        if pytorch_variables is not None:
+            print("    сбрасываю optimizer state (713->715) — будет новый оптимизатор")
+            pytorch_variables = None
+
+        # сохраняем пропатченный чекпоинт во временный файл и грузим как обычный PPO
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            save_to_zip_file(tmp_path, data=data, params=params, pytorch_variables=pytorch_variables)
+            print(f"  Сохраняю пропатченный чекпоинт во временный файл {tmp_path}")
+            ppo_new = PPO.load(tmp_path, device="cpu")
+            print(f"  Успешно загрузил мигрированный PPO")
+            return ppo_new
+        finally:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
     except Exception as e:
-        print(f"  Не удалось пропатчить observation_space: {e}")
-    return ppo_old
+        print(f"  load_from_zip_file миграция не удалась: {e}, пробую fallback через создание нового PPO и копирование весов")
+        import traceback
+        traceback.print_exc()
+        # fallback: создаём новый PPO с 715 и копируем веса напрямую
+        try:
+            # создаём dummy env с 715
+            from agents.env import ExampleEnv
+            from stable_baselines3.common.vec_env import SubprocVecEnv
+            dummy_env = SubprocVecEnv([ExampleEnv.create_env for _ in range(1)])
+            # пробуем загрузить старый PPO через временный 713 конфиг если предыдущий способ упал
+            # последний шанс: пробуем просто загрузить с strict=False через низкоуровневый torch
+            # создаём новый PPO
+            from agents.policy import MaskedActorCriticPolicy
+            ppo_new = PPO(MaskedActorCriticPolicy, dummy_env, device="cpu", verbose=0)
+            # грузим старый state dict через load_from_zip_file снова но теперь паддим и грузим напрямую
+            try:
+                from stable_baselines3.common.save_util import load_from_zip_file as _lf
+                data2, params2, _ = _lf(ppp_path, device=torch.device("cpu"))
+                # найдём policy state снова
+                for k, v in params2.items():
+                    if isinstance(v, dict) and any("weight" in kk for kk in v.keys()):
+                        policy_state2 = v
+                        break
+                else:
+                    policy_state2 = params2
+                # паддинг
+                for kk in list(policy_state2.keys()):
+                    tt = policy_state2[kk]
+                    if isinstance(tt, torch.Tensor) and tt.dim()==2 and tt.shape[1]==OLD_N and tt.shape[0]==512 and "features_extractor" in kk:
+                        nt = torch.zeros((512, NEW_N), dtype=tt.dtype, device=tt.device)
+                        nt[:, :OLD_N] = tt
+                        policy_state2[kk] = nt
+                # загружаем в ppo_new
+                try:
+                    ppo_new.policy.load_state_dict(policy_state2, strict=False)
+                    print("  Fallback: загрузил падденный state_dict напрямую в новый PPO (strict=False)")
+                    # правим observation_space
+                    from gymnasium.spaces import Box, Dict
+                    try:
+                        am_space = ppo_new.observation_space.spaces["action_mask"]
+                    except Exception:
+                        am_space = Box(0,1,shape=(9,), dtype=bool)
+                    new_obs_space = Dict({"observation": Box(-1,4,shape=(NEW_N,), dtype="float32"), "action_mask": am_space})
+                    ppo_new.observation_space = new_obs_space
+                    ppo_new.policy.observation_space = new_obs_space
+                    dummy_env.close()
+                    return ppo_new
+                except Exception as ne:
+                    print(f"  Fallback load_state_dict упал: {ne}")
+                    raise
+            except Exception as ne2:
+                raise ne2
+        except Exception as e2:
+            print(f"  Fallback тоже упал: {e2}")
+            raise e
 
 def _migrate_vecnormalize_713_to_715(vec_path: str, base_env):
     """Грузит VecNormalize с 713 статистикой и расширяет obs_rms до 715 (mean 0, var 1 для новых 2 признаков)."""
