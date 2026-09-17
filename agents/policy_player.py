@@ -47,6 +47,7 @@ def run(
     bc_value_coef: float = 0.0,
     value_warmup_steps: int = 0,
     min_winrate: int = 25,
+    reset_schedules: bool = False,
 ):
     # phase_size должен делиться на n_steps*num_envs = 3072 для ровных роллаутов
     if phase_size % 3072 != 0:
@@ -56,7 +57,13 @@ def run(
 
     if resume_from:
         ppo = PPO.load(resume_from, device="cpu")
-        steps_done_holder = {"value": ppo.num_timesteps}
+        if reset_schedules:
+            print(f"Сбрасываю счетчики lr/ent: было {ppo.num_timesteps} шагов -> 0 (модель {resume_from})")
+            steps_done_holder = {"value": 0}
+            # сбрасываем и внутренний счетчик PPO чтобы логи и TB не прыгали
+            ppo.num_timesteps = 0
+        else:
+            steps_done_holder = {"value": ppo.num_timesteps}
         if ent_coef is not None:
             print(f"Переопределяю ent_coef: {ppo.ent_coef} -> {ent_coef}")
             ppo.ent_coef = ent_coef
@@ -345,6 +352,7 @@ if __name__ == "__main__":
     parser.add_argument("--bc-value-coef", type=float, default=0.0, help="BC value_coef вес value loss при претреине (0.0 только policy, 0.5 учит и value)")
     parser.add_argument("--value-warmup-steps", type=int, default=0, help="Сколько шагов после resume учить только value (заморозить policy) чтобы вылечить просадку -3->-29. Рекомендую 50000")
     parser.add_argument("--min-winrate", type=int, default=25, help="Порог %% vs Heuristics для сохранения qualified снапшота в self-play (было 50 -> 25, + fallback на обычные снапшоты когда нет qualified)")
+    parser.add_argument("--reset-schedules", action="store_true", help="Сбросить счетчик шагов для lr/ent расписаний при resume (lr 3e-5 снова с начала, ent 0.01). Нужно когда берешь фазу 300k и хочешь доучивать как с нуля)")
     args = parser.parse_args()
 
     # поддержка алиаса --lr
@@ -373,4 +381,5 @@ if __name__ == "__main__":
         bc_value_coef=args.bc_value_coef,
         value_warmup_steps=args.value_warmup_steps,
         min_winrate=args.min_winrate,
+        reset_schedules=args.reset_schedules,
     )
