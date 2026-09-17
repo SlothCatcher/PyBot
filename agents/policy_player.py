@@ -25,6 +25,11 @@ from agents.training import (
 import asyncio
 import torch
 import torch.nn as nn
+try:
+    from agents.curiosity import ICM, CuriosityVecWrapper
+except Exception:
+    ICM = None
+    CuriosityVecWrapper = None
 
 def _migrate_ppo_713_to_715(ppp_path: str):
     """Надёжная миграция 713->715 через паддинг весов в zip. Не зависит от глобального N_FEATURES."""
@@ -237,6 +242,14 @@ def run(
     reset_schedules: bool = False,
     eval_battles: int = 20,
     skip_eval: bool = False,
+    # --- ICM Variant B ---
+    icm: bool = False,
+    icm_beta: float = 0.05,
+    icm_anneal: bool = True,
+    icm_lr: float = 3e-4,
+    icm_feat_dim: int = 256,
+    icm_train_freq: int = 2048,
+    icm_batch_size: int = 128,
 ):
     # phase_size должен делиться на фактический размер роллаута n_steps*num_envs (с учётом целочисленного деления)
     rollout_size = (3072 // num_envs) * num_envs
@@ -244,6 +257,8 @@ def run(
         print(f"WARNING: phase_size {phase_size} не кратен фактическому размеру роллаута {rollout_size} (n_steps {3072 // num_envs} * num_envs {num_envs}). Будет обрезка последнего роллаута.")
 
     run_name = f"{'retrain' if resume_from else 'train'}_{time.strftime('%Y%m%d_%H%M%S')}"
+    icm_wrapper = None
+    icm_module = None
 
     if resume_from:
         try:
@@ -294,6 +309,28 @@ def run(
                 env = VecNormalize(base_env, norm_obs=True, norm_reward=norm_reward, gamma=0.99, norm_obs_keys=["observation"])
         else:
             env = base_env
+        # --- ICM Variant B (resume) ---
+        if icm:
+            if ICM is None or CuriosityVecWrapper is None:
+                print("ICM не доступен (agents/curiosity.py не загружен), игнорирую --icm")
+            else:
+                try:
+                    try:
+                        action_dim = int(base_env.action_space.n)
+                    except Exception:
+                        try:
+                            action_dim = int(env.action_space.n)
+                        except Exception:
+                            action_dim = 26
+                    from agents.config import N_FEATURES
+                    icm_module = ICM(obs_dim=N_FEATURES, action_dim=action_dim, feat_dim=int(icm_feat_dim)).to("cpu")
+                    env = CuriosityVecWrapper(env, icm=icm_module, beta=float(icm_beta), anneal=bool(icm_anneal), total_timesteps=int(total_timesteps), lr=float(icm_lr), device="cpu", train_freq=int(icm_train_freq), batch_size=int(icm_batch_size))
+                    icm_wrapper = env
+                    print(f"ICM включён (resume): beta={icm_beta} anneal={icm_anneal} feat={icm_feat_dim} action_dim={action_dim} lr={icm_lr}")
+                except Exception as e:
+                    print(f"Не удалось включить ICM: {e}")
+                    import traceback; traceback.print_exc()
+                    icm_wrapper = None
     else:
         steps_done_holder = {"value": 0}
         base_env = SubprocVecEnv([ExampleEnv.create_env for _ in range(num_envs)])
@@ -301,6 +338,28 @@ def run(
             env = VecNormalize(base_env, norm_obs=True, norm_reward=norm_reward, gamma=0.99, norm_obs_keys=["observation"])
         else:
             env = base_env
+        # --- ICM Variant B (fresh) ---
+        if icm:
+            if ICM is None or CuriosityVecWrapper is None:
+                print("ICM не доступен (agents/curiosity.py не загружен), игнорирую --icm")
+            else:
+                try:
+                    try:
+                        action_dim = int(base_env.action_space.n)
+                    except Exception:
+                        try:
+                            action_dim = int(env.action_space.n)
+                        except Exception:
+                            action_dim = 26
+                    from agents.config import N_FEATURES
+                    icm_module = ICM(obs_dim=N_FEATURES, action_dim=action_dim, feat_dim=int(icm_feat_dim)).to("cpu")
+                    env = CuriosityVecWrapper(env, icm=icm_module, beta=float(icm_beta), anneal=bool(icm_anneal), total_timesteps=int(total_timesteps), lr=float(icm_lr), device="cpu", train_freq=int(icm_train_freq), batch_size=int(icm_batch_size))
+                    icm_wrapper = env
+                    print(f"ICM включён (fresh): beta={icm_beta} anneal={icm_anneal} feat={icm_feat_dim} action_dim={action_dim} lr={icm_lr}")
+                except Exception as e:
+                    print(f"Не удалось включить ICM: {e}")
+                    import traceback; traceback.print_exc()
+                    icm_wrapper = None
         ppo = PPO(
             MaskedActorCriticPolicy,
             env,
@@ -478,6 +537,16 @@ def run(
             ppo.logger.record("train/learning_rate", float(cur_lr))
         except Exception:
             pass
+        # ICM логи
+        if icm and icm_wrapper is not None:
+            try:
+                ppo.logger.record("curiosity/beta", float(getattr(icm_wrapper, "beta", icm_beta)))
+                ppo.logger.record("curiosity/r_int_mean", float(getattr(icm_wrapper, "last_r_int_mean", 0.0)))
+                ppo.logger.record("curiosity/fwd_loss", float(getattr(icm_wrapper, "last_fwd_loss", 0.0)))
+                ppo.logger.record("curiosity/inv_loss", float(getattr(icm_wrapper, "last_inv_loss", 0.0)))
+                print(f"[curiosity] beta={getattr(icm_wrapper, 'beta', 0):.4f} r_int={getattr(icm_wrapper, 'last_r_int_mean', 0):.4f} fwd={getattr(icm_wrapper, 'last_fwd_loss', 0):.4f} inv={getattr(icm_wrapper, 'last_inv_loss', 0):.4f} replay={len(getattr(icm_wrapper, 'replay', []))}")
+            except Exception:
+                pass
         ppo.logger.dump(steps_done_holder["value"])
         print(f"[phase {counter}] {win_rates}")
 
@@ -509,6 +578,43 @@ def run(
                 [partial(ExampleEnv.create_env, opponent_weights=current_weights) for _ in range(num_envs)]
             )
             env = raw_env
+        # --- ICM re-wrap для новой фазы (сохраняем тот же icm_module) ---
+        if icm and icm_wrapper is not None and ICM is not None and CuriosityVecWrapper is not None:
+            try:
+                try:
+                    icm_module_reuse = icm_wrapper.icm
+                    old_beta = icm_wrapper.beta
+                    old_steps = getattr(icm_wrapper, "steps_done", 0)
+                    old_replay = getattr(icm_wrapper, "replay", None)
+                except Exception:
+                    icm_module_reuse = icm_module
+                    old_beta = icm_beta
+                    old_steps = 0
+                    old_replay = None
+                try:
+                    action_dim = int(raw_env.action_space.n)
+                except Exception:
+                    try:
+                        action_dim = int(env.action_space.n)
+                    except Exception:
+                        action_dim = getattr(icm_module_reuse, "action_dim", 26) if icm_module_reuse is not None else 26
+                if icm_module_reuse is None:
+                    from agents.config import N_FEATURES
+                    icm_module_reuse = ICM(obs_dim=N_FEATURES, action_dim=action_dim, feat_dim=int(icm_feat_dim)).to("cpu")
+                    old_beta = float(icm_beta)
+                env = CuriosityVecWrapper(env, icm=icm_module_reuse, beta=float(old_beta), anneal=bool(icm_anneal), total_timesteps=int(total_timesteps), lr=float(icm_lr), device="cpu", train_freq=int(icm_train_freq), batch_size=int(icm_batch_size))
+                try:
+                    if old_replay is not None:
+                        env.replay = old_replay
+                    env.steps_done = int(old_steps)
+                except Exception:
+                    pass
+                icm_wrapper = env
+                icm_module = icm_module_reuse
+                print(f"ICM перенесён на новый env (phase {counter+1}) beta={env.beta:.4f}")
+            except Exception as e:
+                print(f"ICM re-wrap failed: {e}")
+                import traceback; traceback.print_exc()
         ppo.set_env(env)
 
     ppo.save("models/ppo_policy_final")
@@ -575,6 +681,16 @@ if __name__ == "__main__":
     parser.add_argument("--reset-schedules", action="store_true", help="Сбросить счетчик шагов для lr/ent расписаний при resume (lr 3e-5 снова с начала, ent 0.01). Нужно когда берешь фазу 300k и хочешь доучивать как с нуля)")
     parser.add_argument("--eval-battles", type=int, default=20, help="Сколько боев на каждого бота в оценке между фазами (было 60 -> 20, 60*4=240 боев виснет на 5-10 мин)")
     parser.add_argument("--skip-eval", action="store_true", help="Пропустить оценку winrate между фазами (самый быстрый, если виснет на 60 боев)")
+    # --- ICM Variant B ---
+    parser.add_argument("--icm", action="store_true", help="Включить Intrinsic Curiosity Module (Variant B) r = r_ext + beta*r_int")
+    parser.add_argument("--icm-beta", type=float, default=0.05, help="Вес intrinsic награды (0.05 -> 0.01 с anneal)")
+    parser.add_argument("--icm-anneal", dest="icm_anneal", action="store_true", help="Аннилить beta 0.05->0.01 (по умолчанию вкл)")
+    parser.add_argument("--no-icm-anneal", dest="icm_anneal", action="store_false", help="Не аннилить beta")
+    parser.set_defaults(icm_anneal=True)
+    parser.add_argument("--icm-lr", type=float, default=3e-4, help="LR для ICM")
+    parser.add_argument("--icm-feat-dim", type=int, default=256, help="Размер фич ICM encoder")
+    parser.add_argument("--icm-train-freq", type=int, default=2048, help="Как часто тренировать ICM (шагов)")
+    parser.add_argument("--icm-batch-size", type=int, default=128, help="Batch для ICM")
     args = parser.parse_args()
 
     # поддержка алиаса --lr
@@ -606,4 +722,11 @@ if __name__ == "__main__":
         reset_schedules=args.reset_schedules,
         eval_battles=args.eval_battles,
         skip_eval=args.skip_eval,
+        icm=args.icm,
+        icm_beta=args.icm_beta,
+        icm_anneal=args.icm_anneal,
+        icm_lr=args.icm_lr,
+        icm_feat_dim=args.icm_feat_dim,
+        icm_train_freq=args.icm_train_freq,
+        icm_batch_size=args.icm_batch_size,
     )
