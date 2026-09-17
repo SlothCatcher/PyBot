@@ -16,7 +16,7 @@ from .features import embed_battle_with_fusion
 from .fusion_parser import _attach_fusion_parser
 from .players import PolicyPlayer
 
-_MAIN_PID = os.getpid()
+import multiprocessing
 
 
 def _snapshot_number(fname: str) -> int | None:
@@ -43,8 +43,8 @@ def _make_self_play_opponents():
     numbered = [(f, _snapshot_number(f)) for f in candidates]
     numbered = [(f, n) for f, n in numbered if n is not None]
     files = [f for f, _ in sorted(numbered, key=lambda pair: pair[1])][-3:]
-    # лог только 1 раз из главного процесса, иначе 8 воркеров спамят
-    if use_fallback and files and os.getpid() == _MAIN_PID:
+    # лог только 1 раз из главного процесса, иначе 8 воркеров спамят (на Windows spawn _MAIN_PID не работает)
+    if use_fallback and files and multiprocessing.current_process().name == "MainProcess":
         try:
             from agents.config import MIN_WINRATE_TO_QUALIFY
             print(f"self_play fallback: нет qualified (порог {MIN_WINRATE_TO_QUALIFY}), беру последние {len(files)} обычных снапшотов: {files}")
