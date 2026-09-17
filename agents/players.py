@@ -47,10 +47,14 @@ class PolicyPlayer(FusionInfoParser, Player):
         opp_fusion = self.get_fusion_entry(battle, is_ours=False)
         our_protect = self.get_protected_last_turn(battle, is_ours=True)
         opp_protect = self.get_protected_last_turn(battle, is_ours=False)
+        our_team_fusions = self.get_team_fusion_map(battle, is_ours=True) if hasattr(self, "get_team_fusion_map") else None
+        opp_team_fusions = self.get_team_fusion_map(battle, is_ours=False) if hasattr(self, "get_team_fusion_map") else None
         return embed_battle_with_fusion(
             battle, our_fusion, opp_fusion,
             our_protected_last_turn=our_protect,
             opp_protected_last_turn=opp_protect,
+            our_team_fusions=our_team_fusions,
+            opp_team_fusions=opp_team_fusions,
         )
 
 
@@ -74,6 +78,8 @@ class HeuristicRecorder(FusionInfoParser, SimpleHeuristicsPlayer):
             opp_fusion = self.get_fusion_entry(battle, is_ours=False)
             our_protect = self.get_protected_last_turn(battle, is_ours=True)
             opp_protect = self.get_protected_last_turn(battle, is_ours=False)
+            our_team_fusions = self.get_team_fusion_map(battle, is_ours=True) if hasattr(self, "get_team_fusion_map") else None
+            opp_team_fusions = self.get_team_fusion_map(battle, is_ours=False) if hasattr(self, "get_team_fusion_map") else None
             mask = np.array(SinglesEnv.get_action_mask(battle))
             action = SinglesEnv.order_to_action(order, battle, fake=False, strict=False)
             if action is not None and action >= 0:
@@ -89,8 +95,12 @@ class HeuristicRecorder(FusionInfoParser, SimpleHeuristicsPlayer):
                     battle, our_fusion, opp_fusion,
                     our_protected_last_turn=our_protect,
                     opp_protected_last_turn=opp_protect,
+                    our_team_fusions=our_team_fusions,
+                    opp_team_fusions=opp_team_fusions,
                 )
                 self.dataset.append((obs, mask, action, battle.battle_tag))
         except Exception as e:
+            # на один тестовый прогон можно раскомментировать для отладки маскирующих try/except
+            # print(f"WARN HeuristicRecorder.choose_move: {e}")
             pass
         return order

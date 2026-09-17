@@ -706,22 +706,27 @@ def _bench_moves_vec(mon, opp_active, type_chart) -> np.ndarray:
     return vec
 
 def _trick_room_flag(battle) -> float:
+    # надёжно: poke_env Field.TRICK_ROOM или pseudo_weather TRICK_ROOM
     try:
-        # poke_env: battle.fields may contain pseudo weather? check side conditions and battle attribute
+        # 1) прямой атрибут
         if getattr(battle, "trick_room", False):
             return 1.0
-        # fallback: check in fields dict keys as string
-        for k in list(getattr(battle, "fields", {}).keys()) + list(getattr(battle, "pseudo_weather", {}).keys() if hasattr(battle, "pseudo_weather") else []):
-            n = getattr(k, "name", str(k)).lower()
-            if "trick" in n:
-                return 1.0
-        # check side_conditions for trick room
-        for k in battle.side_conditions.keys():
-            if "trick" in getattr(k, "name", str(k)).lower():
-                return 1.0
-        for k in battle.opponent_side_conditions.keys():
-            if "trick" in getattr(k, "name", str(k)).lower():
-                return 1.0
+        # 2) fields / pseudo_weather по enum
+        for attr in ("fields", "pseudo_weather", "pseudoWeather"):
+            d = getattr(battle, attr, None)
+            if isinstance(d, dict):
+                for k in d.keys():
+                    n = getattr(k, "name", str(k)).lower().replace(" ", "").replace("_", "")
+                    if n == "trickroom":
+                        return 1.0
+        # 3) fallback строковый поиск (оставляем как страховку)
+        for src in (getattr(battle, "fields", {}), getattr(battle, "pseudo_weather", {}) if hasattr(battle, "pseudo_weather") else {}):
+            try:
+                for k in src.keys():
+                    if "trick" in getattr(k, "name", str(k)).lower():
+                        return 1.0
+            except Exception:
+                pass
     except Exception:
         pass
     return 0.0
@@ -911,7 +916,7 @@ def _move_wasted_flag(move, battle) -> float:
     return 0.0
 
 
-def embed_battle_with_fusion(battle, our_fusion, opp_fusion, our_protected_last_turn=0.0, opp_protected_last_turn=0.0, our_team_fusions: dict | None = None, opp_team_fusions: dict | None = None):
+def embed_battle_with_fusion(battle, our_fusion, opp_fusion, our_protected_last_turn=0.0, opp_protected_last_turn=0.0, our_team_fusions: dict | None = None, opp_team_fusions: dict | None = None, debug: bool = False):
     from poke_env.data import GenData
 
     moves_base_power = -np.ones(4)
@@ -1018,6 +1023,8 @@ def embed_battle_with_fusion(battle, our_fusion, opp_fusion, our_protected_last_
     our_can_tera_now = _can_tera_now(battle)
     our_used_tera = _team_used_tera(battle.team)
     opp_used_tera = _team_used_tera(battle.opponent_team)
+    our_is_tera = _is_terastallized(battle.active_pokemon)
+    opp_is_tera = _is_terastallized(battle.opponent_active_pokemon)
     our_tera_type = _tera_type_vec(battle.active_pokemon)
     trick_room = _trick_room_flag(battle)
     our_tailwind = _tailwind_flags(battle.side_conditions)
@@ -1052,11 +1059,18 @@ def embed_battle_with_fusion(battle, our_fusion, opp_fusion, our_protected_last_
             our_bench, opp_bench,
             [our_vulnerability, opp_vulnerability],
             [our_can_tera_now, our_used_tera, opp_used_tera],
+            [our_is_tera, opp_is_tera],
             our_tera_type,
             [our_protected_last_turn, opp_protected_last_turn]
         ],
         dtype=np.float32,
     )
     if not np.isfinite(obs).all():
+        if debug:
+            print(f"WARN embed_battle_with_fusion non-finite: {np.where(~np.isfinite(obs))[0][:10]}")
         obs = np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
+    # защита от рассинхрона N_FEATURES (было 3 инцидента ручного подсчёта)
+    from .config import N_FEATURES
+    if obs.shape[0] != N_FEATURES:
+        raise AssertionError(f"embed_battle_with_fusion вернула {obs.shape[0]}, а N_FEATURES={N_FEATURES}. Обнови config.py (ожидалось 713+2 тера-флага=715).")
     return obs

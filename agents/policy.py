@@ -5,10 +5,10 @@ from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
 from .config import N_FEATURES
 
-# N_FEATURES вырос 594 -> 629 -> 641 -> 653 -> 713 (+20% за 2 итерации).
-# Старая голова [512,256,128] shared была узким местом: 713*512=365k в первом слое,
-# но shared pi/vf конфликтовали (value масштаб ±30 vs policy), а bench 400/713 (56%)
-# доминировал и забивал градиенты остальных 313 признаков.
+# N_FEATURES вырос 594 -> 629 -> 641 -> 653 -> 713 -> 715 (+20% за 2 итерации, 715=+2 is_tera).
+# Старая голова [512,256,128] shared была узким местом: 715*512=366k в первом слое,
+# но shared pi/vf конфликтовали (value масштаб ±30 vs policy), а bench 400/715 (56%)
+# доминировал и забивал градиенты остальных 315 признаков.
 # Новая архитектура:
 #  - FeaturesExtractor: 713 -> 512 + LayerNorm + ReLU (+ Dropout 0.1) — нормализует bench-спарсность
 #    и изолирует нормализацию от VecNormalize (который тоже нормализует, но глобально).
@@ -20,7 +20,7 @@ from .config import N_FEATURES
 
 
 class FeaturesExtractor(BaseFeaturesExtractor):
-    """Нормализует 713 признаков перед pi/vf головами. features_dim=512."""
+    """Нормализует 715 признаков перед pi/vf головами. features_dim=512."""
     def __init__(self, observation_space, features_dim: int = 512, dropout: float = 0.1):
         super().__init__(observation_space, features_dim=features_dim)
         self.net = nn.Sequential(

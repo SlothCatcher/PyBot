@@ -161,10 +161,15 @@ class ExampleEnv(SinglesEnv):
         opp_side = "p2" if our_side == "p1" else "p1"
         our_protect = 1.0 if protect_state.get(f"last_{our_side}", False) else 0.0
         opp_protect = 1.0 if protect_state.get(f"last_{opp_side}", False) else 0.0
+        # per-species карты для скамейки (было None -> заниженные дексовые статы резерва)
+        our_team_fusions = source._fusion_stats.get(battle.battle_tag, {}).get(f"{our_side}_by_species")
+        opp_team_fusions = source._fusion_stats.get(battle.battle_tag, {}).get(f"{opp_side}_by_species")
         return embed_battle_with_fusion(
             battle,
             our_fusion=fusion_entry(True),
             opp_fusion=fusion_entry(False),
             our_protected_last_turn=our_protect,
             opp_protected_last_turn=opp_protect,
+            our_team_fusions=our_team_fusions,
+            opp_team_fusions=opp_team_fusions,
         )
