@@ -8,7 +8,7 @@ N_FEATURES = 713  # 120 moves(4*30) +4 faint/hp +14 status +8 hazards +4 switche
 VECNORM_PATH = "models/vecnormalize.pkl"
 SELF_PLAY_PATH = "models/self_play_snapshot"
 QUALIFIED_PREFIX = "self_play_qualified_"
-MIN_WINRATE_TO_QUALIFY = 50
+MIN_WINRATE_TO_QUALIFY = 30  # было 50 - при 25% vs Heuristics self_play никогда не появлялся, 100% heuristic -> плато -20 на 8M
 
 # --- монки-патчи библиотеки poke-env, применяются один раз при импорте ---
 
