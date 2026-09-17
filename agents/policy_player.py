@@ -105,6 +105,19 @@ def _migrate_ppo_713_to_715(ppp_path: str):
             print(f"  Сохраняю пропатченный чекпоинт во временный файл {tmp_path}")
             ppo_new = PPO.load(tmp_path, device="cpu")
             print(f"  Успешно загрузил мигрированный PPO")
+            # критично: сбрасываем Adam моменты (713) — иначе exp_avg 713 vs grad 715 -> RuntimeError
+            try:
+                if hasattr(ppo_new, "policy") and hasattr(ppo_new.policy, "optimizer") and ppo_new.policy.optimizer is not None:
+                    ppo_new.policy.optimizer.state.clear()
+                    print("    сбросил optimizer.state (713->715)")
+            except Exception as _e:
+                print(f"    не удалось сбросить optimizer.state: {_e}")
+            try:
+                # на всякий: SB3 иногда хранит optimizer в ppo.optimizer
+                if hasattr(ppo_new, "optimizer") and ppo_new.optimizer is not None:
+                    ppo_new.optimizer.state.clear()
+            except Exception:
+                pass
             return ppo_new
         finally:
             try:
