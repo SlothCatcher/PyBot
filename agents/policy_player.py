@@ -578,19 +578,27 @@ def run(
                 [partial(ExampleEnv.create_env, opponent_weights=current_weights) for _ in range(num_envs)]
             )
             env = raw_env
-        # --- ICM re-wrap для новой фазы (сохраняем тот же icm_module) ---
+        # --- ICM re-wrap для новой фазы (сохраняем тот же icm_module и optimizer) ---
         if icm and icm_wrapper is not None and ICM is not None and CuriosityVecWrapper is not None:
             try:
                 try:
                     icm_module_reuse = icm_wrapper.icm
-                    old_beta = icm_wrapper.beta
-                    old_steps = getattr(icm_wrapper, "steps_done", 0)
+                    old_beta = float(getattr(icm_wrapper, "beta", icm_beta))
+                    old_initial_beta = float(getattr(icm_wrapper, "initial_beta", icm_beta))
+                    old_steps = int(getattr(icm_wrapper, "steps_done", 0))
                     old_replay = getattr(icm_wrapper, "replay", None)
+                    old_opt_state = None
+                    try:
+                        old_opt_state = icm_wrapper.optimizer.state_dict()
+                    except Exception:
+                        old_opt_state = None
                 except Exception:
                     icm_module_reuse = icm_module
-                    old_beta = icm_beta
+                    old_beta = float(icm_beta)
+                    old_initial_beta = float(icm_beta)
                     old_steps = 0
                     old_replay = None
+                    old_opt_state = None
                 try:
                     action_dim = int(raw_env.action_space.n)
                 except Exception:
@@ -601,17 +609,34 @@ def run(
                 if icm_module_reuse is None:
                     from agents.config import N_FEATURES
                     icm_module_reuse = ICM(obs_dim=N_FEATURES, action_dim=action_dim, feat_dim=int(icm_feat_dim)).to("cpu")
+                    old_initial_beta = float(icm_beta)
                     old_beta = float(icm_beta)
-                env = CuriosityVecWrapper(env, icm=icm_module_reuse, beta=float(old_beta), anneal=bool(icm_anneal), total_timesteps=int(total_timesteps), lr=float(icm_lr), device="cpu", train_freq=int(icm_train_freq), batch_size=int(icm_batch_size))
+                    old_opt_state = None
+                # создаём новый wrapper с исходным initial_beta, чтобы аннилинг продолжался корректно 0.05->0.01
+                env = CuriosityVecWrapper(env, icm=icm_module_reuse, beta=float(old_initial_beta), anneal=bool(icm_anneal), total_timesteps=int(total_timesteps), lr=float(icm_lr), device="cpu", train_freq=int(icm_train_freq), batch_size=int(icm_batch_size))
                 try:
                     if old_replay is not None:
                         env.replay = old_replay
                     env.steps_done = int(old_steps)
+                    # восстанавливаем текущий beta (иначе сбросится к initial)
+                    env.beta = float(old_beta)
+                    # сохраняем оптимизатор (моменты)
+                    if old_opt_state is not None:
+                        try:
+                            env.optimizer.load_state_dict(old_opt_state)
+                        except Exception as _oe:
+                            print(f"ICM optimizer restore warn: {_oe}")
+                    # пробрасываем последние логи
+                    for k in ("last_r_int_mean", "last_fwd_loss", "last_inv_loss"):
+                        try:
+                            setattr(env, k, getattr(icm_wrapper, k, 0.0))
+                        except Exception:
+                            pass
                 except Exception:
                     pass
                 icm_wrapper = env
                 icm_module = icm_module_reuse
-                print(f"ICM перенесён на новый env (phase {counter+1}) beta={env.beta:.4f}")
+                print(f"ICM перенесён на новый env (phase {counter+1}) beta={env.beta:.4f} steps={env.steps_done} replay={len(env.replay)}")
             except Exception as e:
                 print(f"ICM re-wrap failed: {e}")
                 import traceback; traceback.print_exc()

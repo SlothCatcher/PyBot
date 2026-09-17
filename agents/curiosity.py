@@ -18,7 +18,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from collections import deque
-import gymnasium as gym
 from stable_baselines3.common.vec_env.base_vec_env import VecEnvWrapper, VecEnv
 from stable_baselines3.common.vec_env import VecNormalize
 
@@ -59,6 +58,7 @@ class ICM(nn.Module):
 
     def forward_loss(self, obs: torch.Tensor, actions: torch.Tensor, next_obs: torch.Tensor):
         """Считает inv_loss, fwd_loss, r_int (per-sample). actions: LongTensor [B]"""
+        actions = torch.clamp(actions, 0, self.action_dim - 1)
         phi = self.encode(obs)
         phi_next = self.encode(next_obs)
         # inverse
@@ -75,17 +75,20 @@ class ICM(nn.Module):
 
     def intrinsic_reward(self, obs: np.ndarray, actions: np.ndarray, next_obs: np.ndarray, device="cpu"):
         """Быстрый r_int без градиента, для VecEnv step. obs: [N,715], actions: [N], next_obs: [N,715] -> [N]"""
+        was_training = self.training
         self.eval()
         with torch.no_grad():
             obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device)
             next_t = torch.as_tensor(next_obs, dtype=torch.float32, device=device)
             act_t = torch.as_tensor(actions, dtype=torch.long, device=device)
+            # clamp actions to valid range (на случай если action_space 26 а env даёт 9, или наоборот)
+            act_t = torch.clamp(act_t, 0, self.action_dim - 1)
             phi = self.encode(obs_t)
             phi_next = self.encode(next_t)
             a_onehot = F.one_hot(act_t, num_classes=self.action_dim).float().to(device)
             pred = self.forward_model(torch.cat([phi, a_onehot], dim=-1))
             r = (pred - phi_next).pow(2).mean(dim=-1).cpu().numpy()
-        self.train()
+        self.train(was_training)
         return r
 
 
@@ -118,6 +121,42 @@ class CuriosityVecWrapper(VecEnvWrapper):
         self.last_fwd_loss = 0.0
         self.last_r_int_mean = 0.0
 
+    @property
+    def training(self):
+        inner = self.get_vec_normalize_env()
+        if inner is not None and hasattr(inner, "training"):
+            return inner.training
+        return getattr(self.venv, "training", True)
+
+    @training.setter
+    def training(self, value):
+        inner = self.get_vec_normalize_env()
+        if inner is not None and hasattr(inner, "training"):
+            inner.training = value
+        else:
+            try:
+                self.venv.training = value
+            except Exception:
+                pass
+
+    @property
+    def norm_reward(self):
+        inner = self.get_vec_normalize_env()
+        if inner is not None and hasattr(inner, "norm_reward"):
+            return inner.norm_reward
+        return getattr(self.venv, "norm_reward", False)
+
+    @norm_reward.setter
+    def norm_reward(self, value):
+        inner = self.get_vec_normalize_env()
+        if inner is not None and hasattr(inner, "norm_reward"):
+            inner.norm_reward = value
+        else:
+            try:
+                self.venv.norm_reward = value
+            except Exception:
+                pass
+
     def _get_obs_array(self, obs_dict):
         """Достаёт np array [N,715] из VecEnv obs (может быть dict или ndarray)."""
         if isinstance(obs_dict, dict) and "observation" in obs_dict:
@@ -143,49 +182,58 @@ class CuriosityVecWrapper(VecEnvWrapper):
 
     def step_wait(self):
         obs, rewards, dones, infos = self.venv.step_wait()
-        # rewards уже нормализованы VecNormalize если он внутри, но мы снаружи — поэтому это r_ext_norm
-        # считаем r_int только если есть last_obs и icm
         try:
             if self.last_obs is not None and self._actions is not None:
                 last_arr = self._get_obs_array(self.last_obs)
                 next_arr = self._get_obs_array(obs)
+                # done: заменяем reset-obs на истинный terminal_observation (иначе ICM учится на артефакте)
+                try:
+                    dones_arr = np.asarray(dones, dtype=bool)
+                    if dones_arr.any():
+                        for i, d in enumerate(dones_arr):
+                            if d and i < len(infos) and isinstance(infos[i], dict):
+                                term = infos[i].get("terminal_observation")
+                                if term is not None:
+                                    try:
+                                        if isinstance(term, dict) and "observation" in term:
+                                            next_arr[i] = np.asarray(term["observation"], dtype=np.float32)
+                                        else:
+                                            arr = np.asarray(term, dtype=np.float32)
+                                            # иногда VecNormalize даёт terminal_observation как dict с ключами
+                                            if arr.shape != next_arr[i].shape and arr.size == next_arr[i].size:
+                                                arr = arr.reshape(next_arr[i].shape)
+                                            next_arr[i] = arr
+                                    except Exception:
+                                        pass
+                except Exception:
+                    pass
                 actions = self._actions
-                # beta annealing
                 if self.anneal and self.total_timesteps > 0:
                     progress = min(self.steps_done / self.total_timesteps, 1.0)
-                    # 0.05 -> 0.01 линейно, можно до 0.005
                     self.beta = self.initial_beta * (1 - progress) + 0.01 * progress
-                # считаем r_int per-env
-                # для done — всё равно считаем (терминальный переход тоже информативен)
                 r_int = self.icm.intrinsic_reward(last_arr, actions, next_arr, device=self.device)
-                # клип для стабильности (иногда MSE взлетает на 10+)
                 r_int = np.clip(r_int, 0, 5.0)
                 self.last_r_int_mean = float(r_int.mean()) if r_int.size else 0.0
-                # добавляем к награде
                 rewards = np.asarray(rewards, dtype=np.float32) + self.beta * r_int.astype(np.float32)
-                # копим в replay для обучения (только не-done? копим всё)
-                # храним как tuple (obs, act, next_obs)
                 for i in range(len(actions)):
-                    # пропускаем если obs содержит nan/inf
                     if not np.isfinite(last_arr[i]).all() or not np.isfinite(next_arr[i]).all():
                         continue
-                    self.replay.append((last_arr[i].copy(), int(actions[i]), next_arr[i].copy()))
+                    a = int(actions[i])
+                    # страховка от несовпадения action_dim (26 vs 9)
+                    a = int(np.clip(a, 0, self.icm.action_dim - 1))
+                    self.replay.append((last_arr[i].copy(), a, next_arr[i].copy()))
                 self.steps_done += len(actions)
-                # периодическое обучение ICM
                 if len(self.replay) >= self.batch_size and self.steps_done % self.train_freq < len(actions):
                     self._train_icm_step()
-                # логируем в infos для tensorboard если нужно
                 for i, info in enumerate(infos):
                     if isinstance(info, dict):
                         info["r_int"] = float(r_int[i]) if i < len(r_int) else 0.0
                         info["beta"] = float(self.beta)
         except Exception as e:
-            # не роняем rollout из-за curiosity
             print(f"CuriosityVecWrapper step_wait warn: {e}")
             import traceback
             traceback.print_exc()
         self.last_obs = obs
-        # дones: last_obs для следующего шага уже obs, но для done-энвов next reset будет новый obs — ок
         return obs, rewards, dones, infos
 
     def _train_icm_step(self):
