@@ -116,6 +116,66 @@ DEFAULT_CHUNK_SIZE = 1000
 def _ensure_dir(p: str):
     os.makedirs(p, exist_ok=True)
 
+def _sanitize_for_pickle(obj):
+    """Пробует pickle, если падает из-за _thread.lock — заменяет непиклибельные battles на SimpleNamespace(won)."""
+    try:
+        pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+        return obj
+    except Exception as e:
+        if "cannot pickle" not in str(e) and "_thread.lock" not in str(e) and "lock" not in str(e).lower():
+            # неизвестная ошибка — всё равно пробуем санитизацию
+            pass
+        # пытаемся санитизировать battles/raw_dataset
+        try:
+            import types, copy
+            if isinstance(obj, dict) and "battles" in obj and "raw_dataset" in obj:
+                battles = obj.get("battles", {})
+                sanitized_battles = {}
+                for k, v in list(battles.items())[:10000]:
+                    try:
+                        pickle.dumps(v, protocol=pickle.HIGHEST_PROTOCOL)
+                        sanitized_battles[k] = v
+                    except Exception:
+                        try:
+                            ns = types.SimpleNamespace()
+                            ns.won = getattr(v, "won", None)
+                            ns.battle_tag = getattr(v, "battle_tag", k)
+                            sanitized_battles[k] = ns
+                        except Exception:
+                            continue
+                # raw_dataset: каждый entry[0] может быть battle_copy
+                raw = obj.get("raw_dataset", [])
+                sanitized_raw = []
+                for entry in raw:
+                    if len(entry) == 8:
+                        bc, mask, act, tag, of, opf, opr, oppr = entry
+                        try:
+                            pickle.dumps(bc, protocol=pickle.HIGHEST_PROTOCOL)
+                            sanitized_raw.append(entry)
+                        except Exception:
+                            try:
+                                # stripped stub уже должен быть пиклибелен — если нет, пропускаем bc
+                                import types as _t
+                                stub = _t.SimpleNamespace()
+                                for attr in ["battle_tag","gen","weather","fields","side_conditions","opponent_side_conditions","available_moves","team","opponent_team","active_pokemon","opponent_active_pokemon","player_role"]:
+                                    if hasattr(bc, attr):
+                                        try:
+                                            stub.__dict__[attr] = getattr(bc, attr)
+                                        except Exception:
+                                            pass
+                                stub.battle_tag = getattr(bc, "battle_tag", tag)
+                                sanitized_raw.append((stub, mask, act, tag, of, opf, opr, oppr))
+                            except Exception:
+                                sanitized_raw.append((None, mask, act, tag, of, opf, opr, oppr))
+                    else:
+                        sanitized_raw.append(entry)
+                return {"raw_dataset": sanitized_raw, "battles": sanitized_battles, "chunk_idx": obj.get("chunk_idx")}
+            else:
+                return obj
+        except Exception:
+            return obj
+    return obj
+
 def _count_raw_chunk_battles() -> int:
     if not os.path.isdir(HEURISTIC_RAW_CACHE_DIR):
         return 0
@@ -168,8 +228,11 @@ def _save_raw_chunk(raw_dataset: list, battles: dict, chunk_idx: int):
     _ensure_dir(HEURISTIC_RAW_CACHE_DIR)
     path = os.path.join(HEURISTIC_RAW_CACHE_DIR, f"raw_chunk_{chunk_idx:04d}.pkl")
     tmp = path + ".tmp"
+    payload = {"raw_dataset": raw_dataset, "battles": battles, "chunk_idx": chunk_idx}
+    # защита от cannot pickle '_thread.lock' — санитизируем если нужно
+    payload = _sanitize_for_pickle(payload)
     with open(tmp, "wb") as f:
-        pickle.dump({"raw_dataset": raw_dataset, "battles": battles, "chunk_idx": chunk_idx}, f, protocol=pickle.HIGHEST_PROTOCOL)
+        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
     os.replace(tmp, path)
     try:
         import json
@@ -592,8 +655,10 @@ def _save_heuristic_raw_cache(raw_dataset: list, battles: dict, n_battles: int):
     try:
         import pickle, json
         os.makedirs(os.path.dirname(HEURISTIC_RAW_CACHE), exist_ok=True)
+        payload = {"raw_dataset": raw_dataset, "battles": battles, "n_battles": n_battles}
+        payload = _sanitize_for_pickle(payload)
         with open(HEURISTIC_RAW_CACHE, "wb") as f:
-            pickle.dump({"raw_dataset": raw_dataset, "battles": battles, "n_battles": n_battles}, f, protocol=pickle.HIGHEST_PROTOCOL)
+            pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
         # лёгкий meta для быстрой проверки без загрузки pickle
         try:
             with open(HEURISTIC_RAW_CACHE + ".meta.json", "w") as mf:
@@ -998,18 +1063,30 @@ def evaluate_win_rates(ppo, n_battles: int = 180) -> dict[str, float]:
         c(battle_format=BATTLE_FORMAT, max_concurrent_battles=30)
         for c in [RandomPlayer, MaxBasePowerPlayer, SimpleHeuristicsPlayer]
     ]
+    n_sp_appended = 0
+    sp_opps: list = []
     try:
         from .env import _make_self_play_opponents
         sp_opps = _make_self_play_opponents()
         if sp_opps:
-            opponents.append(sp_opps[-1])
+            # _make_self_play_opponents() возвращает до 3 снапшотов, но добавляем ровно 1
+            # и создаём свежий PolicyPlayer без start_listening=False (battle_against нужен слушающий сокет)
+            # иначе battle_against может зависнуть с 0 finished battles
+            base_sp = sp_opps[-1]
+            try:
+                eval_sp = PolicyPlayer(policy=getattr(base_sp, "policy", None), battle_format=BATTLE_FORMAT, max_concurrent_battles=30)
+                opponents.append(eval_sp)
+            except Exception:
+                opponents.append(base_sp)
+            n_sp_appended = 1
     except Exception:
         sp_opps = []
+        n_sp_appended = 0
 
     asyncio.run(base_agent.battle_against(*opponents, n_battles=n_battles))
     rates: dict[str, float] = {}
     for idx, opp in enumerate(opponents):
-        if idx >= len(opponents) - len(sp_opps) and sp_opps:
+        if n_sp_appended and idx >= len(opponents) - n_sp_appended:
             key = "self_play"
         else:
             key = opp.__class__.__name__

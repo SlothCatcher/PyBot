@@ -84,12 +84,37 @@ class HeuristicRecorder(FusionInfoParser, SimpleHeuristicsPlayer):
             action = SinglesEnv.order_to_action(order, battle, fake=False, strict=False)
             if action is not None and action >= 0:
                 # сырой кэш: deepcopy battle для последующей перегенерации obs при смене признаков
+                # защита от cannot pickle '_thread.lock' (если battle держит ссылку на Player/websocket)
                 try:
-                    import copy
+                    import copy, pickle
                     battle_copy = copy.deepcopy(battle)
+                    # быстрый тест пиклибельности — если падает, делаем stripped stub
+                    try:
+                        pickle.dumps(battle_copy, protocol=pickle.HIGHEST_PROTOCOL)
+                    except Exception:
+                        # fallback: минимальный объект только с нужными для embed полями
+                        import types
+                        stub = types.SimpleNamespace()
+                        for attr in ["battle_tag","gen","weather","fields","side_conditions","opponent_side_conditions","available_moves","team","opponent_team","active_pokemon","opponent_active_pokemon","player_role","can_tera","won"]:
+                            if hasattr(battle, attr):
+                                try:
+                                    stub.__dict__[attr] = copy.deepcopy(getattr(battle, attr))
+                                except Exception:
+                                    try:
+                                        stub.__dict__[attr] = getattr(battle, attr)
+                                    except Exception:
+                                        pass
+                        battle_copy = stub
                 except Exception:
-                    battle_copy = battle  # fallback: shallow (лучше чем ничего)
-                self.raw_dataset.append((battle_copy, mask, action, battle.battle_tag, our_fusion, opp_fusion, our_protect, opp_protect))
+                    try:
+                        battle_copy = battle  # последний fallback: shallow
+                    except Exception:
+                        battle_copy = None
+                if battle_copy is not None:
+                    self.raw_dataset.append((battle_copy, mask, action, battle.battle_tag, our_fusion, opp_fusion, our_protect, opp_protect))
+                else:
+                    # не удалось получить копию — пропускаем сырой кэш, но всё равно пишем obs
+                    pass
                 # сразу считаем obs для текущей сессии (чтобы не пересчитывать)
                 obs = embed_battle_with_fusion(
                     battle, our_fusion, opp_fusion,
