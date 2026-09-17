@@ -46,7 +46,7 @@ def run(
     vf_coef: float = 0.5,
     bc_value_coef: float = 0.0,
     value_warmup_steps: int = 0,
-    min_winrate: int = 30,
+    min_winrate: int = 25,
 ):
     # phase_size должен делиться на n_steps*num_envs = 3072 для ровных роллаутов
     if phase_size % 3072 != 0:
@@ -344,7 +344,7 @@ if __name__ == "__main__":
     parser.add_argument("--vf-coef", type=float, default=0.5, help="PPO vf_coef вес value loss (0.5 по умолчанию)")
     parser.add_argument("--bc-value-coef", type=float, default=0.0, help="BC value_coef вес value loss при претреине (0.0 только policy, 0.5 учит и value)")
     parser.add_argument("--value-warmup-steps", type=int, default=0, help="Сколько шагов после resume учить только value (заморозить policy) чтобы вылечить просадку -3->-29. Рекомендую 50000")
-    parser.add_argument("--min-winrate", type=int, default=30, help="Порог %% vs Heuristics для сохранения qualified снапшота в self-play (было 50, теперь 30 - при 25% на старте 50 никогда не появлялся -> плато -20 на 8M)")
+    parser.add_argument("--min-winrate", type=int, default=25, help="Порог %% vs Heuristics для сохранения qualified снапшота в self-play (было 50 -> 25, + fallback на обычные снапшоты когда нет qualified)")
     args = parser.parse_args()
 
     # поддержка алиаса --lr
