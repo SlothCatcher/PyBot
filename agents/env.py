@@ -1,4 +1,5 @@
 import random
+import os
 from os import listdir
 from os.path import isfile, join
 
@@ -15,6 +16,8 @@ from .features import embed_battle_with_fusion
 from .fusion_parser import _attach_fusion_parser
 from .players import PolicyPlayer
 
+_MAIN_PID = os.getpid()
+
 
 def _snapshot_number(fname: str) -> int | None:
     suffix = fname.split("_")[-1].split(".")[0]
@@ -23,26 +26,30 @@ def _snapshot_number(fname: str) -> int | None:
 
 def _make_self_play_opponents():
     model_dir = "models/"
-    # сначала пробуем qualified (прошли порог)
     try:
         candidates = [f for f in listdir(model_dir) if isfile(join(model_dir, f)) and QUALIFIED_PREFIX in f]
     except FileNotFoundError:
         candidates = []
-    # FALLBACK: если qualified пусто (у тебя 31.7% BC есть, но PPO упал до 25% и 30 не пробивает -> deadlock),
-    # берем обычные self_play_snapshot_* чтобы не висеть 8M на 100% heuristic
+    use_fallback = False
     if not candidates:
         try:
-            # берем последние 3 обычных снапшота как self_play, даже если они <порога
             from agents.config import SELF_PLAY_PATH
             prefix = SELF_PLAY_PATH.split("/")[-1] + "_"
             candidates = [f for f in listdir(model_dir) if isfile(join(model_dir, f)) and f.startswith(prefix) and QUALIFIED_PREFIX not in f]
             if candidates:
-                print(f"self_play fallback: нет qualified (порог 30), беру последние {len(candidates)} обычных снапшотов")
+                use_fallback = True
         except Exception:
             pass
     numbered = [(f, _snapshot_number(f)) for f in candidates]
     numbered = [(f, n) for f, n in numbered if n is not None]
     files = [f for f, _ in sorted(numbered, key=lambda pair: pair[1])][-3:]
+    # лог только 1 раз из главного процесса, иначе 8 воркеров спамят
+    if use_fallback and files and os.getpid() == _MAIN_PID:
+        try:
+            from agents.config import MIN_WINRATE_TO_QUALIFY
+            print(f"self_play fallback: нет qualified (порог {MIN_WINRATE_TO_QUALIFY}), беру последние {len(files)} обычных снапшотов: {files}")
+        except Exception:
+            pass
 
     players = []
     for fname in files:
