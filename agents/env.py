@@ -23,10 +23,23 @@ def _snapshot_number(fname: str) -> int | None:
 
 def _make_self_play_opponents():
     model_dir = "models/"
+    # сначала пробуем qualified (прошли порог)
     try:
         candidates = [f for f in listdir(model_dir) if isfile(join(model_dir, f)) and QUALIFIED_PREFIX in f]
     except FileNotFoundError:
-        return []
+        candidates = []
+    # FALLBACK: если qualified пусто (у тебя 31.7% BC есть, но PPO упал до 25% и 30 не пробивает -> deadlock),
+    # берем обычные self_play_snapshot_* чтобы не висеть 8M на 100% heuristic
+    if not candidates:
+        try:
+            # берем последние 3 обычных снапшота как self_play, даже если они <порога
+            from agents.config import SELF_PLAY_PATH
+            prefix = SELF_PLAY_PATH.split("/")[-1] + "_"
+            candidates = [f for f in listdir(model_dir) if isfile(join(model_dir, f)) and f.startswith(prefix) and QUALIFIED_PREFIX not in f]
+            if candidates:
+                print(f"self_play fallback: нет qualified (порог 30), беру последние {len(candidates)} обычных снапшотов")
+        except Exception:
+            pass
     numbered = [(f, _snapshot_number(f)) for f in candidates]
     numbered = [(f, n) for f, n in numbered if n is not None]
     files = [f for f, _ in sorted(numbered, key=lambda pair: pair[1])][-3:]
