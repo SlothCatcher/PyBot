@@ -1070,24 +1070,33 @@ def _damage_block(battle, our_fusion, opp_fusion, our_team_fusions=None, opp_tea
         our_team_fusions = our_team_fusions or {}
         opp_team_fusions = opp_team_fusions or {}
 
-        def _fusion_for(mon):
+        def _fusion_for(mon, own_map):
+            """Фьюжн-запись ТОЛЬКО со своей стороны.
+
+            Раньше при отсутствии вида в своей карте подставлялась чужая
+            (`our_team_fusions.get(sid) or opp_team_fusions.get(sid)`): если у обоих игроков
+            совпадала species, наш покемон получал статы фьюжна противника (и наоборот).
+            Фьюжн-партнёры у одинаковых species могут быть разными, поэтому чужая карта не
+            используется вовсе — нет записи, значит статы берутся из декса (`prepare_mon`
+            с None), как и для любого неизвестного случая.
+            """
             sid = str(getattr(mon, "species", "") or "")
             try:
                 from poke_env.data.normalize import to_id_str
                 sid = to_id_str(sid) or sid
             except Exception:
                 pass
-            return our_team_fusions.get(sid) or opp_team_fusions.get(sid)
+            return own_map.get(sid)
 
         our_prepared = []
         for mon in our_slots:
-            f = _fusion_for(mon)
+            f = _fusion_for(mon, our_team_fusions)
             if f is None and mon is getattr(battle, "active_pokemon", None):
                 f = our_fusion
             our_prepared.append(prepare_mon(mon, f))
         opp_prepared = []
         for mon in opp_slots:
-            f = _fusion_for(mon)
+            f = _fusion_for(mon, opp_team_fusions)
             if f is None and mon is getattr(battle, "opponent_active_pokemon", None):
                 f = opp_fusion
             opp_prepared.append(prepare_mon(mon, f))

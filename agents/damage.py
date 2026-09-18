@@ -117,12 +117,21 @@ _TERRAIN_BOOST = {
     ("MISTY_TERRAIN", "FAIRY"): 1.3,
 }
 
+# Mold Breaker и его клоны (в gen9 Teravolt/Turboblaze работают так же) — игнорируют
+# способность ЦЕЛИ: и иммунитеты (Levitate/Sap Sipper/...), и снижение урона
+# (Multiscale/Filter/Thick Fat/...). Предметы и типовые иммунитеты не игнорируются.
+_MOLD_BREAKER_ABILITIES = {"moldbreaker", "teravolt", "turboblaze"}
+
+# Иммунитеты от способностей защиты: способность -> тип, который она игнорирует.
+# Ключи — уже нормализованные `_id` (нижний регистр без разделителей), поэтому "earth eater"
+# с пробелом тут был бы мёртвым ключом. Не моделируются (нужны флаги приёмов/состояние боя):
+# Wonder Guard, Soundproof, Bulletproof, Wind Rider (иммунитет к wind-приёмам), Disguise,
+# Ice Face, Sturdy (запрет OHKO), а также Mold Breaker у атакующего — см. _MOLD_BREAKER_ABILITIES.
 _ABILITY_IMMUNITY = {
     "levitate": "GROUND", "flashfire": "FIRE", "voltabsorb": "ELECTRIC",
     "lightningrod": "ELECTRIC", "motordrive": "ELECTRIC", "waterabsorb": "WATER",
     "stormdrain": "WATER", "sapsipper": "GRASS", "dryskin": "WATER",
-    "windrider": None, "earth eater": "GROUND", "eartheater": "GROUND",
-    "wellbakedbody": "FIRE", "sapsipper": "GRASS",
+    "eartheater": "GROUND", "wellbakedbody": "FIRE",
 }
 
 # атакующие способности: (множитель, фильтр по типу приёма или None = любой)
@@ -263,6 +272,20 @@ def prepare_mon(mon, fusion_entry: Optional[dict] = None) -> Optional[dict]:
     }
 
 
+def _safe_attr(obj, name, default=None):
+    """getattr, переживающий исключения в свойствах.
+
+    `Move.status`/`Move.weather` внутри делают `Status[...]`/`Weather[...]`, то есть на незнакомой
+    строке (кастомный мод) кидают KeyError. Раньше это уронило бы весь блок признаков урона —
+    проверяем на всех 954 приёмах гена 9, но подстраховка нужна для модов.
+    """
+    try:
+        value = getattr(obj, name, default)
+    except Exception:
+        return default
+    return default if value is None else value
+
+
 def _move_power(move) -> int:
     bp = getattr(move, "base_power", 0) or 0
     if not bp:
@@ -345,6 +368,18 @@ def _move_is_contact(mid: str) -> bool:
     return mid not in _NO_CONTACT_IDS
 
 
+def attack_ignores_ability(atk: Optional[dict], move) -> bool:
+    """Игнорирует ли атака способность защиты (Mold Breaker / Teravolt / Turboblaze / ignoreAbility).
+
+    Берём только известное: способность атакующего мы знаем всегда, когда он наш, и лишь после
+    раскрытия — когда он противника. Неизвестная способность не подставляется (`_id(None)` -> ""),
+    то есть догадок о закрытой информации не появляется.
+    """
+    if atk is not None and atk.get("ability") in _MOLD_BREAKER_ABILITIES:
+        return True
+    return bool(_safe_attr(move, "ignore_ability", False))
+
+
 def estimate_damage(atk: Optional[dict], dfn: Optional[dict], move, ctx: Optional[DamageContext] = None,
                     defender_fusion: Optional[dict] = None) -> Optional[tuple]:
     """(dmg_min, dmg_max) в абсолютных HP, либо None если приём не дамажный/нет данных.
@@ -373,24 +408,16 @@ def estimate_damage(atk: Optional[dict], dfn: Optional[dict], move, ctx: Optiona
     if eff <= 0:
         return (0.0, 0.0)
 
-    # способности-иммунитеты защиты + воздушный шар
+    # способности-иммунитеты защиты (все они есть в _ABILITY_IMMUNITY: Levitate->Ground,
+    # Sap Sipper->Grass, Flash Fire->Fire, Water Absorb/Storm Drain/Dry Skin->Water, ...);
+    # Mold Breaker их отключает, Air Balloon (предмет) — нет
+    ignores_ability = attack_ignores_ability(atk, move)
     ab = dfn["ability"]
-    if ab in _ABILITY_IMMUNITY:
-        imm_type = _ABILITY_IMMUNITY[ab]
+    if not ignores_ability:
+        imm_type = _ABILITY_IMMUNITY.get(ab)
         if imm_type and atk_name == imm_type:
             return (0.0, 0.0)
     if dfn["item"] == "airballoon" and atk_name == "GROUND":
-        return (0.0, 0.0)
-    # способность защиты из «двойного типа»: Dry Skin — иммунитет к воде
-    if ab == "dryskin" and atk_name == "WATER":
-        return (0.0, 0.0)
-    if ab in ("waterabsorb", "stormdrain") and atk_name == "WATER":
-        return (0.0, 0.0)
-    if ab == "flashfire" and atk_name == "FIRE":
-        return (0.0, 0.0)
-    if ab == "sapsipper" and atk_name == "GRASS":
-        return (0.0, 0.0)
-    if ab == "levitate" and atk_name == "GROUND":
         return (0.0, 0.0)
 
     # A и D со стадиями
@@ -451,9 +478,9 @@ def estimate_damage(atk: Optional[dict], dfn: Optional[dict], move, ctx: Optiona
         mult *= 0.5
     if (not is_phys) and spec_screen:
         mult *= 0.5
-    # способности защиты
+    # способности защиты (Mold Breaker/Teravolt/Turboblaze их тоже отключают)
     dfn_ab = dfn["ability"]
-    if dfn_ab in _DEF_ABILITY_MULT:
+    if dfn_ab in _DEF_ABILITY_MULT and not ignores_ability:
         m = _DEF_ABILITY_MULT[dfn_ab]
         applies = False
         if dfn_ab in ("multiscale", "shadowshield"):
@@ -550,20 +577,6 @@ TAUNT_DISABLE_MOVE_IDS = {"taunt", "encore", "torment", "disable", "imprison", "
 DEBUFF_MOVE_IDS = {"partingshot", "memento", "charm", "growl", "leer", "tailwhip", "screech",
                    "metalsound", "faketears", "captivate", "venomdrench", "nobleroar", "tickle",
                    "babydolleyes", "stringshot", "cottonspore", "scaryface"}
-
-
-def _safe_attr(obj, name, default=None):
-    """getattr, переживающий исключения в свойствах.
-
-    `Move.status`/`Move.weather` внутри делают `Status[...]`/`Weather[...]`, то есть на незнакомой
-    строке (кастомный мод) кидают KeyError. Раньше это уронило бы весь блок признаков урона —
-    проверяем на всех 954 приёмах гена 9, но подстраховка нужна для модов.
-    """
-    try:
-        value = getattr(obj, name, default)
-    except Exception:
-        return default
-    return default if value is None else value
 
 
 def _move_target(move) -> str:

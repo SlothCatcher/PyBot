@@ -7,7 +7,9 @@
   4) мин/макс роллы (min = floor(max*0.85));
   5) блок признаков в obs: размер = DAMAGE_BLOCK_SIZE, значения осмысленны (иммунный приём -> 0,
      суперэффективный -> >0), obs = N_FEATURES и конечен;
-  6) канонический порядок слотов команд (матрица не зависит от dict-порядка).
+  6) канонический порядок слотов команд (матрица не зависит от dict-порядка);
+  7) Mold Breaker/Teravolt/Turboblaze и приёмы с ignoreAbility игнорируют способность защиты;
+  8) фьюжн-статы берутся только со своей стороны (species может совпасть).
 
 Запуск: python test_damage.py
 """
@@ -418,6 +420,102 @@ def test_opponent_effect_flags():
     check("флаги: healing на скамейке (roost) тоже виден", fl4["healing_move"], 1.0)
 
 
+def test_mold_breaker():
+    """Mold Breaker/Teravolt/Turboblaze и приёмы с ignoreAbility отключают способность защиты."""
+    from agents.damage import MIRROR_BASE
+    ctx = DamageContext()
+
+    def dmg(atk_mon, dfn_mon, move):
+        return estimate_damage(prepare_mon(atk_mon), prepare_mon(dfn_mon), Move(move, gen=9), ctx)
+
+    levitator = mk_mon("dfn", (PT.POISON,), ["tackle"], ability="levitate")
+    grounder = mk_mon("a", (PT.GROUND,), ["earthquake"])
+    check("Levitate: обычный Ground -> 0", dmg(grounder, levitator, "earthquake"), (0.0, 0.0))
+    for ability in ("moldbreaker", "teravolt", "turboblaze"):
+        got = dmg(mk_mon("a", (PT.GROUND,), ["earthquake"], ability=ability), levitator, "earthquake")
+        check_true(f"{ability}: Ground бьёт сквозь Levitate", bool(got) and got[0] > 0, f"got={got}")
+
+    sipper = mk_mon("dfn2", (PT.NORMAL,), ["tackle"], ability="sapsipper")
+    check("Sap Sipper: обычный Grass -> 0",
+          dmg(mk_mon("g", (PT.GRASS,), ["energyball"]), sipper, "energyball"), (0.0, 0.0))
+    got = dmg(mk_mon("g", (PT.GRASS,), ["energyball"], ability="moldbreaker"), sipper, "energyball")
+    check_true("Mold Breaker: Grass бьёт сквозь Sap Sipper", bool(got) and got[0] > 0, f"got={got}")
+
+    # сопротивление способности: Ice Scales (спец. урон вдвое) и Thick Fat (огонь вдвое)
+    scales = mk_mon("dfn3", (PT.NORMAL,), ["tackle"], ability="icescales")
+    psy = dmg(mk_mon("p", (PT.PSYCHIC,), ["psychic"]), scales, "psychic")
+    geyser = dmg(mk_mon("p", (PT.PSYCHIC,), ["psychic"]), scales, "photongeyser")
+    check_true("Ice Scales режет спец. урон (контроль)",
+               psy[1] > 0 and geyser[1] > psy[1] * 1.8, f"psychic={psy} photon={geyser}")
+    fat = mk_mon("dfn4", (PT.NORMAL,), ["tackle"], ability="thickfat")
+    fire_plain = dmg(mk_mon("f", (PT.FIRE,), ["flamethrower"]), fat, "flamethrower")
+    fire_mb = dmg(mk_mon("f", (PT.FIRE,), ["flamethrower"], ability="moldbreaker"), fat, "flamethrower")
+    check_true("Thick Fat режет огонь, Mold Breaker — нет",
+               fire_mb[1] > fire_plain[1] * 1.8, f"обычный={fire_plain} МБ={fire_mb}")
+
+    # предмет и типовой иммунитет Mold Breaker не пробивает
+    mb = mk_mon("a", (PT.GROUND,), ["earthquake"], ability="moldbreaker")
+    check("Air Balloon (предмет) держит Ground даже при Mold Breaker",
+          dmg(mb, mk_mon("dfn5", (PT.POISON,), ["tackle"], item="airballoon"), "earthquake"), (0.0, 0.0))
+    check("Flying-тип держит Ground даже при Mold Breaker",
+          dmg(mb, mk_mon("dfn6", (PT.FLYING,), ["tackle"]), "earthquake"), (0.0, 0.0))
+
+    # способность защиты неизвестна -> никаких догадок (то же, что и без способности)
+    check("неизвестная способность защиты -> поведение как без неё",
+          dmg(grounder, mk_mon("dfn7", (PT.POISON,), ["tackle"], ability=None), "earthquake"),
+          dmg(grounder, mk_mon("dfn8", (PT.POISON,), ["tackle"]), "earthquake"))
+
+    # зеркало: их Mold Breaker против нашей Levitate (и наоборот — Levitate держит)
+    our_lev = mk_mon("our", (PT.POISON,), ["tackle"], ability="levitate")
+    blk_mb = _damage_block(
+        mk_battle(our_lev, mk_mon("opp", (PT.GROUND,), ["earthquake"], ability="moldbreaker")), None, None)
+    blk_pl = _damage_block(
+        mk_battle(our_lev, mk_mon("opp", (PT.GROUND,), ["earthquake"], ability="sandveil")), None, None)
+    check_true("зеркало: их Mold Breaker пробивает нашу Levitate",
+               float(blk_mb[MIRROR_BASE]) > 0.0, f"={float(blk_mb[MIRROR_BASE]):.3f}")
+    check("зеркало: без Mold Breaker Levitate держит", float(blk_pl[MIRROR_BASE]), 0.0)
+
+
+def test_fusion_map_is_side_local():
+    """Фьюжн-статы берутся только со своей стороны, даже если species совпала."""
+    from agents.config import N_FEATURES
+    from agents.damage import DAMAGE_BLOCK_SIZE
+    # в полном obs блок признаков урона идёт в конец — индексы срезов сдвинуты
+    off = N_FEATURES - DAMAGE_BLOCK_SIZE
+    our = mk_mon("shared", (PT.NORMAL,), ["tackle", "protect"])
+    bench = mk_mon("bench", (PT.NORMAL,), ["tackle", "protect"])
+    opp = mk_mon("foe", (PT.NORMAL,), ["tackle", "protect"])
+    b = mk_battle(our, opp, our_team={"shared": our, "bench": bench}, opp_team={"foe": opp})
+    huge = {"base_stats": {"hp": 200, "atk": 200, "def": 200, "spa": 200, "spd": 200, "spe": 200}}
+
+    base = embed_battle_with_fusion(b, None, None)
+    # в чужой карте лежит НАША species: раньше она подставлялась нашим покемонам
+    alien = embed_battle_with_fusion(b, None, None, our_team_fusions={},
+                                     opp_team_fusions={"shared": huge})
+    diff = float(abs(alien[off + 15:off + 51] - base[off + 15:off + 51]).max())
+    check_true("чужая фьюжн-карта не меняет наш урон (species совпала)", diff == 0.0,
+               f"max diff={diff:.4f}")
+
+    # контроль: своя карта на ту же species применяется, чужая — к их
+    own = embed_battle_with_fusion(b, None, None, our_team_fusions={"shared": huge},
+                                   opp_team_fusions={})
+    # слоты отсортированы по species: 0 = bench (нет в карте), 1 = shared (есть в карте)
+    check_true("контроль: своя фьюжн-карта меняет урон своего покемона",
+               bool((own[off + 21:off + 27] != base[off + 21:off + 27]).any()),
+               f"base={[round(float(x), 3) for x in base[off + 21:off + 27]]} "
+               f"own={[round(float(x), 3) for x in own[off + 21:off + 27]]}")
+    check_true("контроль: строка покемона без записи в карте не меняется",
+               bool((own[off + 15:off + 21] == base[off + 15:off + 21]).all()))
+    theirs = embed_battle_with_fusion(b, None, None, our_team_fusions={},
+                                      opp_team_fusions={"foe": huge})
+    check_true("контроль: карта своей стороны применяется к их урону",
+               bool((theirs[off + 51:off + 87] != base[off + 51:off + 87]).any()))
+    check_true("чужой карты нет -> наши срезы совпадают между прогонами без карт",
+               bool((embed_battle_with_fusion(b, None, None, our_team_fusions={},
+                                              opp_team_fusions={})[off + 15:off + 87]
+                     == base[off + 15:off + 87]).all()))
+
+
 def main() -> int:
     test_formula()
     test_immunities()
@@ -427,6 +525,8 @@ def main() -> int:
     test_slot_order()
     test_mirror_damage()
     test_opponent_effect_flags()
+    test_mold_breaker()
+    test_fusion_map_is_side_local()
     print("-" * 74)
     if FAILED:
         print(f"ПРОВАЛЕНО: {len(FAILED)} -> {FAILED}")
