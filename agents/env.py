@@ -192,32 +192,135 @@ class ExampleEnv(SinglesEnv):
         return total
 
     def _estimate_damage_mult(self, attacker, defender) -> float:
-        """Макс эффективность STAB атакующего vs защитника 0..4"""
+        """Устарел: оставлен для совместимости, теперь используй _estimate_max_damage"""
+        return self._estimate_max_damage(attacker, defender, use_mult_only=True)
+
+    def _boost_multiplier(self, stage: int) -> float:
+        if stage >= 0:
+            return (2 + stage) / 2
+        else:
+            return 2 / (2 - stage)
+
+    def _estimate_max_damage(self, attacker, defender, use_mult_only: bool = False) -> float:
+        """
+        Оценка макс урона атакующего по защитнику 0..~4 (нормирована).
+        Если use_mult_only=True — только по типам (старый путь, для совместимости).
+        Иначе: base_power * mult / defense_stat * attack_stat с учётом категории и бустов.
+        Для статуса (base_power 0) — не считаем.
+        """
         if attacker is None or defender is None:
             return 1.0
         try:
-            from poke_env.data import GenData
-            # берём ген из battle позже, пока без type_chart fallback 1.0
-            atk_types = [t for t in (attacker.type_1, attacker.type_2) if t is not None]
-            if not atk_types:
-                return 1.0
-            # грубая оценка: берём макс из STAB типов атакующего
-            max_mult = 1.0
-            for atk in atk_types:
-                try:
-                    # GenData нужен но в тесте его нет — пробуем без
-                    mult = atk.damage_multiplier(defender.type_1, defender.type_2)
-                except Exception:
+            # fallback по типам если нет мувов или просили только мульт
+            if use_mult_only or not getattr(attacker, "moves", {}):
+                atk_types = [t for t in (attacker.type_1, attacker.type_2) if t is not None]
+                if not atk_types:
+                    return 1.0
+                max_mult = 0.0
+                for atk in atk_types:
                     try:
-                        from poke_env.data import GenData as GD
-                        chart = GD.from_gen(9).type_chart
-                        mult = atk.damage_multiplier(defender.type_1, defender.type_2, type_chart=chart)
+                        mult = atk.damage_multiplier(defender.type_1, defender.type_2)
                     except Exception:
-                        mult = 1.0
-                max_mult = max(max_mult, mult)
-                if max_mult >= 4.0:
-                    break
-            return float(max_mult)
+                        try:
+                            from poke_env.data import GenData as GD
+                            chart = GD.from_gen(9).type_chart
+                            mult = atk.damage_multiplier(defender.type_1, defender.type_2, type_chart=chart)
+                        except Exception:
+                            mult = 1.0
+                    max_mult = max(max_mult, mult)
+                return float(max_mult) if max_mult else 1.0
+
+            # основной путь: перебираем реальные мувы атакующего
+            max_dmg = 0.0
+            has_damaging = False
+            for move in list(getattr(attacker, "moves", {}).values())[:8]:
+                try:
+                    bp = getattr(move, "base_power", 0) or 0
+                    # poke-env иногда 0 для статуса, но в entry может быть power
+                    if bp == 0:
+                        entry = getattr(move, "entry", {}) or {}
+                        bp = entry.get("basePower", 0) or entry.get("base_power", 0) or 0
+                    if not bp or bp < 10:
+                        continue  # статус — пропускаем
+                    has_damaging = True
+                    # категория
+                    cat = getattr(move, "category", None)
+                    cat_name = ""
+                    if cat is not None:
+                        cat_name = getattr(cat, "name", str(cat)).upper()
+                    else:
+                        entry = getattr(move, "entry", {}) or {}
+                        cat_name = str(entry.get("category", "")).upper()
+                    is_physical = cat_name == "PHYSICAL"
+                    is_special = cat_name == "SPECIAL"
+                    if not is_physical and not is_special:
+                        # fallback: считаем физическим если не статус
+                        is_physical = True
+
+                    # типовая эффективность
+                    mtype = getattr(move, "type", None)
+                    if mtype is None:
+                        entry = getattr(move, "entry", {}) or {}
+                        tname = entry.get("type", "")
+                        if tname:
+                            try:
+                                from poke_env.battle import PokemonType
+                                mtype = PokemonType.from_name(tname)
+                            except Exception:
+                                mtype = None
+                    mult = 1.0
+                    if mtype is not None:
+                        try:
+                            mult = mtype.damage_multiplier(defender.type_1, defender.type_2)
+                        except Exception:
+                            try:
+                                from poke_env.data import GenData as GD
+                                chart = GD.from_gen(9).type_chart
+                                mult = mtype.damage_multiplier(defender.type_1, defender.type_2, type_chart=chart)
+                            except Exception:
+                                mult = 1.0
+                    if mult == 0:
+                        # иммун — урон 0
+                        continue
+
+                    # статы + бусты
+                    # base_stats может быть None для незаконченных покемонов — fallback 80
+                    def _get_base(mon, stat):
+                        try:
+                            bs = getattr(mon, "base_stats", {}) or {}
+                            v = bs.get(stat, bs.get(stat.upper(), 80)) or 80
+                            return float(v)
+                        except Exception:
+                            return 80.0
+                    if is_physical:
+                        atk_stat = _get_base(attacker, "atk")
+                        def_stat = _get_base(defender, "def")
+                        atk_boost = getattr(attacker, "boosts", {}).get("atk", 0) if getattr(attacker, "boosts", None) else 0
+                        def_boost = getattr(defender, "boosts", {}).get("def", 0) if getattr(defender, "boosts", None) else 0
+                    else:
+                        atk_stat = _get_base(attacker, "spa")
+                        def_stat = _get_base(defender, "spd")
+                        atk_boost = getattr(attacker, "boosts", {}).get("spa", 0) if getattr(attacker, "boosts", None) else 0
+                        def_boost = getattr(defender, "boosts", {}).get("spd", 0) if getattr(defender, "boosts", None) else 0
+
+                    # бусты в множитель
+                    atk_stat *= self._boost_multiplier(int(atk_boost))
+                    def_stat *= self._boost_multiplier(int(def_boost))
+                    # защита не может быть 0
+                    def_stat = max(def_stat, 1.0)
+
+                    # прокси урона: power * mult * atk / def  (нормируем /100 чтобы влезло в 0..4)
+                    dmg = (float(bp) * float(mult) * float(atk_stat) / float(def_stat)) / 100.0
+                    # клип 0..4
+                    dmg = float(np.clip(dmg, 0, 4))
+                    max_dmg = max(max_dmg, dmg)
+                except Exception:
+                    continue
+
+            if not has_damaging:
+                # нет дамажных мувов — fallback к типам
+                return self._estimate_max_damage(attacker, defender, use_mult_only=True)
+            return float(max_dmg) if max_dmg > 0 else 0.0
         except Exception:
             return 1.0
 
@@ -322,10 +425,13 @@ class ExampleEnv(SinglesEnv):
                 new_mon = battle.active_pokemon
                 opp_mon = battle.opponent_active_pokemon
                 if prev_mon is not None and new_mon is not None and opp_mon is not None:
-                    prev_mult = self._estimate_damage_mult(opp_mon, prev_mon)
-                    new_mult = self._estimate_damage_mult(opp_mon, new_mon)
-                    # разница в эффективности
-                    delta_mult = prev_mult - new_mult
+                    # считаем урон с учётом DEF/SPD и категории приёма (а не только типы)
+                    prev_dmg = self._estimate_max_damage(opp_mon, prev_mon)
+                    new_dmg = self._estimate_max_damage(opp_mon, new_mon)
+                    # для логов/порогов оставим и чистый mult (для иммун проверки)
+                    prev_mult = self._estimate_max_damage(opp_mon, prev_mon, use_mult_only=True)
+                    new_mult = self._estimate_max_damage(opp_mon, new_mon, use_mult_only=True)
+                    delta_dmg = prev_dmg - new_dmg
                     # также считаем фактический урон полученный новым моном в этот ход
                     # prev_new_hp — HP нового мона до свитча (из bench)
                     prev_new_hp = prev.get("team_hp", {}).get(next((k for k, v in battle.team.items() if str(getattr(v, "species","")).lower()==curr_active_species.lower()), ""), None)
@@ -345,18 +451,19 @@ class ExampleEnv(SinglesEnv):
                         except Exception:
                             dmg_taken_new = 0.0
                     # порог: если новый получил на SWITCH_THRESHOLD меньше урона чем ожидалось для старого
-                    # ожидаемый урон старому грубо = prev_mult /4 *0.5 (нормируем)
-                    # упростим: если delta_mult >=0.5 (напр 2.0->1.0) или new_mult==0 — считаем удачным
                     is_success = False
                     is_immune_or_reflect = False
-                    # проверка иммун
-                    if new_mult == 0:
+                    # проверка иммун по типам (0) или по урону 0 (защита+иммун)
+                    if new_dmg == 0 and prev_dmg > 0.1:
                         is_success = True
                         is_immune_or_reflect = True
-                    elif delta_mult >= 1.0:  # 2x -> 1x, 4x->2x etc
+                    elif new_mult == 0 and prev_mult > 0:
                         is_success = True
-                    elif dmg_taken_new < SWITCH_THRESHOLD and prev_mult >= 1.5:
-                        # новый получил <30% урона, а старый бы получил >=1.5x — успех
+                        is_immune_or_reflect = True
+                    elif delta_dmg >= 0.8:  # значимое снижение с учётом DEF/SPD (напр 2.2->1.0)
+                        is_success = True
+                    elif dmg_taken_new < SWITCH_THRESHOLD and prev_dmg >= 1.2:
+                        # новый получил <30% HP урона, а старый бы получил >=1.2 (сильный хит) — успех
                         is_success = True
                     # статус: если новый не застатуслен, а старый был бы уязвим
                     # проверяем: если у нового после свитча статус None, а ход противника был статусным и теперь без эффекта
@@ -381,8 +488,8 @@ class ExampleEnv(SinglesEnv):
                             extra += SWITCH_IMMUNE_BONUS  # x2
                         else:
                             extra += SWITCH_BONUS
-                    # также небольшой бонус если вообще сменили на резист (delta>0)
-                    elif delta_mult > 0.3:
+                    # также небольшой бонус если вообще сменили на более толстый резист (с учётом DEF/SPD)
+                    elif delta_dmg > 0.4:
                         extra += 0.2
 
             # обновляем состояние
