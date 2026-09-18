@@ -595,6 +595,18 @@ def run(
                 import traceback; traceback.print_exc()
                 win_rates = {"SimpleHeuristicsPlayer": 0, "RandomPlayer": 0, "MaxBasePowerPlayer": 0, "self_play": 0}
         heuristics_rate = win_rates.get("SimpleHeuristicsPlayer", 0)
+        # диагностика неизвестных типов (включается PYBOT_DEBUG_TYPES=1)
+        try:
+            try:
+                from .type_utils import debug_enabled as _t_dbg, summary as _t_sum
+            except ImportError:
+                from type_utils import debug_enabled as _t_dbg, summary as _t_sum
+            if _t_dbg():
+                _s = _t_sum()
+                if _s:
+                    print(f"[phase {counter}] type-debug: {_s}")
+        except Exception:
+            pass
         # динамический рэтчет-порог: если уже пробивали выше — требуем не меньше прошлого максимума
         cur_threshold = _get_current_threshold(min_winrate)
         if cur_threshold != min_winrate:

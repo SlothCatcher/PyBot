@@ -12,6 +12,15 @@ _PROTECT_SINGLETURN_KEYWORDS = {
 
 _TITLE_RE = re.compile(r"<b>\s*([^<]+?)\s*base stats", re.IGNORECASE)
 
+# диагностика: что сервер реально присылает в -start|typechange (tag -> {side: raw}).
+# Это ключевое доказательство при разборе "модель не видит иммунитет": если тут "???",
+# то poke-env получает THREE_QUESTION_MARKS и типовая эффективность становится нейтральной.
+_RAW_TYPECHANGE: dict[str, dict[str, str]] = {}
+
+
+def get_raw_typechange(battle_tag: str, side: str):
+    return _RAW_TYPECHANGE.get(battle_tag, {}).get(side)
+
 def _parse_protect_message(protect_state: dict, split_messages):
     battle_tag = split_messages[0][0].strip(">").strip() if split_messages and split_messages[0] else None
     if battle_tag is None:
@@ -55,7 +64,21 @@ def _parse_fusion_message(store: dict, pending: dict, split_messages):
         if msg_type in ("win", "tie"):
             store.pop(battle_tag, None)
             pending.pop(battle_tag, None)
+            _RAW_TYPECHANGE.pop(battle_tag, None)
             continue
+
+        # диагностика: логируем ЛЮБОЙ typechange (в т.ч. без [silent]), чтобы видеть,
+        # какие типы сервер отдаёт для фьюжнов (PYBOT_DEBUG_TYPES=1 включает печать)
+        if msg_type == "-start" and len(m) >= 4 and m[3] == "typechange":
+            _side = m[2][:2] if len(m) > 2 else ""
+            if _side in ("p1", "p2"):
+                _raw = "|".join(m)
+                _RAW_TYPECHANGE.setdefault(battle_tag, {})[_side] = _raw
+                try:
+                    from .type_utils import note_typechange_raw
+                except ImportError:
+                    from type_utils import note_typechange_raw
+                note_typechange_raw(_raw)
 
         if msg_type == "-start" and len(m) >= 4 and m[3] == "typechange" and m[-1] == "[silent]":
             side = m[2][:2]

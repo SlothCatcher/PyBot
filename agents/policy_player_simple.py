@@ -25,6 +25,11 @@ from poke_env.player import (
     SimpleHeuristicsPlayer,
 )
 
+try:
+    from .type_utils import damage_multiplier_safe
+except ImportError:  # запуск модуля вне пакета
+    from type_utils import damage_multiplier_safe
+
 BATTLE_FORMAT = "gen9fusionmonsrandombattle"
 N_FEATURES = 38
 _STATUSES = [None, Status.BRN, Status.PAR, Status.SLP, Status.FRZ, Status.PSN, Status.TOX]
@@ -158,14 +163,14 @@ class PolicyPlayer(Player):
         for i, move in enumerate(battle.available_moves):
             moves_base_power[i] = move.base_power / 100
             if battle.opponent_active_pokemon is not None:
-                try:
-                    moves_dmg_multiplier[i] = move.type.damage_multiplier(
-                        battle.opponent_active_pokemon.type_1,
-                        battle.opponent_active_pokemon.type_2,
-                        type_chart=type_chart,
-                    )
-                except KeyError:
-                    moves_dmg_multiplier[i] = 1.0
+                # безопасный расчёт: при неизвестном втором типе (??? / STELLAR) иммунитет
+                # сохраняется (было: KeyError -> нейтрал 1.0)
+                moves_dmg_multiplier[i] = damage_multiplier_safe(
+                    move.type,
+                    battle.opponent_active_pokemon.type_1,
+                    battle.opponent_active_pokemon.type_2,
+                    type_chart=type_chart,
+                )
 
         fainted_mon_team = len([mon for mon in battle.team.values() if mon.fainted]) / 6
         fainted_mon_opponent = (

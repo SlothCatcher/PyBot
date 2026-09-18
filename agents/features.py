@@ -3,6 +3,11 @@ import numpy as np
 from poke_env.battle import Field, SideCondition, Status, Weather
 from poke_env.battle import Effect
 
+try:
+    from .type_utils import damage_multiplier_safe
+except ImportError:  # запуск модуля вне пакета
+    from type_utils import damage_multiplier_safe
+
 _STATUSES = [None, Status.BRN, Status.PAR, Status.SLP, Status.FRZ, Status.PSN, Status.TOX]
 
 _HAZARD_MOVES = {
@@ -654,10 +659,8 @@ def _weakness_score(mon, opp_active, type_chart) -> float:
         return 0.0
     max_mult = 1.0
     for atk in atk_types:
-        try:
-            mult = atk.damage_multiplier(mon.type_1, mon.type_2, type_chart=type_chart)
-        except Exception:
-            mult = 1.0
+        # безопасный расчёт: неизвестный второй тип не маскирует иммунитет
+        mult = damage_multiplier_safe(atk, mon.type_1, mon.type_2, type_chart)
         max_mult = max(max_mult, mult)
     # map 1->0, 2->0.5, 4->1
     if max_mult >= 4:
@@ -689,11 +692,8 @@ def _bench_moves_vec(mon, opp_active, type_chart) -> np.ndarray:
         if opp_active is not None:
             max_eff = 1.0
             for m in moves:
-                try:
-                    eff = m.type.damage_multiplier(opp_active.type_1, opp_active.type_2, type_chart=type_chart) if getattr(m, "type", None) else 1.0
-                    max_eff = max(max_eff, eff)
-                except Exception:
-                    pass
+                eff = damage_multiplier_safe(m.type, opp_active.type_1, opp_active.type_2, type_chart) if getattr(m, "type", None) else 1.0
+                max_eff = max(max_eff, eff)
             vec[2] = float(np.clip(max_eff / 4.0, 0, 1))
         # has_heal
         has_heal = any(_move_heal_pct(m) > 0 for m in moves)
@@ -806,10 +806,8 @@ def _vulnerability_frac(reserves: list, opponent_active, type_chart) -> float:
     for mon in alive:
         max_mult = 1.0
         for atk in atk_types:
-            try:
-                mult = atk.damage_multiplier(mon.type_1, mon.type_2, type_chart=type_chart)
-            except KeyError:
-                mult = 1.0
+            # было `except KeyError: mult = 1.0` — теперь компонентный расчёт
+            mult = damage_multiplier_safe(atk, mon.type_1, mon.type_2, type_chart)
             max_mult = max(max_mult, mult)
         if max_mult >= 2.0:
             vulnerable += 1
@@ -997,15 +995,9 @@ def _move_wasted_flag(move, battle) -> float:
                 entry = getattr(move, "entry", {}) or {}
                 bp = entry.get("basePower", 0) or entry.get("base_power", 0) or 0
             if bp and bp >= 10:
-                try:
-                    mult = move.type.damage_multiplier(opp.type_1, opp.type_2)
-                except Exception:
-                    try:
-                        from poke_env.data import GenData as GD
-                        chart = GD.from_gen(9).type_chart
-                        mult = move.type.damage_multiplier(opp.type_1, opp.type_2, type_chart=chart)
-                    except Exception:
-                        mult = 1.0
+                # FIX: раньше тут был каскад try/except с fallback mult=1.0 — при неизвестном
+                # втором типе (??? / STELLAR) это прятало иммунитет. Теперь считаем покомпонентно.
+                mult = damage_multiplier_safe(getattr(move, "type", None), opp.type_1, opp.type_2)
                 if mult == 0:
                     return 1.0
     except Exception:
@@ -1049,14 +1041,14 @@ def embed_battle_with_fusion(battle, our_fusion, opp_fusion, our_protected_last_
         moves_pp_frac[i] = move.current_pp / max(move.max_pp, 1)
         moves_wasted[i] = _move_wasted_flag(move, battle)
         if battle.opponent_active_pokemon is not None:
-            try:
-                moves_dmg_multiplier[i] = move.type.damage_multiplier(
-                    battle.opponent_active_pokemon.type_1,
-                    battle.opponent_active_pokemon.type_2,
-                    type_chart=type_chart,
-                )
-            except KeyError:
-                moves_dmg_multiplier[i] = 1.0
+            # FIX: раньше при KeyError писался нейтрал 1.0, из-за чего модель не видела
+            # иммунитет (Electric vs Ground-фьюжн со вторым типом "???"). Теперь 0.0 сохраняется.
+            moves_dmg_multiplier[i] = damage_multiplier_safe(
+                move.type,
+                battle.opponent_active_pokemon.type_1,
+                battle.opponent_active_pokemon.type_2,
+                type_chart=type_chart,
+            )
         moves_boost_own[i] = _move_boost_flags(move, "own")
         moves_drop_opp[i] = _move_boost_flags(move, "opp")
         moves_hazard_clear[i] = _move_hazard_clear_flags(move)

@@ -1,4 +1,9 @@
 from poke_env.battle.pokemon_type import PokemonType
+
+try:
+    from .type_utils import damage_multiplier_safe, note_keyerror
+except ImportError:  # запуск модуля вне пакета
+    from type_utils import damage_multiplier_safe, note_keyerror
 from poke_env.environment.singles_env import SinglesEnv
 from poke_env.player import DefaultBattleOrder, Player
 import numpy as np
@@ -58,9 +63,24 @@ SinglesEnv.action_to_order = staticmethod(_safe_action_to_order)
 _original_damage_multiplier = PokemonType.damage_multiplier
 
 def _safe_damage_multiplier(self, *args, **kwargs):
+    # ВАЖНО: раньше тут был `except KeyError: return 1.0` — это маскировало иммунитет.
+    # Чарт gen9 не знает типов STELLAR / THREE_QUESTION_MARKS, поэтому для фьюжна с
+    # нераспознанным вторым типом ("???") вызов ELECTRIC.damage_multiplier(GROUND, ???)
+    # кидал KeyError, и на весь расчёт возвращался нейтрал 1.0 вместо иммунитета 0.0.
+    # Теперь считаем покомпонентно: неизвестный тип нейтрален только за себя,
+    # известный Ground сохраняет свой 0.0.
     try:
-        return _original_damage_multiplier(self, *args, **kwargs)
-    except KeyError:
-        return 1.0
+        type_1 = args[0] if len(args) > 0 else kwargs.get("type_1")
+        type_2 = args[1] if len(args) > 1 else kwargs.get("type_2")
+        chart = kwargs.get("type_chart")
+        return damage_multiplier_safe(self, type_1, type_2, chart)
+    except Exception:
+        # последний рубеж: оригинал, и только потом нейтрал (с логом, чтобы не молчать)
+        try:
+            return _original_damage_multiplier(self, *args, **kwargs)
+        except KeyError as err:
+            note_keyerror(self, args[0] if args else kwargs.get("type_1"),
+                          args[1] if len(args) > 1 else kwargs.get("type_2"), err)
+            return 1.0
 
 PokemonType.damage_multiplier = _safe_damage_multiplier

@@ -157,7 +157,7 @@ for i in onlyfiles:
 ### 2.9 `agents/features.py` — без критичных, но 2 средних
 
 * Bench порядок зависит от `dict` order → permutation variance. Не фиксили (требует сортировки по `species`), но отметили.
-* Fusion типы не парсятся из html (только base_stats/speed) → `type_1/2` для фьюжнов может быть неверным. Отмечено как TODO, не ломает 418-dim.
+* Fusion типы не парсятся из html (только base_stats/speed) → `type_1/2` для фьюжнов может быть неверным. Частично закрыто в разделе 7: неизвестный тип больше не маскирует иммунитет (KeyError → 0.0 вместо 1.0), плюс добавлена диагностика сырых `typechange`-сообщений сервера.
 
 ---
 
@@ -230,3 +230,52 @@ python -m agents.policy_player --resume models/self_play_snapshot_6.zip --total-
 ---
 
 *Автор аудита: Agent Arena — полный проход по `policy_player.py` + всем его зависимостям.*
+
+---
+
+## 7. Фикс расчёта типовой эффективности (`PokemonType.damage_multiplier`)
+
+**Симптом:** модель спамит Electric-приём по земляному фьюжну, хотя Electric vs Ground = 0 урона.
+
+**Диагноз (воспроизведён на poke-env 0.16.1):** чарт 9-го поколения
+`GenData.from_gen(9).type_chart` содержит только 18 стандартных типов — ни `STELLAR`,
+ни `THREE_QUESTION_MARKS` в нём нет. Оригинальный метод делает
+`type_chart[type_1.name][self.name]` и падает с `KeyError`, если **второй** тип защиты
+отсутствует в чарте:
+
+```
+ELECTRIC.damage_multiplier(GROUND, THREE_QUESTION_MARKS, type_chart=chart)
+-> KeyError('THREE_QUESTION_MARKS')      # чарт знает GROUND, но не знает ???
+```
+
+Монки-патч в `agents/config.py` ловил `KeyError` и возвращал `1.0` на **весь** расчёт, то
+есть иммунитет (0.0) превращался в "нейтрально". Это влияло и на признак
+`moves_dmg_multiplier` в obs, и на `_move_wasted_flag` (→ wasted-штраф не начислялся),
+и на reward (`_estimate_max_damage`, проверка иммунитета в `action_to_order`).
+
+Второй, менее очевидный случай: если `???`/`STELLAR` стоит **первым** типом, poke-env
+возвращает `1` ещё до обращения к чарту (иммунитет тоже не виден, но `KeyError` нет).
+
+**Фикс:** `agents/type_utils.py::damage_multiplier_safe` считает покомпонентно —
+неизвестный тип даёт множитель 1.0 только за себя, известные компоненты сохраняют вклад:
+
+| вызов | было | стало |
+|---|---|---|
+| ELECTRIC vs (GROUND, None) | 0.0 | 0.0 |
+| ELECTRIC vs (GROUND, ???) | **1.0** (KeyError→нейтрал) | **0.0** |
+| ELECTRIC vs (GROUND, STELLAR) | **1.0** | **0.0** |
+| ELECTRIC vs (???, None) | 1.0 | 1.0 (+ флаг unknown) |
+| ELECTRIC vs (WATER, ???) | 1.0 | 2.0 |
+
+Хелпер используется во всех точках: `config.py` (монки-патч), `features.py`
+(`embed_battle_with_fusion`, `_move_wasted_flag`, `_weakness_score`, `_bench_moves_vec`,
+`_vulnerability_frac`), `env.py` (`_estimate_max_damage`, `action_to_order`),
+`policy_player_simple.py`. Размер obs не изменился (715).
+
+**Диагностика (для подтверждения на живых боях):** `PYBOT_DEBUG_TYPES=1` печатает сырые
+`-start|typechange` сообщения сервера (видно, присылает ли он `???` для фьюжнов), сводку по
+бою и по фазе обучения. Первое срабатывание "иммунитет сохранён" / "неизвестный тип"
+печатается всегда, без флага.
+
+**Тест:** `python test_type_multiplier_fix.py` (нужен poke-env) — проверяет и ванильный
+`KeyError`, и покомпонентный расчёт, и E2E на мок-бое (`moves_wasted` + obs-признак).

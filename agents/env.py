@@ -13,6 +13,11 @@ from stable_baselines3.common.monitor import Monitor
 
 from .config import BATTLE_FORMAT, N_FEATURES, QUALIFIED_PREFIX
 from .features import _move_wasted_flag, embed_battle_with_fusion
+
+try:
+    from .type_utils import damage_multiplier_safe, summary_line
+except ImportError:  # запуск модуля вне пакета
+    from type_utils import damage_multiplier_safe, summary_line
 from .fusion_parser import _attach_fusion_parser
 from .players import PolicyPlayer
 
@@ -285,15 +290,8 @@ class ExampleEnv(SinglesEnv):
                     return 1.0
                 max_mult = 0.0
                 for atk in atk_types:
-                    try:
-                        mult = atk.damage_multiplier(defender.type_1, defender.type_2)
-                    except Exception:
-                        try:
-                            from poke_env.data import GenData as GD
-                            chart = GD.from_gen(9).type_chart
-                            mult = atk.damage_multiplier(defender.type_1, defender.type_2, type_chart=chart)
-                        except Exception:
-                            mult = 1.0
+                    # безопасный расчёт: неизвестный тип защиты не маскирует иммунитет
+                    mult = damage_multiplier_safe(atk, defender.type_1, defender.type_2)
                     max_mult = max(max_mult, mult)
                 return float(max_mult) if max_mult else 1.0
 
@@ -337,15 +335,9 @@ class ExampleEnv(SinglesEnv):
                                 mtype = None
                     mult = 1.0
                     if mtype is not None:
-                        try:
-                            mult = mtype.damage_multiplier(defender.type_1, defender.type_2)
-                        except Exception:
-                            try:
-                                from poke_env.data import GenData as GD
-                                chart = GD.from_gen(9).type_chart
-                                mult = mtype.damage_multiplier(defender.type_1, defender.type_2, type_chart=chart)
-                            except Exception:
-                                mult = 1.0
+                        # было: try damage_multiplier -> except -> chart -> except -> 1.0
+                        # (маскировало иммунитет при неизвестном втором типе)
+                        mult = damage_multiplier_safe(mtype, defender.type_1, defender.type_2)
                     if mult == 0:
                         # иммун — урон 0
                         continue
@@ -950,6 +942,21 @@ class ExampleEnv(SinglesEnv):
 
             # универсальный штраф за любой wasted приём, если ещё не наказан спецификой (просьба: "штраф за wasted для любого приёма в принципе, если его нет")
             try:
+                # диагностика неизвестных типов: одна строка на закончившийся бой (только если были события)
+                try:
+                    from .type_utils import debug_enabled, summary
+                    if debug_enabled():
+                        _s = summary()
+                        if _s:
+                            print(f"[type-debug] конец боя {tag}: {_s}")
+                        try:
+                            from .fusion_parser import _RAW_TYPECHANGE
+                            for _sd, _raw in (_RAW_TYPECHANGE.get(tag, {}) or {}).items():
+                                print(f"[type-debug] {tag} тип-сообщение {_sd}: {_raw}")
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
                 was_wasted = bool(self._last_wasted.get(tag, False))
                 last_id = self._last_move_id.get(tag, "")
                 # если уже есть специфика для этого id — не дублируем (иначе double penalty)
@@ -1072,16 +1079,8 @@ class ExampleEnv(SinglesEnv):
                             if bp and bp >= 10:
                                 mtype = getattr(move, "type", None)
                                 opp = battle.opponent_active_pokemon
-                                try:
-                                    mult = mtype.damage_multiplier(opp.type_1, opp.type_2)
-                                except Exception:
-                                    try:
-                                        from poke_env.data import GenData as GD
-                                        chart = GD.from_gen(9).type_chart
-                                        mult = mtype.damage_multiplier(opp.type_1, opp.type_2, type_chart=chart)
-                                    except Exception:
-                                        mult = 1.0
-                                if mult == 0:
+                                # безопасный расчёт (раньше каскад с fallback 1.0 прятал иммунитет)
+                                if damage_multiplier_safe(mtype, opp.type_1, opp.type_2) == 0:
                                     flag = True
                         except Exception:
                             pass
