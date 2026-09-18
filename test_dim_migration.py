@@ -49,11 +49,15 @@ class FakeEnv(gym.Env):
         return self.observation_space.sample(), 0.0, True, False, {}
 
 
-def make_checkpoint(dim: int, path: str):
+def make_checkpoint(dim: int, path: str, features_dim: int = 512):
     """Создаёт настоящий SB3-чекпоинт с политикой сети из agents.policy на dim признаков."""
     env = FakeEnv(dim)
     try:
-        ppo = PPO(MaskedActorCriticPolicy, env, device="cpu", n_steps=8, batch_size=8, verbose=0)
+        ppo = PPO(MaskedActorCriticPolicy, env, device="cpu", n_steps=8, batch_size=8, verbose=0,
+                  policy_kwargs=dict(
+                      features_extractor_kwargs=dict(features_dim=int(features_dim)),
+                      net_arch=dict(pi=[512, 256], vf=[512, 256]),
+                  ))
     finally:
         env.close()
     ppo.save(path)
@@ -265,6 +269,79 @@ def main():
     check("посторонние ошибки не считаются несовпадением размеров",
           not _looks_like_dim_mismatch("FileNotFoundError: nope")
           and not _looks_like_dim_mismatch("RuntimeError: CUDA out of memory"))
+
+    # 9) расширение экстрактора (features_dim 512 -> 640) вместе с признаками 715 -> 802
+    with tempfile.TemporaryDirectory() as td:
+        full3 = make_checkpoint(N_FEATURES, os.path.join(td, "full3.zip"), features_dim=512)
+        old3 = shrink_checkpoint(full3, os.path.join(td, "old3.zip"), 715)
+        src_params = None
+        for _, v in load_from_zip_file(old3, device=torch.device("cpu"))[1].items():
+            if isinstance(v, dict):
+                src_params = v
+                break
+        src_w1 = src_params["features_extractor.net.0.weight"]
+        src_pi = src_params["mlp_extractor.policy_net.0.weight"]
+
+        ppo_big = _migrate_checkpoint_dim(old3, target_dim=N_FEATURES, target_features_dim=640)
+        fe = ppo_big.policy.features_extractor
+        w1 = fe.net[0].weight
+        check("features_dim 512->640: первый слой расширен", tuple(w1.shape) == (640, N_FEATURES),
+              str(tuple(w1.shape)))
+        check("features_dim 512->640: старый блок [512,715] сохранён побитово",
+              bool(torch.equal(w1[:512, :715], src_w1)))
+        check("features_dim 512->640: новые нейроны и признаки нулевые",
+              int(torch.count_nonzero(w1[512:, :])) == 0 and int(torch.count_nonzero(w1[:512, 715:])) == 0)
+        ln_w, ln_b = fe.net[1].weight, fe.net[1].bias
+        check("features_dim 512->640: LayerNorm новых нейронов (weight=1, bias=0)",
+              tuple(ln_w.shape) == (640,) and float(ln_w[512:].mean()) == 1.0
+              and float(ln_b[512:].abs().sum()) == 0.0)
+        pi_w = ppo_big.policy.mlp_extractor.policy_net[0].weight
+        check("features_dim 512->640: вход pi-головы расширен до 640, старые столбцы на месте",
+              tuple(pi_w.shape) == (512, 640) and bool(torch.equal(pi_w[:, :512], src_pi))
+              and int(torch.count_nonzero(pi_w[:, 512:])) == 0, str(tuple(pi_w.shape)))
+        with torch.no_grad():
+            actions, values, _ = ppo_big.policy({
+                "observation": torch.zeros((2, N_FEATURES), dtype=torch.float32),
+                "action_mask": torch.ones((2, 9), dtype=torch.bool),
+            })
+        check("features_dim 512->640: расширенная политика делает forward",
+              tuple(actions.shape) == (2,) and tuple(values.shape) == (2, 1))
+        check("features_dim 512->640: в observation_space записан новый размер",
+              tuple(ppo_big.observation_space["observation"].shape) == (N_FEATURES,))
+
+        # обратный случай: сужение 512 -> 384 (обрезка, без падения)
+        ppo_small = _migrate_checkpoint_dim(old3, target_dim=N_FEATURES, target_features_dim=384)
+        w1s = ppo_small.policy.features_extractor.net[0].weight
+        check("features_dim 512->384: слой обрезан", tuple(w1s.shape) == (384, N_FEATURES),
+              str(tuple(w1s.shape)))
+        check("features_dim 512->384: обрезан именно хвост (старые строки сохранены)",
+              bool(torch.equal(w1s, src_w1[:384, :715].new_zeros((384, N_FEATURES)).add(
+                  torch.nn.functional.pad(src_w1[:384, :715], (0, N_FEATURES - 715))))))
+
+    # 10) метрика использования новых признаков
+    from agents.policy_player import arch_usage_metrics
+    from agents.damage import DAMAGE_BLOCK_SIZE
+    with tempfile.TemporaryDirectory() as td:
+        ck = make_checkpoint(N_FEATURES, os.path.join(td, "m.zip"))
+        from stable_baselines3 import PPO as _PPO
+        m = arch_usage_metrics(_PPO.load(ck, device="cpu"))
+        check("метрика: размерности отражены",
+              m.get("arch/feat_dim") == 512 and m.get("arch/obs_dim") == N_FEATURES, str(m))
+        check("метрика: свежая сеть использует новые признаки наравне (RMS ratio ~1)",
+              0.7 < float(m.get("arch/new_cols_rms_ratio", 0)) < 1.4,
+              f"ratio={m.get('arch/new_cols_rms_ratio'):.3f}")
+        check("метрика: размер блока урона совпадает с DAMAGE_BLOCK_SIZE",
+              int(m.get("arch/obs_dim", 0)) - 715 == DAMAGE_BLOCK_SIZE,
+              f"{int(m.get('arch/obs_dim', 0)) - 715} vs {DAMAGE_BLOCK_SIZE}")
+
+    with tempfile.TemporaryDirectory() as td:
+        full4 = make_checkpoint(N_FEATURES, os.path.join(td, "full4.zip"))
+        old4 = shrink_checkpoint(full4, os.path.join(td, "old4.zip"), 715)
+        warm = _migrate_checkpoint_dim(old4, target_dim=N_FEATURES)
+        m_warm = arch_usage_metrics(warm)
+        check("метрика: у warm-start модели новые признаки не используются (ratio == 0)",
+              float(m_warm.get("arch/new_cols_rms_ratio", 1.0)) == 0.0,
+              f"ratio={m_warm.get('arch/new_cols_rms_ratio')}")
 
     print("-" * 74)
     if FAIL:

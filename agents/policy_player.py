@@ -150,15 +150,15 @@ class _DimProbeEnv(_GymBaseEnv):
         return None
 
 
-def _probe_ppo(target_dim: int):
-    """PPO с случайной политикой на target_dim признаков (для fallback-миграции)."""
+def _probe_ppo(target_dim: int, features_dim: int = 512):
+    """PPO со случайной политикой на target_dim признаков (для fallback-миграции)."""
     from stable_baselines3.common.vec_env import DummyVecEnv
 
     from agents.policy import MaskedActorCriticPolicy
 
     env = DummyVecEnv([lambda: _DimProbeEnv(int(target_dim))])
-    return PPO(MaskedActorCriticPolicy, env, device="cpu", verbose=0,
-               n_steps=8, batch_size=8), env
+    return PPO(MaskedActorCriticPolicy, env, device="cpu", verbose=0, n_steps=8, batch_size=8,
+               policy_kwargs=dict(features_extractor_kwargs=dict(features_dim=int(features_dim)))), env
 
 
 def _migrate_ppo_713_to_715(ppp_path: str, target_dim: int | None = None):
@@ -195,6 +195,42 @@ def explain_missing_checkpoint(path: str) -> str:
     return "\n".join(lines)
 
 
+PI_LAYERS = (512, 256)
+VF_LAYERS = (512, 256)
+
+
+def arch_usage_metrics(ppo) -> dict:
+    """Насколько политика реально использует новые признаки (последние DAMAGE_BLOCK_SIZE).
+
+    Пока сеть не «включила» новые входы, отношение норм весов близко к 0 — по этому числу
+    видно, надо ли расширять экстрактор или поднимать lr.
+    """
+    try:
+        from agents.damage import DAMAGE_BLOCK_SIZE
+
+        w = ppo.policy.features_extractor.net[0].weight.detach()
+        if w.dim() != 2 or w.shape[1] <= DAMAGE_BLOCK_SIZE:
+            return {}
+        n_new = int(DAMAGE_BLOCK_SIZE)
+        w_new, w_old = w[:, -n_new:], w[:, :-n_new]
+        # RMS, а не норма Фробениуса: норма растёт как sqrt(числа элементов) и сравнивать
+        # 87 столбцов с 715 напрямую нельзя. RMS-отношение = 1, когда блок урона выучен
+        # наравне с остальными признаками, и ~0 сразу после warm start (нулевые веса).
+        rms_new = float(w_new.pow(2).mean().sqrt())
+        rms_old = float(w_old.pow(2).mean().sqrt())
+        abs_new = float(w_new.abs().mean())
+        abs_old = float(w_old.abs().mean())
+        return {
+            "arch/feat_dim": int(w.shape[0]),
+            "arch/obs_dim": int(w.shape[1]),
+            "arch/new_cols_rms_ratio": rms_new / max(rms_old, 1e-12),
+            "arch/new_cols_absmean_ratio": abs_new / max(abs_old, 1e-12),
+            "arch/new_cols_rms": rms_new,
+        }
+    except Exception:
+        return {}
+
+
 def resolve_checkpoint_path(path: str) -> str:
     """Дополняет путь до существующего файла: `models/x` -> `models/x.zip`, если так есть.
 
@@ -227,7 +263,46 @@ def _checkpoint_obs_dim(path: str):
         return None
 
 
-def _migrate_checkpoint_dim(ppp_path: str, target_dim: int | None = None, force_fallback: bool = False):
+def _checkpoint_arch(path: str) -> dict:
+    """Архитектура из весов чекпоинта: obs_dim, features_dim, net_arch.
+
+    Читаем из весов, а не из policy_kwargs: у старых снапшотов policy_kwargs пустой
+    (класс подставлял 512 сам), поэтому метаданным доверять нельзя.
+    """
+    try:
+        from stable_baselines3.common.save_util import load_from_zip_file
+        _, params, _ = load_from_zip_file(path, device="cpu")
+    except Exception:
+        return {}
+    state = None
+    for _, v in params.items():
+        if isinstance(v, dict) and any("features_extractor" in k for k in v.keys()):
+            state = v
+            break
+    if state is None:
+        return {}
+    info = {}
+    pi_layers = []   # (индекс слоя, размер выхода) — порядок берём по номеру, а не по dict
+    for k, tensor in state.items():
+        if not hasattr(tensor, "shape"):
+            continue
+        if k.endswith("features_extractor.net.0.weight") and tensor.dim() == 2:
+            info["features_dim"] = int(tensor.shape[0])
+            info["obs_dim"] = int(tensor.shape[1])
+        elif "mlp_extractor.policy_net." in k and k.endswith(".weight") and tensor.dim() == 2:
+            try:
+                layer_idx = int(k.split("policy_net.")[1].split(".")[0])
+            except Exception:
+                layer_idx = len(pi_layers)
+            pi_layers.append((layer_idx, int(tensor.shape[0])))
+    if pi_layers:
+        pi_layers.sort(key=lambda x: x[0])
+        info["net_arch"] = {"pi": [h for _, h in pi_layers], "vf": None}
+    return info
+
+
+def _migrate_checkpoint_dim(ppp_path: str, target_dim: int | None = None, force_fallback: bool = False,
+                            target_features_dim: int | None = None):
     """Миграция чекпоинта на актуальный N_FEATURES через паддинг весов в zip.
 
     Обобщено: раньше умела ровно 713->715, теперь определяет старую размерность из самих
@@ -238,13 +313,17 @@ def _migrate_checkpoint_dim(ppp_path: str, target_dim: int | None = None, force_
     import torch
     import tempfile
     import os
-    OLD_N = _checkpoint_obs_dim(ppp_path)
+    arch = _checkpoint_arch(ppp_path)
+    OLD_N = arch.get("obs_dim") if arch else _checkpoint_obs_dim(ppp_path)
+    OLD_F = int(arch.get("features_dim") or 512)
     NEW_N = int(target_dim or N_FEATURES)
-    if OLD_N is not None and OLD_N == NEW_N:
-        print(f"  {ppp_path}: уже {NEW_N} признаков — миграция не нужна")
+    NEW_F = int(target_features_dim or OLD_F)
+    if OLD_N is not None and OLD_N == NEW_N and OLD_F == NEW_F:
+        print(f"  {ppp_path}: уже {NEW_N} признаков и features_dim={NEW_F} — миграция не нужна")
         from stable_baselines3 import PPO as _PPO
         return _PPO.load(ppp_path, device="cpu")
-    print(f"  Миграция {OLD_N}->{NEW_N} для {ppp_path}...")
+    print(f"  Миграция {ppp_path}: obs {OLD_N}->{NEW_N}, features_dim {OLD_F}->{NEW_F}"
+          if OLD_F != NEW_F else f"  Миграция {ppp_path}: obs {OLD_N}->{NEW_N} (features_dim {NEW_F} без изменений)")
     try:
         if force_fallback:
             raise RuntimeError("force_fallback: основная миграция пропущена по запросу")
@@ -278,20 +357,69 @@ def _migrate_checkpoint_dim(ppp_path: str, target_dim: int | None = None, force_
             raise RuntimeError(f"Не нашёл policy state dict в {list(params.keys())[:5]}")
 
         padded = 0
+
+        def _pad_2d(tensor, new_rows=None, new_cols=None):
+            """Паддинг 2D-тензора нулями справа/снизу (или обрезка, если цель меньше)."""
+            r = int(new_rows if new_rows is not None else tensor.shape[0])
+            c = int(new_cols if new_cols is not None else tensor.shape[1])
+            out = torch.zeros((r, c), dtype=tensor.dtype, device=tensor.device)
+            out[:min(r, tensor.shape[0]), :min(c, tensor.shape[1])] = tensor[:r, :c]
+            return out
+
+        def _pad_1d(tensor, new_len, fill):
+            out = torch.full((int(new_len),), float(fill), dtype=tensor.dtype, device=tensor.device)
+            out[:min(int(new_len), tensor.shape[0])] = tensor[:int(new_len)]
+            return out
+
         for key in list(policy_state.keys()):
             tensor = policy_state[key]
-            if (isinstance(tensor, torch.Tensor) and tensor.dim() == 2 and tensor.shape[0] == 512
-                    and "features_extractor" in key and "weight" in key and tensor.shape[1] != NEW_N):
-                old_cols = int(tensor.shape[1])
-                new_tensor = torch.zeros((tensor.shape[0], NEW_N), dtype=tensor.dtype, device=tensor.device)
-                new_tensor[:, :old_cols] = tensor
-                # новые колонки — нули: новые признаки на старте не влияют на политику
-                policy_state[key] = new_tensor
+            if not isinstance(tensor, torch.Tensor):
+                continue
+            # первый слой экстрактора признаков: [features_dim, obs_dim]
+            if "features_extractor" in key and key.endswith(".net.0.weight") and tensor.dim() == 2:
+                if tensor.shape[0] != NEW_F or tensor.shape[1] != NEW_N:
+                    policy_state[key] = _pad_2d(tensor, NEW_F, NEW_N)
+                    padded += 1
+                    print(f"    паддинг {key} {list(tensor.shape)} -> {list(policy_state[key].shape)} "
+                          f"(новые признаки и нейроны входят с нулевыми весами)")
+            # сдвиг/масштаб LayerNorm после первого слоя
+            elif "features_extractor" in key and key.endswith(".net.1.weight") and tensor.dim() == 1:
+                if tensor.shape[0] != NEW_F:
+                    policy_state[key] = _pad_1d(tensor, NEW_F, 1.0)   # новые нейроны: weight=1
+                    padded += 1
+                    print(f"    паддинг {key} {list(tensor.shape)} -> {list(policy_state[key].shape)} (новые = 1)")
+            elif "features_extractor" in key and key.endswith(".net.1.bias") and tensor.dim() == 1:
+                if tensor.shape[0] != NEW_F:
+                    policy_state[key] = _pad_1d(tensor, NEW_F, 0.0)   # новые нейроны: bias=0
+                    padded += 1
+            elif "features_extractor" in key and key.endswith(".net.0.bias") and tensor.dim() == 1:
+                if tensor.shape[0] != NEW_F:
+                    policy_state[key] = _pad_1d(tensor, NEW_F, 0.0)
+                    padded += 1
+            # вход pi/vf-головы: [hidden, features_dim]
+            elif ("mlp_extractor.policy_net." in key or "mlp_extractor.value_net." in key) \
+                    and key.endswith(".0.weight") and tensor.dim() == 2 and tensor.shape[1] != NEW_F:
+                policy_state[key] = _pad_2d(tensor, None, NEW_F)
                 padded += 1
-                print(f"    паддинг {key} {list(tensor.shape)} -> {list(new_tensor.shape)} "
-                      f"(новые {NEW_N - old_cols} признаков с нулевыми весами)")
+                print(f"    паддинг {key} {list(tensor.shape)} -> {list(policy_state[key].shape)} "
+                      f"(новые нейроны экстрактора входят с нулевыми весами)")
         if padded == 0:
-            print(f"    WARN: не нашёл весов [512, {OLD_N}] для паддинга — возможно другая архитектура")
+            print(f"    WARN: не нашёл весов для паддинга (obs {OLD_N}->{NEW_N}, features {OLD_F}->{NEW_F})")
+
+        # обновляем policy_kwargs: иначе SB3 соберёт политику с дефолтным features_dim=512
+        try:
+            pk = dict(data.get("policy_kwargs") or {})
+            fek = dict(pk.get("features_extractor_kwargs") or {})
+            fek["features_dim"] = int(NEW_F)
+            pk["features_extractor_kwargs"] = fek
+            pk.setdefault("net_arch", dict(arch.get("net_arch") or {"pi": [512, 256], "vf": [512, 256]}))
+            if pk.get("net_arch", {}).get("vf") is None:
+                pk["net_arch"] = dict(pk["net_arch"])
+                pk["net_arch"]["vf"] = list(pk["net_arch"]["pi"])
+            data["policy_kwargs"] = pk
+            print(f"    policy_kwargs: features_dim={NEW_F}, net_arch={pk['net_arch']}")
+        except Exception as e:
+            print(f"    не удалось обновить policy_kwargs: {e}")
 
         # обновляем observation_space в data если есть
         try:
@@ -345,7 +473,7 @@ def _migrate_checkpoint_dim(ppp_path: str, target_dim: int | None = None, force_
         traceback.print_exc()
         # fallback: собираем политику нужной размерности (без сервера) и копируем веса вручную
         try:
-            ppo_new, dummy_env = _probe_ppo(NEW_N)
+            ppo_new, dummy_env = _probe_ppo(NEW_N, NEW_F)
             # грузим старый state dict через load_from_zip_file снова но теперь паддим и грузим напрямую
             try:
                 from stable_baselines3.common.save_util import load_from_zip_file as _lf
@@ -360,15 +488,33 @@ def _migrate_checkpoint_dim(ppp_path: str, target_dim: int | None = None, force_
                 # паддинг
                 for kk in list(policy_state2.keys()):
                     tt = policy_state2[kk]
-                    # старую размерность берём из самого тензора: OLD_N может быть None/недоступен
-                    if (isinstance(tt, torch.Tensor) and tt.dim() == 2 and tt.shape[0] == 512
-                            and "features_extractor" in kk and "weight" in kk
-                            and tt.shape[1] != NEW_N):
-                        old_cols = int(tt.shape[1])
-                        nt = torch.zeros((512, NEW_N), dtype=tt.dtype, device=tt.device)
-                        nt[:, :old_cols] = tt
+                    # размерности берём из самих тензоров: метаданные могут быть пустыми
+                    if (isinstance(tt, torch.Tensor) and tt.dim() == 2
+                            and "features_extractor" in kk and kk.endswith(".net.0.weight")):
+                        if tt.shape[0] != NEW_F or tt.shape[1] != NEW_N:
+                            nt = torch.zeros((NEW_F, NEW_N), dtype=tt.dtype, device=tt.device)
+                            nt[:tt.shape[0], :tt.shape[1]] = tt
+                            policy_state2[kk] = nt
+                            print(f"  Fallback: паддинг {kk} {list(tt.shape)} -> {list(nt.shape)}")
+                    elif (isinstance(tt, torch.Tensor) and tt.dim() == 1
+                            and "features_extractor" in kk and kk.endswith(".net.1.weight")
+                            and tt.shape[0] != NEW_F):
+                        nt = torch.ones((NEW_F,), dtype=tt.dtype, device=tt.device)
+                        nt[:tt.shape[0]] = tt
                         policy_state2[kk] = nt
-                        print(f"  Fallback: паддинг {kk} {old_cols} -> {NEW_N}")
+                    elif (isinstance(tt, torch.Tensor) and tt.dim() == 1
+                            and "features_extractor" in kk and (kk.endswith(".net.1.bias") or kk.endswith(".net.0.bias"))
+                            and tt.shape[0] != NEW_F):
+                        nt = torch.zeros((NEW_F,), dtype=tt.dtype, device=tt.device)
+                        nt[:tt.shape[0]] = tt
+                        policy_state2[kk] = nt
+                    elif (isinstance(tt, torch.Tensor) and tt.dim() == 2
+                            and ("mlp_extractor.policy_net." in kk or "mlp_extractor.value_net." in kk)
+                            and kk.endswith(".0.weight") and tt.shape[1] != NEW_F):
+                        nt = torch.zeros((tt.shape[0], NEW_F), dtype=tt.dtype, device=tt.device)
+                        nt[:, :tt.shape[1]] = tt
+                        policy_state2[kk] = nt
+                        print(f"  Fallback: паддинг {kk} {list(tt.shape)} -> {list(nt.shape)}")
                 # загружаем в ppo_new
                 try:
                     ppo_new.policy.load_state_dict(policy_state2, strict=False)
@@ -437,6 +583,7 @@ def run(
     clip_range: float = 0.2,
     n_epochs: int = 10,
     batch_size: int = 128,
+    features_dim: int = 512,
     vf_coef: float = 0.5,
     bc_value_coef: float = 0.0,
     value_warmup_steps: int = 0,
@@ -467,11 +614,15 @@ def run(
         resume_from = resolve_checkpoint_path(resume_from)
         if not os.path.isfile(resume_from):
             raise SystemExit(explain_missing_checkpoint(resume_from))
-        _resume_dim = _checkpoint_obs_dim(resume_from)
-        if _resume_dim is not None and _resume_dim != N_FEATURES:
-            print(f"Снапшот {resume_from}: {_resume_dim} признаков, сейчас {N_FEATURES} — "
-                  f"мигрирую (паддинг весов нулями + сброс optimizer state)...")
-            ppo = _migrate_checkpoint_dim(resume_from, target_dim=N_FEATURES)
+        _arch = _checkpoint_arch(resume_from)
+        _resume_dim = _arch.get("obs_dim") if _arch else _checkpoint_obs_dim(resume_from)
+        _resume_feat = int(_arch.get("features_dim") or 512)
+        if (_resume_dim is not None and _resume_dim != N_FEATURES) or _resume_feat != int(features_dim):
+            print(f"Снапшот {resume_from}: obs {_resume_dim}, features_dim {_resume_feat} — "
+                  f"мигрирую на obs {N_FEATURES}, features_dim {features_dim} "
+                  f"(паддинг весов + сброс optimizer state)...")
+            ppo = _migrate_checkpoint_dim(resume_from, target_dim=N_FEATURES,
+                                          target_features_dim=int(features_dim))
         else:
             try:
                 ppo = PPO.load(resume_from, device="cpu")
@@ -584,6 +735,12 @@ def run(
             vf_coef=vf_coef,
             device="cpu",
             tensorboard_log="./tb_logs/",
+            # фиксируем размер экстрактора и голов в чекпоинте: иначе policy_kwargs пуст
+            # и миграция не знает features_dim, поэтому не может расширять сеть
+            policy_kwargs=dict(
+                features_extractor_kwargs=dict(features_dim=int(features_dim)),
+                net_arch=dict(pi=list(PI_LAYERS), vf=list(VF_LAYERS)),
+            ),
         )
         # BC: либо собираем с нуля (pretrain_battles>0), либо грузим готовый только если пользователь ЯВНО указал --dataset-path
         # dataset_path по умолчанию None — чтобы наличие models/heuristic_dataset.npz от прошлого прогона не включало BC неожиданно
@@ -784,6 +941,22 @@ def run(
                 print(f"[curiosity] beta={getattr(icm_wrapper, 'beta', 0):.4f} r_int={getattr(icm_wrapper, 'last_r_int_mean', 0):.4f} fwd={getattr(icm_wrapper, 'last_fwd_loss', 0):.4f} inv={getattr(icm_wrapper, 'last_inv_loss', 0):.4f} replay={len(getattr(icm_wrapper, 'replay', []))}")
             except Exception:
                 pass
+        try:
+            _arch_m = arch_usage_metrics(ppo)
+            if _arch_m:
+                for _k, _v in _arch_m.items():
+                    ppo.logger.record(_k, _v)
+                _ratio = _arch_m.get("arch/new_cols_rms_ratio", 1.0)
+                _warn = ""
+                if _ratio < 0.02:
+                    _warn = ("  <- признаки урона почти не используются (веса ~0): "
+                             "подними --learning-rate или --features-dim")
+                elif _ratio < 0.3:
+                    _warn = "  <- признаки урона включаются медленно"
+                print(f"[arch] features_dim={_arch_m['arch/feat_dim']} использование новых"
+                      f" признаков (RMS весов, доля от старых) = {_ratio:.4f}{_warn}")
+        except Exception:
+            pass
         ppo.logger.dump(steps_done_holder["value"])
         print(f"[phase {counter}] {win_rates}")
 
@@ -942,6 +1115,7 @@ if __name__ == "__main__":
     parser.add_argument("--reset-schedules", action="store_true", help="Сбросить счетчик шагов для lr/ent расписаний при resume (lr 3e-5 снова с начала, ent 0.01). Нужно когда берешь фазу 300k и хочешь доучивать как с нуля)")
     parser.add_argument("--eval-battles", type=int, default=20, help="Сколько боев на каждого бота в оценке между фазами (было 60 -> 20, 60*4=240 боев виснет на 5-10 мин)")
     parser.add_argument("--skip-eval", action="store_true", help="Пропустить оценку winrate между фазами (самый быстрый, если виснет на 60 боев)")
+    parser.add_argument("--features-dim", type=int, default=512, help="Размер выхода экстрактора признаков (по умолчанию 512). При смене веса старого чекпоинта паддятся, новые нейроны входят с нулевыми весами (warm start); 640 стоит пробовать, если признаки урона не включаются")
     # --- ICM Variant B ---
     parser.add_argument("--icm", action="store_true", help="Включить Intrinsic Curiosity Module (Variant B) r = r_ext + beta*r_int")
     parser.add_argument("--icm-beta", type=float, default=0.05, help="Вес intrinsic награды (0.05 -> 0.01 с anneal)")
@@ -983,6 +1157,7 @@ if __name__ == "__main__":
         reset_schedules=args.reset_schedules,
         eval_battles=args.eval_battles,
         skip_eval=args.skip_eval,
+        features_dim=args.features_dim,
         icm=args.icm,
         icm_beta=args.icm_beta,
         icm_anneal=args.icm_anneal,
