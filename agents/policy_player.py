@@ -302,7 +302,7 @@ def _checkpoint_arch(path: str) -> dict:
 
 
 def _migrate_checkpoint_dim(ppp_path: str, target_dim: int | None = None, force_fallback: bool = False,
-                            target_features_dim: int | None = None):
+                            target_features_dim: int | None = None, verbose: bool = True):
     """Миграция чекпоинта на актуальный N_FEATURES через паддинг весов в zip.
 
     Обобщено: раньше умела ровно 713->715, теперь определяет старую размерность из самих
@@ -322,8 +322,12 @@ def _migrate_checkpoint_dim(ppp_path: str, target_dim: int | None = None, force_
         print(f"  {ppp_path}: уже {NEW_N} признаков и features_dim={NEW_F} — миграция не нужна")
         from stable_baselines3 import PPO as _PPO
         return _PPO.load(ppp_path, device="cpu")
-    print(f"  Миграция {ppp_path}: obs {OLD_N}->{NEW_N}, features_dim {OLD_F}->{NEW_F}"
-          if OLD_F != NEW_F else f"  Миграция {ppp_path}: obs {OLD_N}->{NEW_N} (features_dim {NEW_F} без изменений)")
+    def _say(msg, *a):
+        if verbose:
+            print(msg if not a else msg % a)
+
+    _say(f"  Миграция {ppp_path}: obs {OLD_N}->{NEW_N}, features_dim {OLD_F}->{NEW_F}"
+         if OLD_F != NEW_F else f"  Миграция {ppp_path}: obs {OLD_N}->{NEW_N} (features_dim {NEW_F} без изменений)")
     try:
         if force_fallback:
             raise RuntimeError("force_fallback: основная миграция пропущена по запросу")
@@ -380,14 +384,14 @@ def _migrate_checkpoint_dim(ppp_path: str, target_dim: int | None = None, force_
                 if tensor.shape[0] != NEW_F or tensor.shape[1] != NEW_N:
                     policy_state[key] = _pad_2d(tensor, NEW_F, NEW_N)
                     padded += 1
-                    print(f"    паддинг {key} {list(tensor.shape)} -> {list(policy_state[key].shape)} "
-                          f"(новые признаки и нейроны входят с нулевыми весами)")
+                    _say(f"    паддинг {key} {list(tensor.shape)} -> {list(policy_state[key].shape)} "
+                         f"(новые признаки и нейроны входят с нулевыми весами)")
             # сдвиг/масштаб LayerNorm после первого слоя
             elif "features_extractor" in key and key.endswith(".net.1.weight") and tensor.dim() == 1:
                 if tensor.shape[0] != NEW_F:
                     policy_state[key] = _pad_1d(tensor, NEW_F, 1.0)   # новые нейроны: weight=1
                     padded += 1
-                    print(f"    паддинг {key} {list(tensor.shape)} -> {list(policy_state[key].shape)} (новые = 1)")
+                    _say(f"    паддинг {key} {list(tensor.shape)} -> {list(policy_state[key].shape)} (новые = 1)")
             elif "features_extractor" in key and key.endswith(".net.1.bias") and tensor.dim() == 1:
                 if tensor.shape[0] != NEW_F:
                     policy_state[key] = _pad_1d(tensor, NEW_F, 0.0)   # новые нейроны: bias=0
@@ -401,10 +405,10 @@ def _migrate_checkpoint_dim(ppp_path: str, target_dim: int | None = None, force_
                     and key.endswith(".0.weight") and tensor.dim() == 2 and tensor.shape[1] != NEW_F:
                 policy_state[key] = _pad_2d(tensor, None, NEW_F)
                 padded += 1
-                print(f"    паддинг {key} {list(tensor.shape)} -> {list(policy_state[key].shape)} "
-                      f"(новые нейроны экстрактора входят с нулевыми весами)")
+                _say(f"    паддинг {key} {list(tensor.shape)} -> {list(policy_state[key].shape)} "
+                     f"(новые нейроны экстрактора входят с нулевыми весами)")
         if padded == 0:
-            print(f"    WARN: не нашёл весов для паддинга (obs {OLD_N}->{NEW_N}, features {OLD_F}->{NEW_F})")
+            _say(f"    WARN: не нашёл весов для паддинга (obs {OLD_N}->{NEW_N}, features {OLD_F}->{NEW_F})")
 
         # обновляем policy_kwargs: иначе SB3 соберёт политику с дефолтным features_dim=512
         try:
@@ -417,9 +421,9 @@ def _migrate_checkpoint_dim(ppp_path: str, target_dim: int | None = None, force_
                 pk["net_arch"] = dict(pk["net_arch"])
                 pk["net_arch"]["vf"] = list(pk["net_arch"]["pi"])
             data["policy_kwargs"] = pk
-            print(f"    policy_kwargs: features_dim={NEW_F}, net_arch={pk['net_arch']}")
+            _say(f"    policy_kwargs: features_dim={NEW_F}, net_arch={pk['net_arch']}")
         except Exception as e:
-            print(f"    не удалось обновить policy_kwargs: {e}")
+            _say(f"    не удалось обновить policy_kwargs: {e}")
 
         # обновляем observation_space в data если есть
         try:
@@ -431,13 +435,13 @@ def _migrate_checkpoint_dim(ppp_path: str, target_dim: int | None = None, force_
                         am_space = obs_space.spaces.get("action_mask", Box(0, 1, shape=(9,), dtype=bool))
                         new_obs_space = Dict({"observation": Box(-1, 4, shape=(NEW_N,), dtype="float32"), "action_mask": am_space})
                         data["observation_space"] = new_obs_space
-                        print(f"    обновил data['observation_space'] {old_shape} -> {(NEW_N,)}")
+                        _say(f"    обновил data['observation_space'] {old_shape} -> {(NEW_N,)}")
         except Exception as e:
-            print(f"    не удалось обновить observation_space в data: {e}")
+            _say(f"    не удалось обновить observation_space в data: {e}")
 
         # сбрасываем optimizer state чтобы не тянуть 713 моменты
         if pytorch_variables is not None:
-            print(f"    сбрасываю optimizer state ({OLD_N}->{NEW_N}) — будет новый оптимизатор")
+            _say(f"    сбрасываю optimizer state ({OLD_N}->{NEW_N}) — будет новый оптимизатор")
             pytorch_variables = None
 
         # сохраняем пропатченный чекпоинт во временный файл и грузим как обычный PPO
@@ -445,14 +449,14 @@ def _migrate_checkpoint_dim(ppp_path: str, target_dim: int | None = None, force_
             tmp_path = tmp.name
         try:
             save_to_zip_file(tmp_path, data=data, params=params, pytorch_variables=pytorch_variables)
-            print(f"  Сохраняю пропатченный чекпоинт во временный файл {tmp_path}")
+            _say(f"  Сохраняю пропатченный чекпоинт во временный файл {tmp_path}")
             ppo_new = PPO.load(tmp_path, device="cpu")
-            print(f"  Успешно загрузил мигрированный PPO")
+            _say(f"  Успешно загрузил мигрированный PPO")
             # критично: сбрасываем Adam моменты старой размерности — иначе exp_avg old vs grad new -> RuntimeError
             try:
                 if hasattr(ppo_new, "policy") and hasattr(ppo_new.policy, "optimizer") and ppo_new.policy.optimizer is not None:
                     ppo_new.policy.optimizer.state.clear()
-                    print(f"    сбросил optimizer.state ({OLD_N}->{NEW_N})")
+                    _say(f"    сбросил optimizer.state ({OLD_N}->{NEW_N})")
             except Exception as _e:
                 print(f"    не удалось сбросить optimizer.state: {_e}")
             try:
@@ -495,7 +499,7 @@ def _migrate_checkpoint_dim(ppp_path: str, target_dim: int | None = None, force_
                             nt = torch.zeros((NEW_F, NEW_N), dtype=tt.dtype, device=tt.device)
                             nt[:tt.shape[0], :tt.shape[1]] = tt
                             policy_state2[kk] = nt
-                            print(f"  Fallback: паддинг {kk} {list(tt.shape)} -> {list(nt.shape)}")
+                            _say(f"  Fallback: паддинг {kk} {list(tt.shape)} -> {list(nt.shape)}")
                     elif (isinstance(tt, torch.Tensor) and tt.dim() == 1
                             and "features_extractor" in kk and kk.endswith(".net.1.weight")
                             and tt.shape[0] != NEW_F):
@@ -514,11 +518,11 @@ def _migrate_checkpoint_dim(ppp_path: str, target_dim: int | None = None, force_
                         nt = torch.zeros((tt.shape[0], NEW_F), dtype=tt.dtype, device=tt.device)
                         nt[:, :tt.shape[1]] = tt
                         policy_state2[kk] = nt
-                        print(f"  Fallback: паддинг {kk} {list(tt.shape)} -> {list(nt.shape)}")
+                        _say(f"  Fallback: паддинг {kk} {list(tt.shape)} -> {list(nt.shape)}")
                 # загружаем в ppo_new
                 try:
                     ppo_new.policy.load_state_dict(policy_state2, strict=False)
-                    print("  Fallback: загрузил падденный state_dict напрямую в новый PPO (strict=False)")
+                    _say("  Fallback: загрузил падденный state_dict напрямую в новый PPO (strict=False)")
                     # правим observation_space
                     from gymnasium.spaces import Box, Dict
                     try:
@@ -639,6 +643,19 @@ def run(
                     ppo = _migrate_checkpoint_dim(resume_from, target_dim=N_FEATURES)
                 else:
                     raise
+        # стартовое состояние признаков урона: после миграции новые веса ровно нулевые,
+        # полезно видеть это до обучения, а не только в конце первой фазы
+        try:
+            _m0 = arch_usage_metrics(ppo)
+            if _m0:
+                print(f"[arch] старт: features_dim={_m0['arch/feat_dim']}, использование новых "
+                      f"признаков урона (RMS весов, доля от старых) = "
+                      f"{_m0['arch/new_cols_rms_ratio']:.4f}")
+                if float(_m0.get("arch/new_cols_rms_ratio", 1.0)) < 0.02:
+                    print("       веса новых признаков нулевые (warm start): они включатся по мере "
+                          "обучения; смотри метрику [arch] между фазами")
+        except Exception:
+            pass
         if reset_schedules:
             print(f"Сбрасываю счетчики lr/ent: было {ppo.num_timesteps} шагов -> 0 (модель {resume_from})")
             steps_done_holder = {"value": 0}

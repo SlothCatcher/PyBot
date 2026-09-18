@@ -75,8 +75,10 @@ def _snapshot_number(fname: str) -> int | None:
     return int(suffix) if suffix.isdigit() else None
 
 
-def _make_self_play_opponents():
-    model_dir = "models/"
+_SELF_PLAY_LOAD_ERRORS_REPORTED: set = set()
+
+
+def _make_self_play_opponents(model_dir: str = "models/", cache_dir: str | None = None):
     try:
         candidates = [f for f in listdir(model_dir) if isfile(join(model_dir, f)) and QUALIFIED_PREFIX in f]
     except FileNotFoundError:
@@ -92,7 +94,7 @@ def _make_self_play_opponents():
         except Exception:
             pass
     # если есть meta — сортируем qualified по winrate, иначе по номеру
-    meta_path = "models/qualified_meta.json"
+    meta_path = join(model_dir, "qualified_meta.json")
     winrate_map = {}
     try:
         import json, os
@@ -143,19 +145,20 @@ def _make_self_play_opponents():
     players = []
     for fname in files:
         try:
-            snap = PPO.load(join(model_dir, fname), device="cpu")
-            # проверка совместимости: если снапшот был обучен на другом N_FEATURES, пропускаем
-            # (иначе ppo.policy будет падать на mismatch observation_space)
-            try:
-                obs_dim = snap.observation_space["observation"].shape[0]  # type: ignore
-                if obs_dim != N_FEATURES:
-                    print(f"Skip qualified snapshot {fname}: obs {obs_dim} != {N_FEATURES}")
-                    continue
-            except Exception:
-                pass
+            from .checkpoint_utils import load_policy_compat
+
+            snap, info = load_policy_compat(join(model_dir, fname), N_FEATURES, cache_dir=cache_dir)
+            if snap is None:
+                # раньше здесь падал PPO.load на 715-снапшотах и спамил на каждой фазе
+                if fname not in _SELF_PLAY_LOAD_ERRORS_REPORTED:
+                    _SELF_PLAY_LOAD_ERRORS_REPORTED.add(fname)
+                    print(f"Failed to load qualified snapshot {fname}: {info.get('error')}")
+                continue
             players.append(PolicyPlayer(policy=snap.policy, battle_format=BATTLE_FORMAT, start_listening=False))
         except Exception as e:
-            print(f"Failed to load qualified snapshot {fname}: {e}")
+            if fname not in _SELF_PLAY_LOAD_ERRORS_REPORTED:
+                _SELF_PLAY_LOAD_ERRORS_REPORTED.add(fname)
+                print(f"Failed to load qualified snapshot {fname}: {e}")
     return players
 
 

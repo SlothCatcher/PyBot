@@ -52,7 +52,11 @@ def _make_self_play_opponents():
     players = []
     for fname in onlyfiles:
         try:
-            snap = PPO.load(join("models", fname), device="cpu")
+            from agents.checkpoint_utils import load_policy_compat
+            snap, info = load_policy_compat(join("models", fname), N_FEATURES)
+            if snap is None:
+                print(f"Failed to load self_play snapshot {fname}: {info.get('error')}")
+                continue
             players.append(PolicyPlayer(
                 policy=snap.policy, battle_format=BATTLE_FORMAT, start_listening=False
             ))
