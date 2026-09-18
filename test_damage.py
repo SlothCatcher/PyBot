@@ -9,7 +9,9 @@
      суперэффективный -> >0), obs = N_FEATURES и конечен;
   6) канонический порядок слотов команд (матрица не зависит от dict-порядка);
   7) Mold Breaker/Teravolt/Turboblaze и приёмы с ignoreAbility игнорируют способность защиты;
-  8) фьюжн-статы берутся только со своей стороны (species может совпасть).
+  8) фьюжн-статы берутся только со своей стороны (species может совпасть);
+  9) STAB от tera-типа — только после теры (объявленный tera:X в details STAB не даёт);
+ 10) инвариант Mold Breaker: способность защиты не влияет на урон (все приёмы x все способности).
 
 Запуск: python test_damage.py
 """
@@ -516,6 +518,95 @@ def test_fusion_map_is_side_local():
                      == base[off + 15:off + 87]).all()))
 
 
+def test_stab_tera_timing():
+    """STAB от tera-типа только ПОСЛЕ теры: объявленный `tera:X` в details не даёт STAB.
+
+    `Pokemon.tera_type` заполняется из details (`tera:Water`) и teambuilder ещё до
+    теры, поэтому старая ветка «совпало с tera_type» давала приёму лишний STAB 1.5x.
+    Тера учитывается через `type_1` (он равен tera-типу только когда покемон
+    терасталлизован).
+    """
+    from agents.damage import DamageContext, estimate_damage, prepare_mon
+
+    def nb():
+        b = Battle(battle_tag="battle-gen9fusionmonsrandombattle-1", username="Me",
+                   logger=logging.getLogger("quiet"), gen=9)
+        for msg in (["", "player", "p1", "Me", "", ""], ["", "player", "p2", "Opp", "", ""],
+                    ["", "start"]):
+            b.parse_message(msg)
+        return b
+
+    ctx = DamageContext()
+    b = nb()
+    # Fire/Ground с объявленным tera:Water (в бою ещё не терасталлизован)
+    b.parse_message(["", "switch", "p1a: Blaze", "camerupt, L50, M, tera:Water", "300/300"])
+    b.parse_message(["", "switch", "p2a: Rock", "steelix, L50, F", "300/300"])
+    mon = b.active_pokemon
+    check("тера ещё не применена, но tera_type уже известен",
+          (getattr(mon.tera_type, "name", None), mon.is_terastallized), ("WATER", False))
+    surf = Move("surf", gen=9)
+    def dmg(m):
+        return estimate_damage(prepare_mon(m, None), prepare_mon(b.opponent_active_pokemon, None), surf, ctx)
+    with_tera_declared = dmg(mon)
+    saved = mon._terastallized_type
+    mon._terastallized_type = None
+    without = dmg(mon)
+    mon._terastallized_type = saved
+    check("Surf по Fire/Ground без теры: STAB от tera:Water не применяется", with_tera_declared, without)
+
+    b2 = nb()
+    b2.parse_message(["", "switch", "p1a: Blaze", "camerupt, L50, M", "300/300"])
+    b2.parse_message(["", "switch", "p2a: Rock", "steelix, L50, F", "300/300"])
+    before = estimate_damage(prepare_mon(b2.active_pokemon, None),
+                             prepare_mon(b2.opponent_active_pokemon, None), surf, ctx)
+    b2.active_pokemon.terastallize("Water")
+    after = estimate_damage(prepare_mon(b2.active_pokemon, None),
+                            prepare_mon(b2.opponent_active_pokemon, None), surf, ctx)
+    check_true("после теры в Water STAB появляется (урон вырос ~1.5x)",
+               after[1] > before[1] * 1.4, f"до={before} после={after}")
+
+
+def test_mold_breaker_is_exhaustive():
+    """Инвариант: с Mold Breaker способность защиты не влияет НИ на один приём.
+
+    Проверяем на всех атакующих приёмах гена 9 и всех способностях, которые моделирует
+    `damage.py` (иммунитеты + снижение урона) — и заодно что без Mold Breaker каждая
+    из этих способностей действительно что-то меняет (тест не вырожденный).
+    """
+    from poke_env.data import GenData
+    from agents.damage import (DamageContext, _ABILITY_IMMUNITY, _DEF_ABILITY_MULT,
+                               estimate_damage, prepare_mon)
+
+    ctx = DamageContext()
+    dex = GenData.from_gen(9).moves
+    damaging = [mid for mid in dex if (getattr(Move(mid, gen=9), "base_power", 0) or 0) > 0]
+    abilities = sorted(set(_ABILITY_IMMUNITY) | set(_DEF_ABILITY_MULT))
+    check_true("набор способностей для проверки не пуст", len(abilities) >= 20, f"n={len(abilities)}")
+
+    mb_atk = prepare_mon(mk_mon("a", (PT.FIGHTING, PT.GROUND), ["tackle"], ability="moldbreaker"))
+    plain_atk = prepare_mon(mk_mon("a", (PT.FIGHTING, PT.GROUND), ["tackle"], ability="sandveil"))
+    dfn_none = prepare_mon(mk_mon("dfn", (PT.NORMAL, PT.POISON), ["tackle"], ability=None))
+
+    bad, vacuous = [], []
+    for ab in abilities:
+        dfn = prepare_mon(mk_mon("dfn", (PT.NORMAL, PT.POISON), ["tackle"], ability=ab))
+        changed_without_mb = False
+        for mid in damaging:
+            mv = Move(mid, gen=9)
+            mb, mb_none = estimate_damage(mb_atk, dfn, mv, ctx), estimate_damage(mb_atk, dfn_none, mv, ctx)
+            if mb != mb_none:
+                bad.append((ab, mid, mb, mb_none))
+            if estimate_damage(plain_atk, dfn, mv, ctx) != estimate_damage(plain_atk, dfn_none, mv, ctx):
+                changed_without_mb = True
+        if not changed_without_mb:
+            vacuous.append(ab)
+
+    check("Mold Breaker: способность защиты не влияет на урон (нарушений)", len(bad), 0)
+    if bad:
+        print("      примеры:", bad[:5])
+    check("все способности влияют на урон БЕЗ Mold Breaker (тест не вырожденный)", vacuous, [])
+
+
 def main() -> int:
     test_formula()
     test_immunities()
@@ -527,6 +618,8 @@ def main() -> int:
     test_opponent_effect_flags()
     test_mold_breaker()
     test_fusion_map_is_side_local()
+    test_stab_tera_timing()
+    test_mold_breaker_is_exhaustive()
     print("-" * 74)
     if FAILED:
         print(f"ПРОВАЛЕНО: {len(FAILED)} -> {FAILED}")

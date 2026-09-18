@@ -375,7 +375,8 @@ def attack_ignores_ability(atk: Optional[dict], move) -> bool:
     раскрытия — когда он противника. Неизвестная способность не подставляется (`_id(None)` -> ""),
     то есть догадок о закрытой информации не появляется.
     """
-    if atk is not None and atk.get("ability") in _MOLD_BREAKER_ABILITIES:
+    ability = atk.get("ability") if isinstance(atk, dict) else _safe_attr(atk, "ability")
+    if ability in _MOLD_BREAKER_ABILITIES:
         return True
     return bool(_safe_attr(move, "ignore_ability", False))
 
@@ -433,13 +434,17 @@ def estimate_damage(atk: Optional[dict], dfn: Optional[dict], move, ctx: Optiona
     base = int((int(2 * level / 5) + 2) * power * A / D / 50) + 2
 
     mult = float(eff)
-    # STAB
+    # STAB. Тера тут уже учтена: `Pokemon.type_1` отдаёт tera-тип, когда покемон
+    # терасталлизован (а `type_2` становится None). Отдельная ветка «совпало с tera_type»
+    # была ошибкой: у НЕтерасталлизованного покемона `tera_type` уже заполнен — poke-env
+    # ставит `_terastallized_type` из details `tera:X` (наш `|switch|`/`|request|`) и из
+    # teambuilder, — и приём получал лишний STAB 1.5x, которого в бою ещё нет
+    # (проверено на живом `Battle`: Camerupt Fire/Ground с объявленным tera:Water получал
+    # STAB за Surf).
     amon = atk["mon"]
     stab_types = {str(getattr(getattr(amon, "type_1", None), "name", "") or "").upper(),
                   str(getattr(getattr(amon, "type_2", None), "name", "") or "").upper()}
-    tera = getattr(amon, "tera_type", None) or getattr(amon, "_terastallized_type", None)
-    tera_name = str(getattr(tera, "name", tera) or "").upper()
-    if atk_name in stab_types or (tera_name and atk_name == tera_name):
+    if atk_name in stab_types:
         mult *= 2.0 if atk["ability"] == "adaptability" else 1.5
     # техник
     if atk["ability"] == "technician" and power <= 60:
@@ -914,6 +919,7 @@ def their_known_moves_damage(opp_active: Optional[dict], our_active: Optional[di
 
     atk_sig = _mon_sig(opp_active, True)
     act_sig = _mon_sig(our_active, False)
+    team_sigs = [None] * OUR_TEAM_SLOTS
     scored = []
     for mv in moves:
         dmg = cached_move_damage(opp_active, our_active, mv, ctx, atk_sig, act_sig)
@@ -931,7 +937,9 @@ def their_known_moves_damage(opp_active: Optional[dict], our_active: Optional[di
         for j, dfn in enumerate(our_prepared[:OUR_TEAM_SLOTS]):
             if dfn is None or getattr(dfn.get("mon"), "fainted", False):
                 continue
-            d = cached_move_damage(opp_active, dfn, mv, ctx, atk_sig, _mon_sig(dfn, False))
+            if team_sigs[j] is None:      # сигнатуру считаем один раз на покемона,
+                team_sigs[j] = _mon_sig(dfn, False)   # а не на каждый из его приёмов
+            d = cached_move_damage(opp_active, dfn, mv, ctx, atk_sig, team_sigs[j])
             if d is None:
                 continue
             out_team[slot * OUR_TEAM_SLOTS + j] = damage_frac(d[0], dfn["hp_now"], dfn["hp_max"])
