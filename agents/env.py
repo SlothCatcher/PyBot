@@ -5,7 +5,7 @@ from os.path import isfile, join
 
 import numpy as np
 from gymnasium.spaces import Box
-from poke_env.battle import AbstractBattle, SideCondition, Status
+from poke_env.battle import AbstractBattle, SideCondition, Status, Weather, Field, Effect
 from poke_env.environment import SingleAgentWrapper, SinglesEnv
 from poke_env.player import MaxBasePowerPlayer, RandomPlayer, SimpleHeuristicsPlayer
 from stable_baselines3 import PPO
@@ -41,6 +41,15 @@ HAZARD_DAMAGE_PENALTY = 0.08       # было 0.3
 PROTECT_BONUS = 0.10               # было 0.4
 STATUS_CURE_BONUS = 0.10           # было 0.4
 TERA_BONUS = 0.08                  # было 0.3 (weak)
+# расширение пула — всё понемногу 0.06, с cap 12
+WEATHER_BONUS = 0.08
+TERRAIN_BONUS = 0.06
+SUBSTITUTE_BONUS = 0.08
+SUBSTITUTE_WASTED_PENALTY = 0.06
+LEECH_SEED_BONUS = 0.08
+LEECH_WASTED_PENALTY = 0.06
+HEAL_BONUS = 0.08
+HEAL_WASTED_PENALTY = 0.06
 SHAPING_EPISODE_CAP = 12.0         # макс суммарный shaping за бой (меньше victory 30)
 SHAPING_STEP_CLIP = 0.50           # клип на ход (было 2.0) — ещё сильнее жмём одиночный всплеск
 STATUS_IMMUNE_TYPES = {
@@ -341,6 +350,99 @@ class ExampleEnv(SinglesEnv):
         except Exception:
             return 1.0
 
+    def _team_has_weather_synergy(self, team: dict, weather) -> bool:
+        """Есть ли в команде абилка/приём зависящий от погоды — только тогда награждаем за погоду"""
+        if weather is None:
+            return False
+        try:
+            wname = getattr(weather, "name", str(weather)).lower()
+            for mon in team.values():
+                if mon.fainted:
+                    continue
+                ab = str(getattr(mon, "ability", "") or "").lower().replace(" ", "").replace("-", "")
+                # Sunny: chlorophyll, flowergift, solar power, Solar Beam, Growth, Synthesis
+                if "sunnyday" in wname:
+                    if ab in ("chlorophyll", "flowergift", "solarpower", "orichalcumpulse"):
+                        return True
+                if "raindance" in wname:
+                    if ab in ("swiftswim", "raindance", "hydration", "dryskin"):
+                        return True
+                if "sandstorm" in wname:
+                    if ab in ("sandrush", "sandforce", "sandveil"):
+                        return True
+                if "snow" in wname:
+                    if ab in ("slushrush", "icebody", "snowcloak"):
+                        return True
+                for mv in list(getattr(mon, "moves", {}).values()):
+                    mid = str(getattr(mv, "id", "") or "").lower()
+                    mname = mid.replace("-", "").replace(" ", "")
+                    if "sunnyday" in wname and mname in ("solarbeam", "solarblade", "growth", "synthesis", "morningsun", "moonlight", "weatherball"):
+                        return True
+                    if "raindance" in wname and mname in ("thunder", "hurricane", "weatherball", "hydropump"):
+                        return True
+                    if "sandstorm" in wname and mname in ("weatherball",):
+                        return True
+                    if "snow" in wname and mname in ("blizzard", "auroraveil", "weatherball"):
+                        return True
+        except Exception:
+            pass
+        return False
+
+    def _team_has_terrain_synergy(self, team: dict, field) -> bool:
+        if field is None:
+            return False
+        try:
+            fname = getattr(field, "name", str(field)).lower()
+            for mon in team.values():
+                if mon.fainted:
+                    continue
+                ab = str(getattr(mon, "ability", "") or "").lower()
+                if "electricterrain" in fname and ab in ("surgesurfer", "hadronengine", "electricsurge"):
+                    return True
+                if "grassyterrain" in fname and ab in ("grassysurge", "grassyterrain"):
+                    return True
+                if "psychicterrain" in fname and ab in ("psychicsurge",):
+                    return True
+                if "mistyterrain" in fname and ab in ("mistysurge",):
+                    return True
+                for mv in list(getattr(mon, "moves", {}).values()):
+                    mid = str(getattr(mv, "id", "") or "").lower()
+                    if "terrain" in fname and "terrainpulse" in mid:
+                        return True
+                    if "grassyterrain" in fname and mid in ("grassyglide",):
+                        return True
+                    if "electricterrain" in fname and mid in ("risingvoltage",):
+                        return True
+        except Exception:
+            pass
+        return False
+
+    def _has_substitute(self, pokemon) -> bool:
+        if pokemon is None:
+            return False
+        try:
+            if Effect.SUBSTITUTE in getattr(pokemon, "effects", {}):
+                return True
+            for k in getattr(pokemon, "effects", {}).keys():
+                if "substitute" in str(getattr(k, "name", str(k))).lower():
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _has_leech_seed(self, pokemon) -> bool:
+        if pokemon is None:
+            return False
+        try:
+            if Effect.LEECH_SEED in getattr(pokemon, "effects", {}):
+                return True
+            for k in getattr(pokemon, "effects", {}).keys():
+                if "leechseed" in str(getattr(k, "name", str(k))).lower().replace("_", ""):
+                    return True
+        except Exception:
+            pass
+        return False
+
     def calc_reward(self, battle) -> float:
         base = self.reward_computing_helper(
             battle, fainted_value=2.0, hp_value=1.0, status_value=0.5, victory_value=30.0,
@@ -379,6 +481,11 @@ class ExampleEnv(SinglesEnv):
                     curr_protected = True
             except Exception:
                 curr_protected = False
+            curr_weather = next(iter(battle.weather), None) if getattr(battle, "weather", None) else None
+            curr_field = next(iter(battle.fields), None) if getattr(battle, "fields", None) else None
+            curr_has_sub = self._has_substitute(battle.active_pokemon)
+            curr_opp_has_leech = self._has_leech_seed(battle.opponent_active_pokemon)
+            curr_has_leech = self._has_leech_seed(battle.active_pokemon)
             # предыдущее состояние
             prev = self._reward_state.get(tag)
             if prev is None:
@@ -402,6 +509,11 @@ class ExampleEnv(SinglesEnv):
                     "opp_status": curr_opp_status,
                     "is_tera": curr_is_tera,
                     "protected": curr_protected,
+                    "weather": curr_weather,
+                    "field": curr_field,
+                    "has_sub": curr_has_sub,
+                    "opp_has_leech": curr_opp_has_leech,
+                    "has_leech": curr_has_leech,
                     "extra_accum": 0.0,  # для per-episode бюджета
                 }
                 return base - 0.02
@@ -613,6 +725,53 @@ class ExampleEnv(SinglesEnv):
             except Exception:
                 pass
 
+            # погода — только если в команде есть синергия (как просил)
+            try:
+                prev_weather = prev.get("weather", None)
+                if prev_weather is None and curr_weather is not None:
+                    if self._team_has_weather_synergy(battle.team, curr_weather):
+                        extra += WEATHER_BONUS
+                    else:
+                        extra -= 0.04
+            except Exception:
+                pass
+            try:
+                prev_field = prev.get("field", None)
+                if prev_field is None and curr_field is not None:
+                    if self._team_has_terrain_synergy(battle.team, curr_field):
+                        extra += TERRAIN_BONUS
+                    else:
+                        extra -= 0.03
+            except Exception:
+                pass
+            try:
+                prev_has_sub = bool(prev.get("has_sub", False))
+                if not prev_has_sub and curr_has_sub and prev.get("own_hp", 1.0) > 0.26:
+                    extra += SUBSTITUTE_BONUS
+                elif not prev_has_sub and curr_has_sub and prev.get("own_hp", 1.0) <= 0.26:
+                    extra -= SUBSTITUTE_WASTED_PENALTY
+            except Exception:
+                pass
+            try:
+                prev_opp_leech = bool(prev.get("opp_has_leech", False))
+                if not prev_opp_leech and curr_opp_has_leech:
+                    extra += LEECH_SEED_BONUS
+                elif prev_opp_leech and curr_opp_has_leech and not opp_switched:
+                    extra -= LEECH_WASTED_PENALTY * 0.5
+                prev_has_leech = bool(prev.get("has_leech", False))
+                if not prev_has_leech and curr_has_leech:
+                    extra -= LEECH_WASTED_PENALTY
+            except Exception:
+                pass
+            try:
+                heal_amount = curr_own_hp - prev.get("own_hp", curr_own_hp)
+                if heal_amount > 0.12 and prev.get("own_hp", 1.0) < 0.90:
+                    extra += HEAL_BONUS
+                elif heal_amount > 0.05 and prev.get("own_hp", 1.0) >= 0.95:
+                    extra -= HEAL_WASTED_PENALTY
+            except Exception:
+                pass
+
             # per-step клип (был 2.0 → 0.5) + per-episode бюджет 12 < victory 30
             extra = float(np.clip(extra, -SHAPING_STEP_CLIP, SHAPING_STEP_CLIP))
             # per-episode бюджет — чтобы сумма за бой не перевесила победу
@@ -650,6 +809,11 @@ class ExampleEnv(SinglesEnv):
                 "opp_status": curr_opp_status,
                 "is_tera": curr_is_tera,
                 "protected": curr_protected,
+                "weather": curr_weather,
+                "field": curr_field,
+                "has_sub": curr_has_sub,
+                "opp_has_leech": curr_opp_has_leech,
+                "has_leech": curr_has_leech,
                 "extra_accum": float(new_accum),
             }
 
