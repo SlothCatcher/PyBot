@@ -197,7 +197,14 @@ agents/fusion_parser.py        # set pending, защита от потери ф�
 agents/players.py              # mask guard, Forfeit guard
 agents/policy_player.py        # LR/ent annealing, вечная пересборка env, нормализованная оценка
 agents/policy_player_simple.py # фикс цикла load, mask guard
-agents/training.py             # нормализованная оценка, self_play EMA, BC clip, robust load\nagents/damage.py               # расчёт потенциального урона (87 признаков)\nagents/vecnorm_utils.py        # паддинг статистик VecNormalize под текущий N_FEATURES\nplay_trained.py                # инференс с нормализацией и авто-миграцией снапшота\ntest_damage.py                 # тесты блока урона\ntest_dim_migration.py          # тесты миграции снапшотов/VecNormalize/датасетов\n```
+agents/training.py             # нормализованная оценка, self_play EMA, BC clip, robust load
+agents/damage.py               # расчёт потенциального урона (87 признаков)
+agents/vecnorm_utils.py        # паддинг статистик VecNormalize под текущий N_FEATURES
+play_trained.py                # инференс с нормализацией и авто-миграцией снапшота
+test_damage.py                 # тесты блока урона
+test_dim_migration.py          # тесты миграции снапшотов/VecNormalize/датасетов
+test_no_shadowing.py           # ast-детектор затенения имён (UnboundLocalError) по всему проекту
+```
 
 Все импорты проверены: `python -c "import agents.config; from agents.env import ExampleEnv; ..."` → `ALL IMPORTS OK`, `heuristic_dataset.npz` 418 совпадает с `VecNormalize` 418.
 
@@ -517,15 +524,34 @@ stab и т.д.), наверное лучше прописывать минима
   `ValueError`. Нули = «нет информации» для признаков урона, модель их игнорирует, пока не
   дообучится на свежих данных. Пересборка 3.6 ГБ датасета больше не обязательна.
 
-Регресс-тесты: `test_dim_migration.py` (20 проверок) — читаемость размерности,
+Регресс-тесты: `test_dim_migration.py` (30 проверок) — читаемость размерности,
 идемпотентность, побитовое сохранение старых колонок, нули в новых, forward после миграции,
-паддинг `VecNormalize` (418→802), паддинг датасета (включая mmap-путь).
+паддинг `VecNormalize` (418→802), паддинг датасета (включая mmap-путь), fallback-путь
+миграции и определение «несовпадение размеров» по тексту ошибки.
+
+Мелочи, которые тоже стреляли на реальном `--resume`:
+
+* **`UnboundLocalError: N_FEATURES`** — внутри `run()` был локальный
+  `from agents.config import N_FEATURES`, из-за чего имя становилось локальным для всей
+  функции, а миграционная проверка стояла выше него. Локальные импорты убраны,
+  `test_no_shadowing.py` (39 проверок) сканирует **весь проект** ast-анализом и ловит
+  любое «использование имени раньше его локального определения» (проверено на самом баге).
+* **`--resume models/self_play_qualified_19` без `.zip`** — `resolve_checkpoint_path`
+  подставляет `.zip`/`.pkl`, а если файла нет — печатает список похожих файлов рядом
+  вместо голого `FileNotFoundError`.
+* **fallback-миграция** больше не поднимает `SubprocVecEnv` с `ExampleEnv` (это требовало
+  запущенного poke-env сервера и падало на `_DimProbeEnv` без gymnasium): политика
+  собирается на крошечном `_DimProbeEnv(dim)`; паддинг определяет старую размерность из
+  самого тензора, а не из `OLD_N` (тот мог быть `None`).
 
 ### 11.6 Как запускать
 
 ```bash
 # все тесты фич
-for t in test_damage test_type_multiplier_fix test_typechange_timing test_type_sync          test_inference_paths test_dim_migration; do PYTHONPATH=. python $t.py; done
+for t in test_damage test_type_multiplier_fix test_typechange_timing test_type_sync \
+         test_inference_paths test_dim_migration test_no_shadowing; do
+  PYTHONPATH=. python $t.py
+done
 
 # играть старой моделью (715) на новых признаках — миграция автоматическая
 python play_trained.py --selfcheck --model models/self_play_qualified_19.zip   # проверить пайплайн

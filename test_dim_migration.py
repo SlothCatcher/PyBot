@@ -152,6 +152,17 @@ def main():
         w2 = ppo2.policy.features_extractor.net[0].weight
         check("повторная миграция даёт тот же результат", bool(torch.equal(w, w2)))
 
+        # 4b) тот же сценарий, что у пользователя: путь без .zip на resume
+        from agents.policy_player import resolve_checkpoint_path
+        noext = os.path.join(td, "self_play_qualified_19")
+        zipped = noext + ".zip"
+        os.rename(old_zip, zipped)
+        check("resume без расширения .zip находит файл", resolve_checkpoint_path(noext) == zipped)
+        ppo3 = _migrate_checkpoint_dim(resolve_checkpoint_path(noext), target_dim=N_FEATURES)
+        w3 = ppo3.policy.features_extractor.net[0].weight
+        check("миграция по пути без .zip даёт 715 -> N_FEATURES",
+              tuple(w3.shape) == (512, N_FEATURES), str(tuple(w3.shape)))
+
     # 5) VecNormalize со старой статистикой должен паддиться, а не падать
     with tempfile.TemporaryDirectory() as td:
         from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
@@ -212,6 +223,48 @@ def main():
     check("BC-датасет: большой путь через mmap работает",
           big.shape == (40, N_FEATURES) and float(big[0, -1]) == 0.0 and float(big[0, 0]) == 1.0,
           f"shape={big.shape}, edge={float(big[0, 0])}/{float(big[0, -1])}")
+
+    # 7) fallback-путь миграции (если основная упала) тоже должен работать и не требовать сервера
+    with tempfile.TemporaryDirectory() as td:
+        full2 = make_checkpoint(N_FEATURES, os.path.join(td, "full2.zip"))
+        old2 = shrink_checkpoint(full2, os.path.join(td, "old2.zip"), 715)
+        try:
+            ppo_fb = _migrate_checkpoint_dim(old2, target_dim=N_FEATURES, force_fallback=True)
+            w_fb = ppo_fb.policy.features_extractor.net[0].weight
+            check("fallback-миграция: первый слой расширен до N_FEATURES",
+                  tuple(w_fb.shape) == (512, N_FEATURES), str(tuple(w_fb.shape)))
+            check("fallback-миграция: новые колонки нулевые",
+                  int(torch.count_nonzero(w_fb[:, 715:])) == 0)
+            check("fallback-миграция: observation_space обновлён",
+                  tuple(ppo_fb.observation_space["observation"].shape) == (N_FEATURES,),
+                  str(tuple(ppo_fb.observation_space["observation"].shape)))
+            try:
+                ppo_fb.policy.env = ppo_fb.get_env()
+            except Exception:
+                pass
+            check("fallback-миграция: политика делает forward",
+                  tuple(ppo_fb.policy({
+                      "observation": torch.zeros((1, N_FEATURES), dtype=torch.float32),
+                      "action_mask": torch.ones((1, 9), dtype=torch.bool),
+                  })[0].shape) == (1,))
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            check(f"fallback-миграция (упала: {type(e).__name__}: {e})", False)
+
+    # 8) детектор несовпадения размерностей по тексту ошибки
+    from agents.policy_player import _looks_like_dim_mismatch
+    check("ошибка SB3 'size mismatch' распознаётся",
+          _looks_like_dim_mismatch(
+              "size mismatch for features_extractor.net.0.weight: copying a param with shape "
+              "torch.Size([512, 715]) from checkpoint, the shape in current model is torch.Size([512, 802])."))
+    check("ошибка 'Error(s) in loading state_dict' распознаётся",
+          _looks_like_dim_mismatch("Error(s) in loading state_dict for MaskedActorCriticPolicy: size mismatch"))
+    check("ошибка формы в matmul распознаётся",
+          _looks_like_dim_mismatch("mat1 and mat2 shapes cannot be multiplied (4x715 and 802x512)"))
+    check("посторонние ошибки не считаются несовпадением размеров",
+          not _looks_like_dim_mismatch("FileNotFoundError: nope")
+          and not _looks_like_dim_mismatch("RuntimeError: CUDA out of memory"))
 
     print("-" * 74)
     if FAIL:

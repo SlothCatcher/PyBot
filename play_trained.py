@@ -124,8 +124,9 @@ def load_policy(model_path: str, allow_migrate: bool = True):
     """
     from stable_baselines3 import PPO
 
-    from agents.policy_player import _checkpoint_obs_dim, _migrate_checkpoint_dim
+    from agents.policy_player import _checkpoint_obs_dim, _migrate_checkpoint_dim, resolve_checkpoint_path
 
+    model_path = resolve_checkpoint_path(model_path)
     dim = _checkpoint_obs_dim(model_path)
     if dim is None:
         return PPO.load(model_path, device="cpu"), None

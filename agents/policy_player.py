@@ -113,9 +113,104 @@ except Exception:
     ICM = None
     CuriosityVecWrapper = None
 
+try:  # gymnasium есть всегда (зависимость SB3), но модуль должен импортироваться и без него
+    from gymnasium import Env as _GymBaseEnv
+except Exception:  # pragma: no cover
+    class _GymBaseEnv:  # type: ignore
+        pass
+
+
+class _DimProbeEnv(_GymBaseEnv):
+    """Минимальный env нужной размерности для сборки политики без poke-env сервера.
+
+    Используется только для того, чтобы инстанцировать PPO с правильными shapes.
+    """
+
+    metadata = {"render_modes": []}
+
+    def __init__(self, dim: int):
+        import numpy as _np
+
+        from gymnasium import spaces
+
+        self._np = _np
+        self.observation_space = spaces.Dict({
+            "observation": spaces.Box(-1.0, 4.0, shape=(int(dim),), dtype=_np.float32),
+            "action_mask": spaces.Box(0, 1, shape=(9,), dtype=bool),
+        })
+        self.action_space = spaces.Discrete(9)
+
+    def reset(self, *, seed=None, options=None):
+        return self.observation_space.sample(), {}
+
+    def step(self, action):
+        return self.observation_space.sample(), 0.0, True, False, {}
+
+    def close(self):
+        return None
+
+
+def _probe_ppo(target_dim: int):
+    """PPO с случайной политикой на target_dim признаков (для fallback-миграции)."""
+    from stable_baselines3.common.vec_env import DummyVecEnv
+
+    from agents.policy import MaskedActorCriticPolicy
+
+    env = DummyVecEnv([lambda: _DimProbeEnv(int(target_dim))])
+    return PPO(MaskedActorCriticPolicy, env, device="cpu", verbose=0,
+               n_steps=8, batch_size=8), env
+
+
 def _migrate_ppo_713_to_715(ppp_path: str, target_dim: int | None = None):
     """Старое имя миграции (713->715). Сохранено для совместимости со скриптами."""
     return _migrate_checkpoint_dim(ppp_path, target_dim=target_dim)
+
+
+def _looks_like_dim_mismatch(msg: str) -> bool:
+    """Похоже ли сообщение об ошибке на несовпадение размерности obs при загрузке весов."""
+    m = (msg or "").lower()
+    for marker in ("size mismatch", "loading state_dict", "shapes cannot be multiplied",
+                   "mat1 and mat2", "copying a param with shape"):
+        if marker in m:
+            return True
+    return "size" in m and "shape" in m
+
+
+def explain_missing_checkpoint(path: str) -> str:
+    """Человеческая подсказка, если файл снапшота не найден (частый случай: забыли .zip)."""
+    d = os.path.dirname(os.path.abspath(path)) or "."
+    base = os.path.basename(path)
+    try:
+        files = sorted(os.listdir(d))
+    except Exception:
+        files = []
+    hints = [f for f in files if base.lower().split(".")[0] in f.lower()][:8]
+    lines = [f"Файл снапшота не найден: {path}"]
+    if hints:
+        lines.append("Похожие файлы рядом: " + ", ".join(os.path.join(d, h) for h in hints))
+    elif files:
+        lines.append(f"В каталоге {d} есть: " + ", ".join(files[:8]))
+    lines.append("Укажите путь целиком (обычно с расширением .zip): "
+                 "--resume models/self_play_qualified_19.zip")
+    return "\n".join(lines)
+
+
+def resolve_checkpoint_path(path: str) -> str:
+    """Дополняет путь до существующего файла: `models/x` -> `models/x.zip`, если так есть.
+
+    Пользователь часто пишет --resume models/self_play_qualified_19 без расширения;
+    SB3 сам расширение не добавляет, поэтому падало FileNotFoundError.
+    """
+    if not path:
+        return path
+    if os.path.isfile(path):
+        return path
+    for suffix in (".zip", ".pkl"):
+        cand = path + suffix
+        if os.path.isfile(cand):
+            print(f"  {path}: файла нет, использую {cand}")
+            return cand
+    return path
 
 
 def _checkpoint_obs_dim(path: str):
@@ -132,7 +227,7 @@ def _checkpoint_obs_dim(path: str):
         return None
 
 
-def _migrate_checkpoint_dim(ppp_path: str, target_dim: int | None = None):
+def _migrate_checkpoint_dim(ppp_path: str, target_dim: int | None = None, force_fallback: bool = False):
     """Миграция чекпоинта на актуальный N_FEATURES через паддинг весов в zip.
 
     Обобщено: раньше умела ровно 713->715, теперь определяет старую размерность из самих
@@ -151,6 +246,8 @@ def _migrate_checkpoint_dim(ppp_path: str, target_dim: int | None = None):
         return _PPO.load(ppp_path, device="cpu")
     print(f"  Миграция {OLD_N}->{NEW_N} для {ppp_path}...")
     try:
+        if force_fallback:
+            raise RuntimeError("force_fallback: основная миграция пропущена по запросу")
         from stable_baselines3.common.save_util import load_from_zip_file, save_to_zip_file
         from gymnasium.spaces import Box, Dict
         data, params, pytorch_variables = load_from_zip_file(ppp_path, device=torch.device("cpu"))
@@ -246,17 +343,9 @@ def _migrate_checkpoint_dim(ppp_path: str, target_dim: int | None = None):
         print(f"  load_from_zip_file миграция не удалась: {e}, пробую fallback через создание нового PPO и копирование весов")
         import traceback
         traceback.print_exc()
-        # fallback: создаём новый PPO с 715 и копируем веса напрямую
+        # fallback: собираем политику нужной размерности (без сервера) и копируем веса вручную
         try:
-            # создаём dummy env с 715
-            from agents.env import ExampleEnv
-            from stable_baselines3.common.vec_env import SubprocVecEnv
-            dummy_env = SubprocVecEnv([ExampleEnv.create_env for _ in range(1)])
-            # пробуем загрузить старый PPO через временный 713 конфиг если предыдущий способ упал
-            # последний шанс: пробуем просто загрузить с strict=False через низкоуровневый torch
-            # создаём новый PPO
-            from agents.policy import MaskedActorCriticPolicy
-            ppo_new = PPO(MaskedActorCriticPolicy, dummy_env, device="cpu", verbose=0)
+            ppo_new, dummy_env = _probe_ppo(NEW_N)
             # грузим старый state dict через load_from_zip_file снова но теперь паддим и грузим напрямую
             try:
                 from stable_baselines3.common.save_util import load_from_zip_file as _lf
@@ -271,10 +360,15 @@ def _migrate_checkpoint_dim(ppp_path: str, target_dim: int | None = None):
                 # паддинг
                 for kk in list(policy_state2.keys()):
                     tt = policy_state2[kk]
-                    if isinstance(tt, torch.Tensor) and tt.dim()==2 and tt.shape[1]==OLD_N and tt.shape[0]==512 and "features_extractor" in kk:
+                    # старую размерность берём из самого тензора: OLD_N может быть None/недоступен
+                    if (isinstance(tt, torch.Tensor) and tt.dim() == 2 and tt.shape[0] == 512
+                            and "features_extractor" in kk and "weight" in kk
+                            and tt.shape[1] != NEW_N):
+                        old_cols = int(tt.shape[1])
                         nt = torch.zeros((512, NEW_N), dtype=tt.dtype, device=tt.device)
-                        nt[:, :OLD_N] = tt
+                        nt[:, :old_cols] = tt
                         policy_state2[kk] = nt
+                        print(f"  Fallback: паддинг {kk} {old_cols} -> {NEW_N}")
                 # загружаем в ppo_new
                 try:
                     ppo_new.policy.load_state_dict(policy_state2, strict=False)
@@ -370,6 +464,9 @@ def run(
 
     if resume_from:
         # размерность чекпоинта против текущего N_FEATURES: если разошлась — паддинг весов
+        resume_from = resolve_checkpoint_path(resume_from)
+        if not os.path.isfile(resume_from):
+            raise SystemExit(explain_missing_checkpoint(resume_from))
         _resume_dim = _checkpoint_obs_dim(resume_from)
         if _resume_dim is not None and _resume_dim != N_FEATURES:
             print(f"Снапшот {resume_from}: {_resume_dim} признаков, сейчас {N_FEATURES} — "
@@ -379,14 +476,14 @@ def run(
             try:
                 ppo = PPO.load(resume_from, device="cpu")
             except RuntimeError as e:
-                if "size mismatch" in str(e):
+                if _looks_like_dim_mismatch(str(e)):
                     print(f"Несовпадение размеров при загрузке {resume_from} — мигрирую...")
                     ppo = _migrate_checkpoint_dim(resume_from, target_dim=N_FEATURES)
                 else:
                     raise
             except Exception as e:
                 # SB3 иногда оборачивает RuntimeError
-                if "size mismatch" in str(e):
+                if _looks_like_dim_mismatch(str(e)):
                     print(f"Несовпадение размеров при загрузке {resume_from} — мигрирую...")
                     ppo = _migrate_checkpoint_dim(resume_from, target_dim=N_FEATURES)
                 else:
@@ -437,7 +534,6 @@ def run(
                             action_dim = int(env.action_space.n)
                         except Exception:
                             action_dim = 26
-                    from agents.config import N_FEATURES
                     icm_module = ICM(obs_dim=N_FEATURES, action_dim=action_dim, feat_dim=int(icm_feat_dim)).to("cpu")
                     env = CuriosityVecWrapper(env, icm=icm_module, beta=float(icm_beta), anneal=bool(icm_anneal), total_timesteps=int(total_timesteps), lr=float(icm_lr), device="cpu", train_freq=int(icm_train_freq), batch_size=int(icm_batch_size))
                     icm_wrapper = env
@@ -466,7 +562,6 @@ def run(
                             action_dim = int(env.action_space.n)
                         except Exception:
                             action_dim = 26
-                    from agents.config import N_FEATURES
                     icm_module = ICM(obs_dim=N_FEATURES, action_dim=action_dim, feat_dim=int(icm_feat_dim)).to("cpu")
                     env = CuriosityVecWrapper(env, icm=icm_module, beta=float(icm_beta), anneal=bool(icm_anneal), total_timesteps=int(total_timesteps), lr=float(icm_lr), device="cpu", train_freq=int(icm_train_freq), batch_size=int(icm_batch_size))
                     icm_wrapper = env
@@ -749,7 +844,6 @@ def run(
                     except Exception:
                         action_dim = getattr(icm_module_reuse, "action_dim", 26) if icm_module_reuse is not None else 26
                 if icm_module_reuse is None:
-                    from agents.config import N_FEATURES
                     icm_module_reuse = ICM(obs_dim=N_FEATURES, action_dim=action_dim, feat_dim=int(icm_feat_dim)).to("cpu")
                     old_initial_beta = float(icm_beta)
                     old_beta = float(icm_beta)
