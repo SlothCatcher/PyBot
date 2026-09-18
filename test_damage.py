@@ -29,7 +29,7 @@ from agents.damage import (
     DAMAGE_BLOCK_SIZE, DamageContext, EFFECT_FLAGS, best_move_damage, estimate_damage,
     mon_stats, opponent_effect_flags, prepare_mon, real_stat, team_slots,
 )
-from agents.features import _damage_block, embed_battle_with_fusion
+from agents.features import _damage_block, canonical_reserves, embed_battle_with_fusion
 
 FAILED = []
 
@@ -213,15 +213,33 @@ def test_slot_order():
     team2 = {"alpha": b_, "zeta": a}
     check("порядок не зависит от dict-порядка",
           [m.species for m in team_slots(team2)], ["alpha", "zeta"])
-    # и obs не меняется при другом порядке вставки
+    # и obs не меняется при другом порядке вставки. ВАЖНО: заглушки mk_mon создаются
+    # активными, поэтому реальные резервы нужно пометить active=False — иначе проверка
+    # вырождается (bench-блок нулевой в обоих случаях и нечего сравнивать).
+    zeta_reserve = mk_mon("zeta", (PT.NORMAL,), ["tackle", "protect"], hp=200)
+    zeta_reserve.active = False
+    alpha_reserve = mk_mon("alpha", (PT.WATER,), ["surf", "protect"], hp=220)
+    alpha_reserve.active = False
+    alpha_reserve.name = "p1: Alpha"
+    zeta_reserve.name = "p1: Zeta"
     our = mk_mon("our", (PT.WATER,), ["surf", "protect", "tackle", "thunderbolt"])
     opp = mk_mon("opp", (PT.FIRE,), ["flamethrower"])
-    b1 = mk_battle(our, opp, our_team={"our": our, "zeta": a, "alpha": b_},
-                   opp_team={"opp": opp})
-    b2 = mk_battle(our, opp, our_team={"alpha": b_, "our": our, "zeta": a},
-                   opp_team={"opp": opp})
-    check("obs одинаков при разном порядке team",
-          bool((embed_battle_with_fusion(b1, None, None) == embed_battle_with_fusion(b2, None, None)).all()), True)
+    opp_res_b = mk_mon("bravo", (PT.GRASS,), ["energyball"], hp=240)
+    opp_res_b.active = False
+    opp_res_c = mk_mon("charlie", (PT.ICE,), ["icebeam"], hp=260)
+    opp_res_c.active = False
+
+    b1 = mk_battle(our, opp, our_team={"our": our, "zeta": zeta_reserve, "alpha": alpha_reserve},
+                   opp_team={"opp": opp, "bravo": opp_res_b, "charlie": opp_res_c})
+    b2 = mk_battle(our, opp, our_team={"alpha": alpha_reserve, "our": our, "zeta": zeta_reserve},
+                   opp_team={"charlie": opp_res_c, "bravo": opp_res_b, "opp": opp})
+    o1, o2 = embed_battle_with_fusion(b1, None, None), embed_battle_with_fusion(b2, None, None)
+    diff = int((o1 != o2).sum())
+    check("obs одинаков при разном порядке team (наш и их, с реальными резервами)", diff, 0)
+    check("резервы отсортированы по species (наш bench)",
+          [m.species for m in canonical_reserves(b1.team)], ["alpha", "zeta"])
+    check("резервы отсортированы по species (их bench)",
+          [m.species for m in canonical_reserves(b1.opponent_team)], ["bravo", "charlie"])
 
 
 def _flags_view(blk):

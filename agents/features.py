@@ -782,8 +782,24 @@ def _reserve_slot_vec(mon, opp_active=None, type_chart=None, fusion_entry: dict 
     return np.concatenate([type_vec, [hp], status_vec, actual_vec, weak, moves_vec, item_flag]).astype(np.float32)
 
 
+def canonical_reserves(team) -> list:
+    """Резервные покемоны в КАНОНИЧЕСКОМ порядке (сортировка по species, тай-брейк — имя).
+
+    Порядок `dict` в poke-env — это порядок выхода/превью, то есть произволен и меняется
+    между боями: одинаковые состояния давали разные obs (8 dims на перестановку двух
+    резервов в тесте, диапазон индексов 299..565 — это ровно bench-блок). В damage.py тот
+    же принцип уже применён к слотам матриц (`team_slots`), здесь он оставлен недоисправленным.
+    Имя (identify/ник) уникально внутри стороны, поэтому для двух покемонов одного вида
+    порядок всё равно детерминирован.
+    """
+    reserves = [mon for mon in (team or {}).values()
+                if mon is not None and not getattr(mon, "active", False)]
+    return sorted(reserves, key=lambda m: (str(getattr(m, "species", "") or ""),
+                                           str(getattr(m, "name", "") or "")))
+
+
 def _bench_vec(team: dict, opp_active=None, type_chart=None, fusion_map: dict | None = None) -> np.ndarray:
-    reserves = [mon for mon in team.values() if not mon.active]
+    reserves = canonical_reserves(team)
     slots = []
     for i in range(MAX_RESERVES):
         if i < len(reserves):
@@ -867,7 +883,7 @@ def _hazards(side_conditions: dict) -> np.ndarray:
 
 
 def _switch_summary(team: dict) -> np.ndarray:
-    reserves = [mon for mon in team.values() if not mon.active]
+    reserves = canonical_reserves(team)
     if not reserves:
         return np.zeros(2, dtype=np.float32)
     alive = [mon for mon in reserves if not mon.fainted]
@@ -1247,8 +1263,8 @@ def embed_battle_with_fusion(battle, our_fusion, opp_fusion, our_protected_last_
     opp_sub_damaged = _substitute_damaged(battle.opponent_active_pokemon)
 
     our_restricted = _is_move_restricted(battle)
-    our_reserves = [mon for mon in battle.team.values() if not mon.active]
-    opp_reserves = [mon for mon in battle.opponent_team.values() if not mon.active]
+    our_reserves = canonical_reserves(battle.team)
+    opp_reserves = canonical_reserves(battle.opponent_team)
 
     our_bench = _bench_vec(battle.team, battle.opponent_active_pokemon, type_chart, our_team_fusions)
     opp_bench = _bench_vec(battle.opponent_team, battle.active_pokemon, type_chart, opp_team_fusions)

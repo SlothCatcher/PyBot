@@ -65,6 +65,50 @@ def nonzero(obs):
     return {k: v for k, v in flags(obs).items() if v}
 
 
+def test_reveal_order_is_irrelevant():
+    """Порядок выхода покемонов (порядок ключей в battle.team/opponent_team) не влияет на obs.
+
+    Порядок dict в poke-env — это порядок превью/выходов, он произволен. Раньше bench-блок
+    obs (по 135 признаков на скамейку) раскладывался по этому порядку, и одинаковые состояния
+    давали разные obs: 8 dims на перестановку двух резервов. Слоты матриц урона порядок уже
+    нормализовали (`team_slots`), скамейка — нет.
+    """
+    import numpy as np
+    from agents.features import embed_battle_with_fusion
+
+    rock = ("Rock", "steelix, L50, F", "earthquake")
+    skarm = ("Skarm", "skarmory, L50, F", "spikes")
+    blade = ("Blade", "garchomp, L50, M", "dragonclaw")
+
+    def live(order):
+        b = new_battle()
+        feed(b, [["", "switch", "p1a: Aqua", "swampert, L50, M", "362/362"]])
+        for name, details, move in order:
+            feed(b, [
+                ["", "switch", f"p2a: {name}", details, "100/100"],
+                ["", "move", f"p2a: {name}", move, "p1a: Aqua"],
+            ])
+        return b
+
+    a = live([rock, skarm, blade])
+    b = live([skarm, rock, blade])
+    check_true("порядок ключей в командах действительно разный",
+               list(a.opponent_team) != list(b.opponent_team) and list(a.team) == list(b.team),
+               f"{list(a.opponent_team)} vs {list(b.opponent_team)}")
+    check("активный в обоих боях один и тот же",
+          a.opponent_active_pokemon.species, b.opponent_active_pokemon.species)
+    oa, ob = embed_battle_with_fusion(a, None, None), embed_battle_with_fusion(b, None, None)
+    diff = int((oa != ob).sum())
+    check("obs не зависит от порядка выхода противника", diff, 0)
+
+    # и перестановка словарей «на месте» (сильнее: та же самая боевая сцена)
+    before = embed_battle_with_fusion(a, None, None)
+    a._team = dict(reversed(list(a._team.items())))
+    a._opponent_team = dict(reversed(list(a._opponent_team.items())))
+    after = embed_battle_with_fusion(a, None, None)
+    check("перестановка battle.team/opponent_team не меняет obs", int((before != after).sum()), 0)
+
+
 def main() -> int:
     b = new_battle()
     feed(b, [
@@ -164,6 +208,9 @@ def main() -> int:
     check_true("зеркало: у нового активного только статусный приём -> урона нет",
                float(obs5[MIRROR]) == 0.0, f"слот0={float(obs5[MIRROR]):.3f}")
     check_true("мой активный в бою тот же, obs конечен", bool(obs5.sum() == obs5.sum()))
+
+    # ---- порядок выходов не влияет на obs ----
+    test_reveal_order_is_irrelevant()
 
     # ---- сломанных путей логирования быть не должно ----
     from agents import features as _f

@@ -11,6 +11,11 @@ import pathlib
 import sys
 
 from agents.config import N_FEATURES, VECNORM_PATH
+
+# Карта групп ниже и индексы-пробы написаны под раскладку из 418 признаков. Сама по себе она
+# устарела (713 -> 715 -> 802 -> 870), поэтому «мёртвые» группы и пробы по индексам при
+# несовпадении пропускаем, а не печатаем FAIL: иначе скрипт врёт про корректный код.
+LEGACY_LAYOUT = (N_FEATURES == 418)
 from agents.features import (
     _TYPE_LIST, _STATUSES, _VOLATILES, _KEY_ITEMS, _RESERVE_SLOT_SIZE,
     _WEATHERS, _FIELDS, MAX_RESERVES, embed_battle_with_fusion,
@@ -35,7 +40,8 @@ def check_dataset(samples: int = 5000, dataset_path: str | None = None):
     print(f"  obs shape {obs.shape}, mask {mask.shape}, action [{action.min()}, {action.max()}]")
     print(f"  N_FEATURES config={N_FEATURES}, dataset={obs.shape[1]}, match={obs.shape[1]==N_FEATURES} -> {'OK' if obs.shape[1]==N_FEATURES else 'FAIL'}")
     if obs.shape[1] != N_FEATURES:
-        print("  FAIL: пересобери датасет или поправь N_FEATURES")
+        print(f"  WARN: датасет старой размерности ({obs.shape[1]}), для текущей N_FEATURES={N_FEATURES}"
+              " он будет пересобран автоматически (agents/training.py, _pad_obs_to_features)")
         return False
     n_nan = np.isnan(obs).sum()
     n_inf = np.isinf(obs).sum()
@@ -65,6 +71,10 @@ def check_dataset(samples: int = 5000, dataset_path: str | None = None):
         ("our_vol(11)",78,89), ("opp_vol(11)",89,100), ("our_item(11)",100,111), ("opp_item(11)",111,122),
         ("our_bench(135)",122,257), ("opp_bench(135)",257,392), ("vuln(2)",392,394), ("tera_flags(3)",394,397), ("tera_type(19)",397,416), ("protect(2)",416,418),
     ]
+    if not LEGACY_LAYOUT:
+        groups = []
+        print(f"\n  Карта групп ниже — от раскладки 418, для N_FEATURES={N_FEATURES} она устарела: пропущена.")
+        print("  Актуальная раскладка: AUDIT.md §11.2 и §14; проверки признаков — test_damage.py.")
     print("\n  Проверка групп (mean должен быть !=0, std>0 для живых фич):")
     # semi/sub/tera_type — редкие: в heuristic_dataset 0.0 ожидаемо, т.к. SimpleHeuristics почти не юзает Substitute/SkyDrop/Tera
     # и старый poke_env не парсил tera. После фикса детекторы оживают в синтетике/живых боях, dataset остаётся DEAD исторически.
@@ -158,7 +168,7 @@ def check_embed_synthetic():
         try:
             obs = embed_battle_with_fusion(battle, our_fusion=our_fus, opp_fusion=opp_fus,
                                            our_protected_last_turn=our_prot, opp_protected_last_turn=opp_prot)
-            ok = obs.shape==(418,) and np.isfinite(obs).all()
+            ok = obs.shape==(N_FEATURES,) and np.isfinite(obs).all()
             print(f"  {name:40s} shape {obs.shape} finite {np.isfinite(obs).all()} min {obs.min():.2f} max {obs.max():.2f} -> {'OK' if ok else 'FAIL'}")
             return obs
         except Exception as e:
@@ -196,7 +206,7 @@ def check_embed_synthetic():
     b.opponent_team = {"b": b.opponent_active_pokemon}
     b.available_moves = [FakeMove("substitute",0, PokemonType.NORMAL)]
     obs_sub = run_one("volatiles/sub", b)
-    if obs_sub is not None:
+    if obs_sub is not None and LEGACY_LAYOUT:
         # semi/sub/tera — проверяем что детекторы живые в синтетике
         print(f"    -> sub our {obs_sub[75]:.2f} opp {obs_sub[76]:.2f} (ожидается >0 для our)")
         print(f"    -> semi our {obs_sub[73]:.2f} (ожидается 0 тут, см. следующий тест)")
@@ -212,7 +222,7 @@ def check_embed_synthetic():
     b.team = {"a": prep_mon}; b.opponent_team = {"b": b.opponent_active_pokemon}
     b.available_moves = [FakeMove("solarbeam",120, PokemonType.GRASS)]
     obs_prep = run_one("semi via preparing (Fly/SolarBeam)", b)
-    if obs_prep is not None:
+    if obs_prep is not None and LEGACY_LAYOUT:
         print(f"    -> semi our {obs_prep[73]:.2f} opp {obs_prep[74]:.2f} (ожидается 1.0/0.0)")
     # tera via fallback _last_details / _terastallized_type (чиним DEAD: poke_env не парсил tera)
     b = MockBattle()
@@ -224,7 +234,7 @@ def check_embed_synthetic():
     b.team = {"a": tera_mon}; b.opponent_team = {"b": b.opponent_active_pokemon}
     b.available_moves = [FakeMove("tackle",40, PokemonType.NORMAL)]
     obs_tera = run_one("tera via _last_details fallback", b)
-    if obs_tera is not None:
+    if obs_tera is not None and LEGACY_LAYOUT:
         tera_sum = float(obs_tera[397:416].sum())
         print(f"    -> tera_type sum {tera_sum:.1f} (ожидается 1.0, был DEAD до фикса)")
 
@@ -248,7 +258,7 @@ def check_embed_synthetic():
     b.opponent_active_pokemon = b.opponent_team["a"]; b.opponent_active_pokemon.active=True
     b.available_moves = [FakeMove("flamethrower",90,fire)]
     obs = run_one("bench+vuln (огонь vs трава)", b)
-    if obs is not None:
+    if obs is not None and LEGACY_LAYOUT:
         vuln_our, vuln_opp = obs[392], obs[393]
         # our bench: 3x Grass + 1x Water vs Grass-активный: Water 2x уязвим -> 0.25; opp bench Water vs Fire -> 0.0
         print(f"    vulnerability our {vuln_our:.2f} opp {vuln_opp:.2f} (ожидается 0.25/0.00 — корректно, Grass→Water 2x)")
