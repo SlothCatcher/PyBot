@@ -18,29 +18,33 @@ from .players import PolicyPlayer
 
 import multiprocessing
 
-# --- веса для новой награды (сбалансированы под базу fainted 2.0 / hp 1.0 / victory 30) ---
+# --- веса для новой награды (сбалансированы под базу fainted 2.0 / hp 1.0 / victory 30)
+# ИСПРАВЛЕНИЕ: суммарный shaping за бой раньше мог быть 40-80 > victory 30 → доминировал над победой.
+# Сжали в 4 раза + per-episode бюджет 12, чтобы победа оставалась главным сигналом.
 HAZARD_REWARDS = {
-    SideCondition.STEALTH_ROCK: 0.8,
-    SideCondition.SPIKES: 0.5,       # за слой
-    SideCondition.TOXIC_SPIKES: 0.5, # за слой
-    SideCondition.STICKY_WEB: 0.6,
+    SideCondition.STEALTH_ROCK: 0.20,   # было 0.8
+    SideCondition.SPIKES: 0.12,         # было 0.5
+    SideCondition.TOXIC_SPIKES: 0.12,   # было 0.5
+    SideCondition.STICKY_WEB: 0.15,     # было 0.6
 }
-DAMAGE_WEIGHT = 0.8          # за 100% HP урона активному противнику
-DAMAGE_TAKEN_PENALTY = 0.4   # штраф за полученный урон (меньше, чтобы не боялся атаковать)
-BOOST_WEIGHT = 0.15          # за каждую ступень буста своих
-DEBUFF_WEIGHT = 0.15         # за каждую ступень дебаффа противника
-SWITCH_BONUS = 0.5           # базовый бонус за удачный свитч
-SWITCH_IMMUNE_BONUS = 1.0    # x2 за иммун/отражение (пользователь: x2)
-SWITCH_THRESHOLD = 0.30      # разница урона 30% HP = порог удачного свитча
-# новые
-HAZARD_CLEAR_BONUS = 0.5         # снял хазарды оппа с себя (Rapid Spin)
-HAZARD_SELF_CLEAR_PENALTY = 0.5   # снял свои хазарды с оппа (Defog)
-HAZARD_DAMAGE_PENALTY = 0.3       # урон от хазардов при свитче
-PROTECT_BONUS = 0.4               # удачный протект
-STATUS_CURE_BONUS = 0.4           # клин статуса (Heal Bell)
-TERA_BONUS = 0.3                  # удачный тера (как выбрал weak)
+DAMAGE_WEIGHT = 0.20          # было 0.8
+DAMAGE_TAKEN_PENALTY = 0.10   # было 0.4
+BOOST_WEIGHT = 0.04           # было 0.15
+DEBUFF_WEIGHT = 0.04          # было 0.15
+SWITCH_BONUS = 0.12           # было 0.5
+SWITCH_IMMUNE_BONUS = 0.25    # было 1.0 (x2)
+SWITCH_THRESHOLD = 0.30
+# новые — тоже сжаты
+HAZARD_CLEAR_BONUS = 0.12         # было 0.5
+HAZARD_SELF_CLEAR_PENALTY = 0.12   # было 0.5
+HAZARD_DAMAGE_PENALTY = 0.08       # было 0.3
+PROTECT_BONUS = 0.10               # было 0.4
+STATUS_CURE_BONUS = 0.10           # было 0.4
+TERA_BONUS = 0.08                  # было 0.3 (weak)
+SHAPING_EPISODE_CAP = 12.0         # макс суммарный shaping за бой (меньше victory 30)
+SHAPING_STEP_CLIP = 0.50           # клип на ход (было 2.0) — ещё сильнее жмём одиночный всплеск
 STATUS_IMMUNE_TYPES = {
-    "par": ["electric", "ground"],  # Thunder Wave не действует на Electric/Ground с VoltAbsorb? Упростим: Electric имун к параличу? На деле только Ground имун к Thunder Wave, но оставим
+    "par": ["electric", "ground"],
     "brn": ["fire"],
     "psn": ["poison", "steel"],
     "tox": ["poison", "steel"],
@@ -378,7 +382,9 @@ class ExampleEnv(SinglesEnv):
             # предыдущее состояние
             prev = self._reward_state.get(tag)
             if prev is None:
-                # первый вызов для этого боя — инициализируем и не даём extra (иначе награда за стартовые хазарды 0)
+                # первый вызов для этого боя — инициализируем и не даём extra
+                # BUGFIX: раньше не было opp_active_species → второй ход ошибочно считал урон между разными покемонами
+                curr_opp_species_init = getattr(getattr(battle.opponent_active_pokemon, "species", None), "lower", lambda: "")() if battle.opponent_active_pokemon else ""
                 self._reward_state[tag] = {
                     "opp_haz": opp_haz,
                     "own_haz": own_haz,
@@ -390,11 +396,13 @@ class ExampleEnv(SinglesEnv):
                     "active_hp": curr_own_hp,
                     "team_hp": {k: v.current_hp_fraction for k, v in battle.team.items()},
                     "opp_team_hp": {k: v.current_hp_fraction for k, v in battle.opponent_team.items()},
+                    "opp_active_species": curr_opp_species_init,
                     "turn": getattr(battle, "turn", 0),
                     "status": curr_status,
                     "opp_status": curr_opp_status,
                     "is_tera": curr_is_tera,
                     "protected": curr_protected,
+                    "extra_accum": 0.0,  # для per-episode бюджета
                 }
                 return base - 0.02
 
@@ -605,7 +613,26 @@ class ExampleEnv(SinglesEnv):
             except Exception:
                 pass
 
-            # обновляем состояние
+            # per-step клип (был 2.0 → 0.5) + per-episode бюджет 12 < victory 30
+            extra = float(np.clip(extra, -SHAPING_STEP_CLIP, SHAPING_STEP_CLIP))
+            # per-episode бюджет — чтобы сумма за бой не перевесила победу
+            try:
+                prev_accum = float(prev.get("extra_accum", 0.0)) if prev else 0.0
+                new_accum = prev_accum + extra
+                if new_accum > SHAPING_EPISODE_CAP:
+                    extra = SHAPING_EPISODE_CAP - prev_accum
+                    new_accum = SHAPING_EPISODE_CAP
+                elif new_accum < -SHAPING_EPISODE_CAP:
+                    extra = -SHAPING_EPISODE_CAP - prev_accum
+                    new_accum = -SHAPING_EPISODE_CAP
+            except Exception:
+                new_accum = float(prev.get("extra_accum", 0.0)) if prev else 0.0
+                try:
+                    new_accum += extra
+                except Exception:
+                    pass
+
+            # обновляем состояние (с аккумулятором)
             self._reward_state[tag] = {
                 "opp_haz": opp_haz,
                 "own_haz": own_haz,
@@ -623,18 +650,20 @@ class ExampleEnv(SinglesEnv):
                 "opp_status": curr_opp_status,
                 "is_tera": curr_is_tera,
                 "protected": curr_protected,
+                "extra_accum": float(new_accum),
             }
-            # чистим завершённые бои (победа/поражение)
-            if getattr(battle, "finished", False):
-                self._reward_state.pop(tag, None)
 
         except Exception as e:
             # не роняем шаг из-за награды
-            # print(f"reward shaping warn {e}")
             pass
+        finally:
+            # чистим завершённые бои даже если выше был exception (фикс утечки)
+            try:
+                if getattr(battle, "finished", False):
+                    self._reward_state.pop(tag, None)
+            except Exception:
+                pass
 
-        # клип extra чтобы не взорвать PPO (VecNormalize нормализует, но всё равно)
-        extra = float(np.clip(extra, -2.0, 2.0))
         return base + extra - 0.02
 
     def action_to_order(self, action, battle, fake=False, strict=True):
