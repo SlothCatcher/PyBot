@@ -32,6 +32,13 @@ DEBUFF_WEIGHT = 0.15         # за каждую ступень дебаффа �
 SWITCH_BONUS = 0.5           # базовый бонус за удачный свитч
 SWITCH_IMMUNE_BONUS = 1.0    # x2 за иммун/отражение (пользователь: x2)
 SWITCH_THRESHOLD = 0.30      # разница урона 30% HP = порог удачного свитча
+# новые
+HAZARD_CLEAR_BONUS = 0.5         # снял хазарды оппа с себя (Rapid Spin)
+HAZARD_SELF_CLEAR_PENALTY = 0.5   # снял свои хазарды с оппа (Defog)
+HAZARD_DAMAGE_PENALTY = 0.3       # урон от хазардов при свитче
+PROTECT_BONUS = 0.4               # удачный протект
+STATUS_CURE_BONUS = 0.4           # клин статуса (Heal Bell)
+TERA_BONUS = 0.3                  # удачный тера (как выбрал weak)
 STATUS_IMMUNE_TYPES = {
     "par": ["electric", "ground"],  # Thunder Wave не действует на Electric/Ground с VoltAbsorb? Упростим: Electric имун к параличу? На деле только Ground имун к Thunder Wave, но оставим
     "brn": ["fire"],
@@ -349,6 +356,25 @@ class ExampleEnv(SinglesEnv):
             curr_active_species = getattr(getattr(battle.active_pokemon, "species", None), "lower", lambda: "")() if battle.active_pokemon else ""
             if not curr_active_species and battle.active_pokemon:
                 curr_active_species = str(getattr(battle.active_pokemon, "species", ""))[:40]
+            curr_status = getattr(battle.active_pokemon, "status", None) if battle.active_pokemon else None
+            curr_opp_status = getattr(battle.opponent_active_pokemon, "status", None) if battle.opponent_active_pokemon else None
+            curr_is_tera = bool(getattr(battle.active_pokemon, "is_terastallized", False)) if battle.active_pokemon else False
+            curr_protected = False
+            try:
+                if self.battle1 is not None and getattr(battle, "battle_tag", None) == getattr(self.battle1, "battle_tag", None):
+                    src_tmp = self.agent1
+                elif self.battle2 is not None and getattr(battle, "battle_tag", None) == getattr(self.battle2, "battle_tag", None):
+                    src_tmp = self.agent2
+                else:
+                    src_tmp = self.agent1 if getattr(battle, "player_role", "p1") == "p1" else self.agent2
+                tag_tmp = getattr(battle, "battle_tag", "")
+                prot_state = src_tmp._protect_state.get(tag_tmp, {}) if hasattr(src_tmp, "_protect_state") else {}
+                our_side_tmp = getattr(battle, "player_role", "p1")
+                curr_protected = bool(prot_state.get(f"last_{our_side_tmp}", False))
+                if not curr_protected and battle.active_pokemon and any("protect" in str(k).lower() for k in getattr(battle.active_pokemon, "effects", {}).keys()):
+                    curr_protected = True
+            except Exception:
+                curr_protected = False
             # предыдущее состояние
             prev = self._reward_state.get(tag)
             if prev is None:
@@ -365,54 +391,52 @@ class ExampleEnv(SinglesEnv):
                     "team_hp": {k: v.current_hp_fraction for k, v in battle.team.items()},
                     "opp_team_hp": {k: v.current_hp_fraction for k, v in battle.opponent_team.items()},
                     "turn": getattr(battle, "turn", 0),
+                    "status": curr_status,
+                    "opp_status": curr_opp_status,
+                    "is_tera": curr_is_tera,
+                    "protected": curr_protected,
                 }
                 return base - 0.02
 
-            # 1) Hazards: размещение у противника +, у себя - (штраф)
+            # 1) Hazards: размещение/снятие + штраф за урон от них
             d_opp_haz = opp_haz - prev["opp_haz"]
             d_own_haz = own_haz - prev["own_haz"]
             if d_opp_haz > 0:
-                extra += d_opp_haz * 1.0  # уже взвешено per_layer, доп множитель 1.0
-            if d_opp_haz < 0:
-                # сняли наши хазарды — штраф (Defog у противника)
-                extra += d_opp_haz * 0.5  # d отрицателен, штраф
+                extra += d_opp_haz * 1.0
+            elif d_opp_haz < 0:
+                # сняли свои хазарды с оппа (Defog) — штраф, как просил
+                extra -= abs(d_opp_haz) * HAZARD_SELF_CLEAR_PENALTY
             if d_own_haz > 0:
-                extra -= d_own_haz * 0.6  # противник поставил нам — штраф
+                extra -= d_own_haz * 0.6
+            elif d_own_haz < 0:
+                # сняли хазарды оппа с себя (Rapid Spin/Defog) — бонус
+                extra += abs(d_own_haz) * HAZARD_CLEAR_BONUS
 
-            # 2) Урон: по активному противнику
-            # если противник сменился — не считаем HP дельту (новый мон с фулл HP)
+            # 2) Урон: по активному противнику (учитывает DEF/SPD уже через HP дельту)
             prev_opp_active_species = prev.get("opp_active_species", "")
             curr_opp_species = getattr(getattr(battle.opponent_active_pokemon, "species", None), "lower", lambda: "")() if battle.opponent_active_pokemon else ""
             opp_switched = prev_opp_active_species and curr_opp_species and prev_opp_active_species != curr_opp_species
             if not opp_switched:
-                dmg_dealt = prev["opp_hp"] - curr_opp_hp  # >0 если нанесли урон
+                dmg_dealt = prev["opp_hp"] - curr_opp_hp
                 if dmg_dealt > 1e-6:
                     extra += dmg_dealt * DAMAGE_WEIGHT
-                # штраф за полученный урон (меньше вес, чтобы не боялся размена)
                 dmg_taken = prev["own_hp"] - curr_own_hp
                 if dmg_taken > 1e-6:
                     extra -= dmg_taken * DAMAGE_TAKEN_PENALTY
-            else:
-                # противник сменился — засчитываем только если добили предыдущего (prev HP был низкий, сейчас новый с фулл — не штрафуем)
-                pass
-
             # 3) Бусты своих
             d_own_boost = curr_own_boost - prev["own_boost"]
             if d_own_boost > 0:
                 extra += d_own_boost * BOOST_WEIGHT
-            # 4) Дебаффы противника (его статы упали)
+            # 4) Дебаффы противника
             d_opp_debuff = curr_opp_debuff - prev["opp_debuff"]
             if d_opp_debuff > 0:
                 extra += d_opp_debuff * DEBUFF_WEIGHT
 
-            # 5) Удачный свитч
+            # 5) Удачный свитч (с DEF/SPD)
             prev_species = prev.get("active_species", "")
-            # считаем свитч если вид сменился и предыдущий не был fainted (HP>0)
             was_switch = False
             if prev_species and curr_active_species and prev_species != curr_active_species:
-                # проверяем что предыдущий мон не fainted (иначе это не свитч а вынужденная замена)
                 prev_active_hp = prev.get("active_hp", 1.0)
-                # также проверяем что смена произошла в этот ход (turn увеличился)
                 curr_turn = getattr(battle, "turn", 0)
                 prev_turn = prev.get("turn", 0)
                 if prev_active_hp > 0.05 and curr_turn > prev_turn:
@@ -533,6 +557,54 @@ class ExampleEnv(SinglesEnv):
                     elif delta_dmg > 0.4:
                         extra += 0.2
 
+            # штраф за урон от хазардов при свитче (дополнительно к dmg_taken, который уже учтён)
+            if was_switch and own_haz > 0.01:
+                # Stealth Rock 0.8 -> -0.14, 3 слоя Spikes 1.5 -> -0.27
+                extra -= own_haz * HAZARD_DAMAGE_PENALTY * 0.6
+
+            # удачный протект (был в protect прошлом ходом и не получил урона, опп бил)
+            try:
+                prev_protected = bool(prev.get("protected", False))
+                # protect длится 1 ход: prev_protected True означает в прошлом ходу нажали Protect
+                # сейчас уже нет, но в прошлом ходу урона не было и опп не свитчил
+                if prev_protected and not curr_protected:
+                    dmg_taken_protect = prev.get("own_hp", curr_own_hp) - curr_own_hp
+                    if abs(dmg_taken_protect) < 1e-6 and not opp_switched and abs(prev.get("opp_hp", curr_opp_hp) - curr_opp_hp) < 1e-6:
+                        # опп пытался атаковать но мы в протект — бонус
+                        extra += PROTECT_BONUS
+            except Exception:
+                pass
+
+            # клин статуса (Heal Bell / Natural Cure)
+            try:
+                prev_status = prev.get("status", None)
+                if prev_status is not None and curr_status is None and curr_own_hp > 0.05:
+                    extra += STATUS_CURE_BONUS
+            except Exception:
+                pass
+
+            # удачный тера (смена типа дала резист или добила)
+            try:
+                prev_is_tera = bool(prev.get("is_tera", False))
+                if not prev_is_tera and curr_is_tera:
+                    opp_fainted_now = curr_opp_hp == 0 and prev.get("opp_hp", 0) > 0.2
+                    if opp_fainted_now:
+                        dmg_before = prev_dmg if 'prev_dmg' in locals() else 1.0
+                        # если до теры урон был бы не гарантированно летальным (<1.5) — полный бонус, иначе малый
+                        if dmg_before < 1.5:
+                            extra += TERA_BONUS
+                        else:
+                            extra += 0.15
+                    else:
+                        # без убийства — проверяем снижение входящего урона от теры
+                        # delta_dmg уже есть если был свитч+тера, иначе считаем заново
+                        has_delta = 'delta_dmg' in locals() and delta_dmg > 0.6
+                        has_immune = 'new_mult' in locals() and new_mult == 0 and prev_mult != 0
+                        if has_delta or has_immune:
+                            extra += TERA_BONUS
+            except Exception:
+                pass
+
             # обновляем состояние
             self._reward_state[tag] = {
                 "opp_haz": opp_haz,
@@ -547,6 +619,10 @@ class ExampleEnv(SinglesEnv):
                 "opp_team_hp": {k: v.current_hp_fraction for k, v in battle.opponent_team.items()},
                 "opp_active_species": curr_opp_species,
                 "turn": getattr(battle, "turn", 0),
+                "status": curr_status,
+                "opp_status": curr_opp_status,
+                "is_tera": curr_is_tera,
+                "protected": curr_protected,
             }
             # чистим завершённые бои (победа/поражение)
             if getattr(battle, "finished", False):
