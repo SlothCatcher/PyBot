@@ -247,6 +247,11 @@ def summary_line(prefix: str = "[type-debug]") -> str:
     return f"{prefix} {s}" if s else ""
 
 
+def counter_snapshot(kind: str) -> dict:
+    """Снимок счётчика событий (для диагностических скриптов)."""
+    return dict(_counts.get(kind, {}))
+
+
 def reset_counts() -> None:
     for c in _counts.values():
         c.clear()

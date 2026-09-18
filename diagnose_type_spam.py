@@ -31,8 +31,39 @@ from poke_env.player import DefaultBattleOrder, Player, SimpleHeuristicsPlayer, 
 
 from agents.config import BATTLE_FORMAT
 from agents.players import PolicyPlayer
-from agents.type_utils import damage_multiplier_safe_ex, is_unknown_type, summary_line
+from agents.type_utils import (
+    damage_multiplier_safe, damage_multiplier_safe_ex, is_unknown_type,
+    summary_line, counter_snapshot,
+)
 from agents.fusion_parser import _RAW_TYPECHANGE
+
+
+def _norm_type_name(x) -> str:
+    n = str(x or "").strip()
+    if n == "???":
+        return "THREE_QUESTION_MARKS"
+    return n.upper()
+
+
+def _to_pokemon_type(name: str):
+    """Строка из лога сервера -> PokemonType (умеет '???' и 'Stellar')."""
+    try:
+        from poke_env.battle import PokemonType
+        return PokemonType.from_name(str(name).strip())
+    except Exception:
+        return None
+
+
+def _server_types_for(battle, side: str):
+    """(ident, (type1, type2)|None) из ПОСЛЕДНЕГО typechange сервера по стороне."""
+    raw = _RAW_TYPECHANGE.get(getattr(battle, "battle_tag", ""), {}).get(side)
+    if not raw:
+        return None
+    parts = raw.split("|")
+    if len(parts) < 5:
+        return None
+    tnames = [_norm_type_name(x) for x in parts[4].split("/") if x.strip()]
+    return parts[2], (tuple(tnames) if tnames else None)
 
 
 def _move_bp(move) -> int:
@@ -53,9 +84,10 @@ def _type_pair(mon):
 class TypeDiagPlayer(PolicyPlayer):
     """PolicyPlayer + логирование решений (эффективность выбранного приёма)."""
 
-    def __init__(self, *args, deterministic: bool = False, **kwargs):
+    def __init__(self, *args, deterministic: bool = False, check_obs: bool = True, **kwargs):
         super().__init__(*args, **kwargs)
         self.deterministic = deterministic
+        self.check_obs = check_obs
         self.stats = {
             "turns": 0,
             "immune_chosen": 0,
@@ -67,6 +99,13 @@ class TypeDiagPlayer(PolicyPlayer):
             "unknown_pairs": Counter(),
             "best_missed": 0,
             "would_mask": 0,
+            # сверка с логом сервера
+            "type_checks": 0,
+            "type_mismatch": 0,
+            "server_msg_other_mon": 0,
+            "obs_checks": 0,
+            "obs_stale": 0,
+            "mismatch_examples": [],
         }
         self._logged_battles = set()
 
@@ -100,6 +139,15 @@ class TypeDiagPlayer(PolicyPlayer):
         if is_unknown_type(getattr(opp, "type_1", None)) or is_unknown_type(getattr(opp, "type_2", None)):
             self.stats["unknown_type_turns"] += 1
             self.stats["unknown_pairs"][pair] += 1
+
+        # сверка: тип в бою (то, что видит модель) против последнего typechange сервера
+        self._check_server_vs_battle(battle)
+        # сверка: obs-мультипликаторы против серверных типов (ловит obs, посчитанный до применения типа)
+        if self.check_obs:
+            try:
+                self._check_obs_against_server(battle, moves)
+            except Exception as e:
+                print(f"[diag] ошибка obs-сверки: {e}")
 
         # эффективность всех приёмов
         effs = []
@@ -140,6 +188,74 @@ class TypeDiagPlayer(PolicyPlayer):
             ch = f"{getattr(chosen[0], 'id', '?')}={chosen[1]:g}" if chosen else f"switch(idx {action})"
             print(f"[diag] ход {self.stats['turns']:3d} vs {pair:28s} выбрано {ch:22s} | доступно: {moves_str}")
 
+    # --- сверки с логом сервера -------------------------------------------------
+    def _check_server_vs_battle(self, battle):
+        sides = []
+        try:
+            role = getattr(battle, "player_role", None)
+            opp = "p2" if role == "p1" else "p1"
+            sides = [(role, getattr(battle, "active_pokemon", None), "наш"),
+                     (opp, getattr(battle, "opponent_active_pokemon", None), "чужой")]
+        except Exception:
+            return
+        for side, mon, label in sides:
+            if side not in ("p1", "p2") or mon is None:
+                continue
+            srv = _server_types_for(battle, side)
+            if srv is None:
+                continue
+            ident, srv_types = srv
+            if srv_types is None:
+                continue
+            # сообщение может относиться к другому покемону (свитч уже был, typechange ещё нет)
+            ident_key = ident.split(": ", 1)[-1].lstrip("+").strip().lower()
+            species = str(getattr(mon, "species", "") or "").lower()
+            if ident_key and species and ident_key not in species:
+                self.stats["server_msg_other_mon"] += 1
+                continue
+            actual = tuple(str(getattr(t, "name", t)) for t in (mon.type_1, mon.type_2) if t is not None)
+            self.stats["type_checks"] += 1
+            if actual != srv_types:
+                self.stats["type_mismatch"] += 1
+                if len(self.stats["mismatch_examples"]) < 5:
+                    self.stats["mismatch_examples"].append(
+                        f"{label} {ident}: сервер={srv_types} в бою={actual}")
+                    print(f"[diag] РАСХОЖДЕНИЕ типа: {label} {ident}: "
+                          f"сервер прислал {srv_types}, а в бою {actual}")
+
+    def _check_obs_against_server(self, battle, moves):
+        """obs (то, что уходит в сеть) посчитан по СЕРВЕРНЫМ типам оппонента?"""
+        opp_side = "p2" if getattr(battle, "player_role", "p1") == "p1" else "p1"
+        srv = _server_types_for(battle, opp_side)
+        if srv is None or srv[1] is None:
+            return
+        s_types = [_to_pokemon_type(x) for x in srv[1]]
+        if not s_types or s_types[0] is None:
+            return
+        s1 = s_types[0]
+        s2 = s_types[1] if len(s_types) > 1 else None
+        from agents.features import embed_battle_with_fusion
+        raw = embed_battle_with_fusion(
+            battle,
+            self.get_fusion_entry(battle, is_ours=True),
+            self.get_fusion_entry(battle, is_ours=False),
+            our_protected_last_turn=self.get_protected_last_turn(battle, is_ours=True),
+            opp_protected_last_turn=self.get_protected_last_turn(battle, is_ours=False),
+            our_team_fusions=self.get_team_fusion_map(battle, is_ours=True),
+            opp_team_fusions=self.get_team_fusion_map(battle, is_ours=False),
+        )
+        for i, m in enumerate(moves):
+            if 4 + i >= len(raw):
+                break
+            obs_mult = float(raw[4 + i])           # moves_dmg_multiplier[i]
+            srv_mult = float(damage_multiplier_safe(getattr(m, "type", None), s1, s2))
+            self.stats["obs_checks"] += 1
+            if abs(obs_mult - srv_mult) > 1e-6:
+                self.stats["obs_stale"] += 1
+                if self.stats["obs_stale"] <= 5:
+                    print(f"[diag] obs НЕ по серверному типу: {getattr(m, 'id', '?')} "
+                          f"obs={obs_mult:g} ожидалось {srv_mult:g} при серверных {srv[1]}")
+
     def print_summary(self):
         s = self.stats
         print("\n" + "=" * 78)
@@ -161,6 +277,35 @@ class TypeDiagPlayer(PolicyPlayer):
         print(f"распределение выбранных приёмов: {dict(s['chosen_moves'].most_common(10))}")
         if s["immune_matchups"]:
             print(f"иммунные матчапы: {dict(s['immune_matchups'].most_common(10))}")
+
+        print("-" * 78)
+        print("СВЕРКА С ЛОГОМ СЕРВЕРА (типы)")
+        if s["type_checks"]:
+            print(f"проверок 'тип в бою == последний typechange сервера': {s['type_checks']}, "
+                  f"расхождений: {s['type_mismatch']}"
+                  f"{'  ✓' if s['type_mismatch'] == 0 else '  ✗ см. примеры выше'}")
+        else:
+            print("проверок типов не было (нет сырых typechange — сервер не присылал?)")
+        if s["server_msg_other_mon"]:
+            print(f"пропущено (typechange был про другого покемона, ещё не применён): {s['server_msg_other_mon']}")
+        if s["obs_checks"]:
+            print(f"проверок 'obs посчитан по серверному типу': {s['obs_checks']}, "
+                  f"устаревших: {s['obs_stale']}"
+                  f"{'  ✓' if s['obs_stale'] == 0 else '  ✗ см. примеры выше'}")
+        for ex in s["mismatch_examples"]:
+            print(f"   пример: {ex}")
+
+        # интерпретация порядка кадров из логов
+        frames = counter_snapshot("frame_sequence")
+        if frames:
+            only_request = sum(v for k, v in frames.items() if set(k.split(">")) == {"request"})
+            total = sum(frames.values())
+            if only_request == total:
+                print("порядок кадров: сервер присылает |request| отдельным кадром -> "
+                      "typechange всегда применяется ДО решения, гонки нет")
+            else:
+                print(f"кадры с |request|: {frames} (есть кадры со смешанными сообщениями — "
+                      f"перестановка typechange актуальна)")
         print(summary_line() or "[type-debug] счётчики неизвестных типов пусты")
 
 
@@ -171,6 +316,9 @@ def main() -> int:
     ap.add_argument("--opponents", default="SimpleHeuristicsPlayer,RandomPlayer",
                     help="список классов через запятую")
     ap.add_argument("--deterministic", action="store_true", help="жадный выбор действия")
+    ap.add_argument("--no-check-obs", dest="check_obs", action="store_false",
+                    help="не пересчитывать obs для сверки с серверным типом (быстрее, но без этой проверки)")
+    ap.set_defaults(check_obs=True)
     args = ap.parse_args()
 
     from stable_baselines3 import PPO
@@ -178,7 +326,8 @@ def main() -> int:
     ppo = PPO.load(args.model)
     vec_norm = ppo.get_vec_normalize_env() if hasattr(ppo, "get_vec_normalize_env") else None
     agent = TypeDiagPlayer(policy=ppo.policy, battle_format=BATTLE_FORMAT,
-                           max_concurrent_battles=30, deterministic=args.deterministic)
+                           max_concurrent_battles=30, deterministic=args.deterministic,
+                           check_obs=args.check_obs)
     if vec_norm is not None:
         orig_embed = agent.embed_battle
 
