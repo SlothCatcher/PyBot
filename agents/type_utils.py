@@ -64,6 +64,9 @@ _counts: dict[str, Counter] = {
     "typechange_raw": Counter(),          # сырые -start|typechange от сервера (только debug)
     "typechange_after_request": Counter(),# typechange пришёл ПОСЛЕ |request| в батче (гонка)
     "typechange_reordered": Counter(),    # батч переставлен: typechange перед |request|
+    "typechange_variant": Counter(),      # со [silent] / без него (влияет на сбор статов)
+    "frame_sequence": Counter(),          # порядок сообщений в кадре с |request|
+    "stats_missing_at_decision": Counter(),  # фьюжн-статы не успели к решению
 }
 # сколько уникальных строк печатать на вид события (чтобы не залить лог)
 _PRINT_LIMIT = {
@@ -72,6 +75,9 @@ _PRINT_LIMIT = {
     "keyerror": 3,
     "typechange_after_request": 3,
     "typechange_reordered": 3,
+    "typechange_variant": 2,
+    "frame_sequence": 5,
+    "stats_missing_at_decision": 5,
 }
 
 
@@ -118,6 +124,12 @@ def _note(kind: str, key: str, limit_unique: int | None = None) -> None:
         print(f"[type-fix] неизвестный тип у защиты: {key}")
     elif kind == "typechange_reordered":
         print(f"[type-fix] typechange перенесён перед |request| ({key}) — иначе решение ушло бы со старым типом")
+    elif kind == "typechange_variant":
+        print(f"[type-debug] typechange пришёл {key}")
+    elif kind == "frame_sequence":
+        print(f"[type-debug] кадр с |request|: {key}")
+    elif kind == "stats_missing_at_decision":
+        print(f"[type-fix] фьюжн-статы отсутствовали на момент решения ({key}) — ход сыгран по дексовому фолбэку")
     elif kind == "typechange_raw":
         print(f"[type-debug] typechange от сервера: {key}")
 
@@ -201,6 +213,22 @@ def note_typechange_raw(message: str, after_request: bool = False) -> None:
 
 def note_typechange_reordered(signature: str) -> None:
     _note("typechange_reordered", signature)
+
+
+def note_typechange_variant(variant: str) -> None:
+    _note("typechange_variant", variant)
+
+
+def note_frame_sequence(kinds: str, has_typechange: bool, has_html: bool, tc_after_request: bool) -> None:
+    """Порядок сообщений в кадре с |request| (доказательство того, что шлёт сервер)."""
+    _note("frame_sequence", kinds)
+    if tc_after_request:
+        _note("typechange_after_request", kinds)
+
+
+def note_stats_missing(context: str) -> None:
+    """Фьюжн-статы не были разобраны к моменту решения (obs пошёл на дексовом фолбэке)."""
+    _note("stats_missing_at_decision", context)
 
 
 def summary() -> str:

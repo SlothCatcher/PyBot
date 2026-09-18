@@ -45,6 +45,20 @@ class PolicyPlayer(FusionInfoParser, Player):
     def embed_battle(self, battle: AbstractBattle):
         our_fusion = self.get_fusion_entry(battle, is_ours=True)
         opp_fusion = self.get_fusion_entry(battle, is_ours=False)
+        # диагностика: если в бою уже были typechange (значит фьюжн), а статов оппонента ещё нет —
+        # этот ход сыгран по дексовому фолбэку. Видно, приходят ли статы в том же кадре, что и решение.
+        try:
+            try:
+                from .fusion_parser import _RAW_TYPECHANGE
+                from .type_utils import note_stats_missing
+            except ImportError:
+                from fusion_parser import _RAW_TYPECHANGE
+                from type_utils import note_stats_missing
+            if opp_fusion is None and _RAW_TYPECHANGE.get(getattr(battle, "battle_tag", "")):
+                note_stats_missing(f"turn {getattr(battle, 'turn', '?')}, оппонент "
+                                   f"{getattr(getattr(battle, 'opponent_active_pokemon', None), 'species', '?')}")
+        except Exception:
+            pass
         our_protect = self.get_protected_last_turn(battle, is_ours=True)
         opp_protect = self.get_protected_last_turn(battle, is_ours=False)
         our_team_fusions = self.get_team_fusion_map(battle, is_ours=True) if hasattr(self, "get_team_fusion_map") else None

@@ -30,6 +30,11 @@ try:
 except ImportError:  # запуск модуля вне пакета
     from type_utils import damage_multiplier_safe
 
+try:
+    from .fusion_parser import FusionInfoParser
+except ImportError:  # запуск модуля вне пакета
+    from fusion_parser import FusionInfoParser
+
 BATTLE_FORMAT = "gen9fusionmonsrandombattle"
 N_FEATURES = 38
 _STATUSES = [None, Status.BRN, Status.PAR, Status.SLP, Status.FRZ, Status.PSN, Status.TOX]
@@ -122,7 +127,10 @@ class FeaturesExtractor(BaseFeaturesExtractor):
         return obs["observation"]
 
 
-class PolicyPlayer(Player):
+class PolicyPlayer(FusionInfoParser, Player):
+    """FusionInfoParser первым в MRO: даёт перестановку typechange перед |request|
+    (иначе решение уходит со старым типом) и разбор статов фьюжна из html."""
+
     policy: ActorCriticPolicy | None
 
     def __init__(

@@ -268,31 +268,26 @@ def _migrate_ppo_713_to_715(ppp_path: str):
             raise e
 
 def _migrate_vecnormalize_713_to_715(vec_path: str, base_env):
-    """Грузит VecNormalize с 713 статистикой и расширяет obs_rms до 715 (mean 0, var 1 для новых 2 признаков)."""
+    """Грузит VecNormalize и подгоняет obs_rms под размерность env (любая старая: 418, 713, ...).
+
+    Раньше умела ТОЛЬКО 713 -> 715: файл со статистикой на 418 признаков (как
+    models/vecnormalize.pkl в репо) не мигрировал и падал на normalize_obs.
+    """
     try:
-        vec = VecNormalize.load(vec_path, base_env)
-        # проверяем размер
+        target_dim = None
         try:
-            mean = vec.obs_rms["observation"].mean
-            if len(mean) == 713 and base_env.observation_spaces[base_env.possible_agents[0]].shape[0] == 715:
-                import numpy as np
-                print(f"  Мигрирую VecNormalize 713->715 (mean {mean.shape} -> 715)")
-                new_mean = np.zeros(715, dtype=mean.dtype)
-                new_mean[:713] = mean
-                # new_var по умолчанию 1 для новых признаков (ненормализованные)
-                old_var = vec.obs_rms["observation"].var
-                new_var = np.ones(715, dtype=old_var.dtype)
-                new_var[:713] = old_var
-                vec.obs_rms["observation"].mean = new_mean
-                vec.obs_rms["observation"].var = new_var
-                # count остаётся прежним
-        except Exception as e:
-            print(f"  VecNormalize миграция 713->715 не удалась: {e}")
-        return vec
+            target_dim = base_env.observation_spaces[base_env.possible_agents[0]].shape[0]
+        except Exception:
+            try:
+                target_dim = base_env.observation_space["observation"].shape[0]
+            except Exception:
+                target_dim = None
+        from .vecnorm_utils import load_vecnormalize_for_dim
+        return load_vecnormalize_for_dim(vec_path, base_env, target_dim)
     except Exception as e:
         msg = str(e)
-        if "713" in msg or "715" in msg or "shape" in msg.lower():
-            print(f"  VecNormalize.load упал из-за 713->715, создаю новый VecNormalize (статистика сброшена): {e}")
+        if "713" in msg or "715" in msg or "418" in msg or "shape" in msg.lower():
+            print(f"  VecNormalize.load упал ({e}), создаю новый VecNormalize (статистика сброшена)")
             return VecNormalize(base_env, norm_obs=True, norm_reward=False, gamma=0.99, norm_obs_keys=["observation"])
         raise
 
