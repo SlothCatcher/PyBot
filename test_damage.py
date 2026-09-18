@@ -6,13 +6,14 @@
   3) множители: STAB 1.5, погода, ожог, бусты, экраны, Multiscale;
   4) мин/макс роллы (min = floor(max*0.85));
   5) блок признаков в obs: размер = DAMAGE_BLOCK_SIZE, значения осмысленны (иммунный приём -> 0,
-     суперэффективный -> >0), obs остаётся 802-мерным и конечным;
+     суперэффективный -> >0), obs = N_FEATURES и конечен;
   6) канонический порядок слотов команд (матрица не зависит от dict-порядка).
 
 Запуск: python test_damage.py
 """
 import logging
 import sys
+from types import SimpleNamespace
 import types as _t
 
 from poke_env.battle import Battle, Move
@@ -21,8 +22,8 @@ from poke_env.battle import PokemonType as PT
 from agents import config as _cfg  # noqa: F401  (монки-патчи)
 from agents.config import N_FEATURES
 from agents.damage import (
-    DAMAGE_BLOCK_SIZE, DamageContext, best_move_damage, estimate_damage,
-    mon_stats, prepare_mon, real_stat, team_slots,
+    DAMAGE_BLOCK_SIZE, DamageContext, EFFECT_FLAGS, best_move_damage, estimate_damage,
+    mon_stats, opponent_effect_flags, prepare_mon, real_stat, team_slots,
 )
 from agents.features import _damage_block, embed_battle_with_fusion
 
@@ -220,9 +221,8 @@ def test_slot_order():
 
 
 def _flags_view(blk):
-    from agents.damage import EFFECT_FLAGS, EFFECT_FLAG_COUNT, OPP_MOVE_SLOTS, OUR_TEAM_SLOTS
-    f0 = 87 + OPP_MOVE_SLOTS * 3 + OPP_MOVE_SLOTS * OUR_TEAM_SLOTS
-    return {EFFECT_FLAGS[i]: float(blk[f0 + i]) for i in range(EFFECT_FLAG_COUNT)}
+    from agents.damage import EFFECT_FLAGS, EFFECT_FLAG_COUNT, FLAGS_BASE
+    return {EFFECT_FLAGS[i]: float(blk[FLAGS_BASE + i]) for i in range(EFFECT_FLAG_COUNT)}
 
 
 def _nonzero_flags(blk):
@@ -231,15 +231,17 @@ def _nonzero_flags(blk):
 
 def test_mirror_damage():
     """Зеркальный урон: известные приёмы противника по НАМ + сортировка по урону."""
-    from agents.damage import DAMAGE_BLOCK_SIZE, EFFECT_FLAG_COUNT, OPP_MOVE_SLOTS, OUR_TEAM_SLOTS
-    check("размер блока = 87 + зеркало + флаги", DAMAGE_BLOCK_SIZE,
-          87 + OPP_MOVE_SLOTS * 3 + OPP_MOVE_SLOTS * OUR_TEAM_SLOTS + EFFECT_FLAG_COUNT)
+    from agents.damage import (DAMAGE_BLOCK_SIZE, EFFECT_FLAG_COUNT, FLAGS_BASE, MIRROR_BASE,
+                               OPP_MOVE_SLOTS, OUR_TEAM_SLOTS, TEAM_BASE)
+    check("раскладка блока: MIRROR/TEAM/FLAGS", (MIRROR_BASE, TEAM_BASE, FLAGS_BASE), (87, 99, 123))
+    check("размер блока = зеркало + флаги", DAMAGE_BLOCK_SIZE,
+          MIRROR_BASE + OPP_MOVE_SLOTS * 3 + OPP_MOVE_SLOTS * OUR_TEAM_SLOTS + EFFECT_FLAG_COUNT)
 
     our = mk_mon("our", (PT.FIRE,), ["tackle", "protect", "ember", "quickattack"])
     opp = mk_mon("opp", (PT.WATER,), ["surf", "tackle", "recover", "roar"])
     blk = _damage_block(mk_battle(our, opp), None, None)
 
-    base = 87
+    base = MIRROR_BASE
     mins = [float(blk[base + i * 3]) for i in range(OPP_MOVE_SLOTS)]
     maxs = [float(blk[base + i * 3 + 1]) for i in range(OPP_MOVE_SLOTS)]
     check_true("зеркало: min урона убывает по слотам (сортировка по опасности)",
@@ -255,18 +257,54 @@ def test_mirror_damage():
                    ("rocky", (PT.ROCK,)), ("steely", (PT.STEEL,)), ("ghosty", (PT.GHOST,))):
         team[sp] = mk_mon(sp, tp, ["tackle", "protect"])
     blk2 = _damage_block(mk_battle(team["our"], opp, our_team=team), None, None)
-    t0 = base + OPP_MOVE_SLOTS * 3
+    t0 = TEAM_BASE
     check_true("зеркало: матрица по 6 нашим слотам заполнена",
                all(float(blk2[t0 + j]) > 0 for j in range(OUR_TEAM_SLOTS)),
                f"row0={[round(float(x), 3) for x in blk2[t0:t0 + OUR_TEAM_SLOTS]]}")
     check_true("зеркало: Water-наш получает меньше от surf, чем Fire-наш",
                float(blk2[t0 + 1]) < float(blk2[t0 + 0]),
                f"fire={float(blk2[t0 + 0]):.3f} water={float(blk2[t0 + 1]):.3f}")
+    check_true("зеркало: [99:123] лежит ровно между матрицей и флагами",
+               len(blk2[TEAM_BASE:FLAGS_BASE]) == OPP_MOVE_SLOTS * OUR_TEAM_SLOTS)
 
-    # KO-флаг: наш монстр почти добит
-    low = mk_mon("our", (PT.FIRE,), ["tackle"], hp=362, cur_hp=20)
-    blk3 = _damage_block(mk_battle(low, opp), None, None)
-    check("зеркало: гарантированный KO помечен флагом", float(blk3[base + 2]), 1.0)
+    # фейнт: урон по мёртвому не считается (иначе деление на 1 HP насыщает признак)
+    dead = mk_mon("dead", (PT.NORMAL,), ["tackle"], hp=300, cur_hp=1)
+    dead.fainted = True
+    dead.current_hp_fraction = 0.0
+    bench_alive = mk_mon("benchmon", (PT.WATER,), ["tackle"])
+    team_dead = {"our": our, "dead": dead, "benchmon": bench_alive}
+    blk_dead = _damage_block(mk_battle(our, opp, our_team=team_dead), None, None)
+    # слоты по species: 0 = benchmon, 1 = dead, 2 = our
+    check_true("фейнт: урон по мёртвому слоту = 0 (матрица и зеркало)",
+               float(blk_dead[51 + 1]) == 0.0 and float(blk_dead[TEAM_BASE + 1]) == 0.0,
+               f"матрица={float(blk_dead[52]):.3f} зеркало={float(blk_dead[TEAM_BASE + 1]):.3f}")
+    check_true("фейнт: соседние живые слоты считаются",
+               float(blk_dead[51 + 2]) > 0.0 and float(blk_dead[TEAM_BASE + 2]) > 0.0)
+    our.fainted = True
+    blk_dead2 = _damage_block(mk_battle(our, opp, our_team=team_dead), None, None)
+    check_true("фейнт нашего активного: срез зеркала по активному обнулён",
+               float(blk_dead2[MIRROR_BASE:MIRROR_BASE + 3].max()) == 0.0,
+               f"={[round(float(x), 3) for x in blk_dead2[MIRROR_BASE:MIRROR_BASE + 3]]}")
+    check_true("фейнт нашего активного: строки по живой скамейке остаются",
+               float(blk_dead2[TEAM_BASE]) > 0.0)
+    our.fainted = False
+
+    # possible_KO считается от МАКСИМАЛЬНОГО ролла: hp между min и max
+    from agents.damage import DamageContext, cached_move_damage, prepare_mon
+    prep_opp = prepare_mon(opp, None)
+    prep_our = prepare_mon(our, None)
+    dmin, dmax = cached_move_damage(prep_opp, prep_our, Move("surf", gen=9), DamageContext())
+    check_true("possible_KO: подготовка теста (dmax > dmin)", dmax > dmin, f"min={dmin} max={dmax}")
+    mid_hp = int(dmin) + 1
+    our_mid = mk_mon("our", (PT.FIRE,), ["tackle"], hp=362, cur_hp=mid_hp)
+    blk_mid = _damage_block(mk_battle(our_mid, opp), None, None)
+    check_true("possible_KO: минимальный ролл НЕ добивает",
+               float(blk_mid[base]) < 0.999, f"min_frac={float(blk_mid[base]):.3f} hp={mid_hp}")
+    check("possible_KO: максимальный ролл добивает -> флаг 1",
+          float(blk_mid[base + 2]), 1.0)
+    our_tank = mk_mon("our", (PT.FIRE,), ["tackle"], hp=362, cur_hp=int(dmax) + 10)
+    blk_tank = _damage_block(mk_battle(our_tank, opp), None, None)
+    check("possible_KO: не добивает даже максимум -> флаг 0", float(blk_tank[base + 2]), 0.0)
 
     # детерминизм: порядок раскрытия приёмов не влияет
     opp_shuffled = mk_mon("opp", (PT.WATER,), ["roar", "recover", "tackle", "surf"])
@@ -282,7 +320,7 @@ def test_mirror_damage():
     check_true("раскладка: наша матрица [15:51] не изменилась",
                bool((blk[15:51] == blk5[15:51]).all()))
     check_true("раскладка: без известных приёмов зеркало и флаги нулевые",
-               float(abs(blk5[87:].max())) == 0.0, f"max={float(abs(blk5[87:]).max())}")
+               float(abs(blk5[MIRROR_BASE:].max())) == 0.0, f"max={float(abs(blk5[MIRROR_BASE:]).max())}")
 
 
 def test_opponent_effect_flags():
@@ -304,7 +342,7 @@ def test_opponent_effect_flags():
     check("флаги: ложных срабатываний нет (нет screens)", fl["screens"], 0.0)
     check("флаги: ложных срабатываний нет (нет heal)", fl["healing_move"], 0.0)
     check_true("флаги: длина блока флагов совпадает с EFFECT_FLAG_COUNT",
-               len(blk[87 + OPP_MOVE_SLOTS * 3 + OPP_MOVE_SLOTS * OUR_TEAM_SLOTS:]) == EFFECT_FLAG_COUNT)
+               len(blk[123:]) == EFFECT_FLAG_COUNT)
 
     # статусы из secondary (scald -> burn 30%)
     opp2 = mk_mon("opp", (PT.WATER,), ["scald", "icebeam", "spore", "thunderwave"])
@@ -313,6 +351,54 @@ def test_opponent_effect_flags():
                fl2.get("status_burn") == 1.0 and fl2.get("status_freeze") == 1.0, str(fl2))
     check_true("флаги: spore (sleep) и thunderwave (para) видны",
                fl2.get("status_sleep") == 1.0 and fl2.get("status_para") == 1.0)
+
+    # setup: самоослабляющие атаки НЕ должны попадать в setup_booster
+    for mid in ("closecombat", "overheat", "dracometeor", "superpower", "vcreate", "leafstorm"):
+        fl_setup = _nonzero_flags(_damage_block(mk_battle(our, mk_mon("opp", (PT.WATER,), [mid])),
+                                                None, None))
+        check(f"флаги: {mid} — самоослабление, не setup", fl_setup.get("setup_booster", 0.0), 0.0)
+    # ...а настоящие бусты и self-buff атаки — должны
+    for mid, want in (("swordsdance", 1.0), ("calmmind", 1.0), ("shellsmash", 1.0),
+                      ("flamecharge", 1.0), ("poweruppunch", 1.0), ("swagger", 0.0), ("charm", 0.0)):
+        fl_setup = _nonzero_flags(_damage_block(mk_battle(our, mk_mon("opp", (PT.WATER,), [mid])),
+                                                None, None))
+        check(f"флаги: {mid} setup_booster", fl_setup.get("setup_booster", 0.0), want)
+
+    # hazard-атаки: движок не хранит side_condition, но Stealth Rock/Spikes они ставят
+    fl_sr = _flags_view(_damage_block(mk_battle(our, mk_mon("opp", (PT.ROCK,), ["stoneaxe"])), None, None))
+    check("флаги: Stone Axe ставит Stealth Rock", fl_sr["hazard_stealthrock"], 1.0)
+    fl_sp = _flags_view(_damage_block(mk_battle(our, mk_mon("opp", (PT.DARK,), ["ceaselessedge"])), None, None))
+    check("флаги: Ceaseless Edge ставит Spikes", fl_sp["hazard_spikes"], 1.0)
+
+    # битый приём (кастомный мод) не должен ронять остальные флаги
+    class _BrokenSecondary(dict):
+        def get(self, key, default=None):
+            raise RuntimeError("мод сломан")
+
+    class _BrokenMove:
+        id = "brokenmove"
+        entry = {}
+        base_power = 0
+        category = None
+        boosts = None
+        heal = 0
+        drain = 0
+        priority = 0
+        secondary = [_BrokenSecondary()]
+
+        @property
+        def status(self):
+            raise KeyError("frost")   # так падал кастомный мод fusionmons
+
+        @property
+        def weather(self):
+            raise KeyError("frost")
+
+    bad_mon = SimpleNamespace(species="broken", moves={"brokenmove": _BrokenMove()},
+                              type_1=PT.NORMAL, type_2=None)
+    good_mon = mk_mon("opp", (PT.NORMAL,), ["swordsdance"])
+    fl_bad = dict(zip(EFFECT_FLAGS, opponent_effect_flags([bad_mon, good_mon])))
+    check("флаги: битый приём не мешает остальным", fl_bad["setup_booster"], 1.0)
 
     # защита/восстановление/переключение
     opp3 = mk_mon("opp", (PT.NORMAL,), ["protect", "recover", "uturn", "extremespeed"])

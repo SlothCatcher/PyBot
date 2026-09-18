@@ -8,11 +8,11 @@
 
 Отличие от `policy_player --pretrain-battles`:
   - не создаёт PPO, не грузит policy, не делает BC
-  - только бьёт SimpleHeuristics vs SimpleHeuristics, эмбедит obs (715) и сохраняет npz
+  - только бьёт SimpleHeuristics vs SimpleHeuristics, эмбедит obs (N_FEATURES) и сохраняет npz
   - поддерживает chunked кэш (models/heuristic_raw_chunks/, models/heuristic_dataset_tmp/) и resume
-  - пересобирает obs из сырого кэша если N_FEATURES изменился (713->715)
+  - пересобирает obs из сырого кэша если N_FEATURES изменился
 
-Датасет формат: npz с keys obs [N,715] float32, mask [N,9] int8, action [N] int64, ret [N] float32
+Датасет формат: npz с keys obs [N,N_FEATURES] float32, mask [N,9] int8, action [N] int64, ret [N] float32
   ret = ±30 * 0.99**(steps_remaining)  (победа/поражение)
 """
 
