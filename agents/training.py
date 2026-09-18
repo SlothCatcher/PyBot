@@ -147,8 +147,9 @@ def _sanitize_for_pickle(obj):
                 raw = obj.get("raw_dataset", [])
                 sanitized_raw = []
                 for entry in raw:
-                    if len(entry) == 8:
-                        bc, mask, act, tag, of, opf, opr, oppr = entry
+                    if len(entry) in (8, 9):
+                        bc, mask, act, tag, of, opf, opr, oppr = entry[:8]
+                        tail = tuple(entry[8:])
                         try:
                             pickle.dumps(bc, protocol=pickle.HIGHEST_PROTOCOL)
                             sanitized_raw.append(entry)
@@ -164,9 +165,9 @@ def _sanitize_for_pickle(obj):
                                         except Exception:
                                             pass
                                 stub.battle_tag = getattr(bc, "battle_tag", tag)
-                                sanitized_raw.append((stub, mask, act, tag, of, opf, opr, oppr))
+                                sanitized_raw.append((stub, mask, act, tag, of, opf, opr, oppr) + tail)
                             except Exception:
-                                sanitized_raw.append((None, mask, act, tag, of, opf, opr, oppr))
+                                sanitized_raw.append((None, mask, act, tag, of, opf, opr, oppr) + tail)
                     else:
                         sanitized_raw.append(entry)
                 return {"raw_dataset": sanitized_raw, "battles": sanitized_battles, "chunk_idx": obj.get("chunk_idx")}
@@ -219,7 +220,73 @@ def _list_raw_chunk_files():
         return []
     return sorted(glob.glob(os.path.join(HEURISTIC_RAW_CACHE_DIR, "raw_chunk_*.pkl")))
 
-def _list_dataset_chunk_files(tmp_dir: str = HEURISTIC_DATASET_TMP_DIR):
+def _npz_array_shape(path: str, key: str = "obs"):
+    """Форма массива из .npz по заголовку (без загрузки данных). None, если не прочитать."""
+    try:
+        import zipfile
+        with zipfile.ZipFile(path, "r") as z:
+            with z.open(f"{key}.npy") as f:
+                version = np.lib.format.read_magic(f)
+                if version == (1, 0):
+                    shape, _, _ = np.lib.format.read_array_header_1_0(f)
+                elif version == (2, 0):
+                    shape, _, _ = np.lib.format.read_array_header_2_0(f)
+                else:
+                    shape, _, _ = np.lib.format.read_array_header_1_0(f)
+                return tuple(int(x) for x in shape)
+    except Exception:
+        return None
+
+
+def _npz_keys(path: str) -> list:
+    """Имена массивов внутри .npz (по оглавлению zip)."""
+    try:
+        import zipfile
+        with zipfile.ZipFile(path, "r") as z:
+            return [n[:-4] for n in z.namelist() if n.endswith(".npy")]
+    except Exception:
+        return []
+
+
+def _dataset_chunk_dims(chunk_files: list) -> dict:
+    """Сводка по размерностям чанков датасета: {(obs_dim, mask_w): количество}."""
+    dims: dict = {}
+    for cf in chunk_files:
+        obs_shape = _npz_array_shape(cf, "obs")
+        if not obs_shape:
+            continue
+        mask_shape = _npz_array_shape(cf, "mask")
+        mask_w = int(mask_shape[1]) if mask_shape and len(mask_shape) > 1 else 1
+        key = (int(obs_shape[1]) if len(obs_shape) > 1 else 0, mask_w)
+        dims[key] = dims.get(key, 0) + 1
+    return dims
+
+
+def _wrong_dim_dataset_chunks(chunk_files: list, target_dim: int) -> dict:
+    """{obs_dim: количество чанков} для чанков, чья размерность obs != target_dim.
+
+    Нужно, чтобы не подмешивать в датасет чанки, посчитанные прежним набором признаков:
+    раскладка менялась не только в конец (713 -> 715 вставил [our_is_tera, opp_is_tera]
+    перед tera_type), поэтому «добить нулями справа» — не универсальное решение.
+    """
+    bad: dict = {}
+    for cf in chunk_files:
+        shape = _npz_array_shape(cf, "obs")
+        if not shape or len(shape) < 2:
+            continue
+        dim = int(shape[1])
+        if dim != int(target_dim):
+            bad[dim] = bad.get(dim, 0) + 1
+    return bad
+
+
+def _list_dataset_chunk_files(tmp_dir: str | None = None):
+    """Чанки датасета из каталога (по умолчанию HEURISTIC_DATASET_TMP_DIR).
+
+    Каталог читается в момент вызова, а не при импорте: иначе константу нельзя ни
+    переопределить, ни подменить в тестах (default-значение связывается один раз).
+    """
+    tmp_dir = tmp_dir or HEURISTIC_DATASET_TMP_DIR
     if not os.path.isdir(tmp_dir):
         return []
     return sorted(glob.glob(os.path.join(tmp_dir, "dataset_chunk_*.npz")))
@@ -262,42 +329,62 @@ def _merge_dataset_chunks(chunk_files: list, final_path: str):
         print("WARNING: нет чанков для мержа")
         return
     print(f"Мержу {len(chunk_files)} чанков в {final_path} ...")
-    # First pass: count total and get dims
+    # Первый проход: количества и размерности (по заголовкам, без загрузки данных)
     total = 0
-    obs_dim = None
-    mask_dim = None
-    has_ret = None
+    obs_dims: set = set()
+    mask_dims: set = set()
+    ret_counts = {"ret": 0, "no_ret": 0}
+    usable = []
     for cf in chunk_files:
         try:
-            d = np.load(cf)
-            n = len(d["obs"])
-            total += n
-            if obs_dim is None:
-                obs_dim = d["obs"].shape[1]
-                mask_dim = d["mask"].shape[1] if d["mask"].ndim > 1 else 1
-                has_ret = "ret" in d
+            shape = _npz_array_shape(cf, "obs")
+            if not shape or len(shape) < 2 or int(shape[0]) == 0:
+                continue
+            mshape = _npz_array_shape(cf, "mask")
+            mw = int(mshape[1]) if mshape and len(mshape) > 1 else 1
+            has_ret_chunk = "ret" in _npz_keys(cf)
+            total += int(shape[0])
+            obs_dims.add(int(shape[1]))
+            mask_dims.add(mw)
+            ret_counts["ret" if has_ret_chunk else "no_ret"] += 1
+            usable.append(cf)
         except Exception as e:
             print(f"  пропуск битого чанка {cf}: {e}")
     if total == 0:
         print("WARNING: все чанки пустые")
         return
+    # Разные размерности = чанки от разных версий признаков/экшн-спейса. Молча падать в
+    # середине записи («could not broadcast ... into shape») или добивать нулями нельзя:
+    # раскладка признаков менялась и в середину (713 -> 715 вставил два tera-признака перед
+    # tera_type), поэтому паддинг справа сдвинул бы колонки и испортил данные.
+    if len(obs_dims) > 1 or len(mask_dims) > 1:
+        obs_part = ", ".join(f"{d}: {sum(1 for c in usable if (_npz_array_shape(c, 'obs') or (0, 0))[1] == d)} чанк(ов)"
+                             for d in sorted(obs_dims))
+        mask_part = ", ".join(str(d) for d in sorted(mask_dims))
+        raise ValueError(
+            f"чанки собраны разными версиями кода и их нельзя слить: obs_dim ({obs_part}), mask_dim ({mask_part}). "
+            "Пересоберите датасет из сырого кэша текущим кодом — удалите ТОЛЬКО чанки датасета "
+            f"({os.path.join(HEURISTIC_DATASET_TMP_DIR, 'dataset_chunk_*.npz')}) и запустите обучение снова: "
+            "obs пересчитается из сырого кэша. Сырой кэш и --force-recollect для этого не нужны "
+            "(--force-recollect ещё и стирает сырые чанки, из-за чего бои придётся собирать заново)."
+        )
+    obs_dim = obs_dims.pop()
+    mask_dim = mask_dims.pop()
+    has_ret = ret_counts["ret"] > 0
+    if ret_counts["no_ret"]:
+        print(f"  WARNING: в {ret_counts['no_ret']} чанк(ах) нет ret — эти примеры получат return=0")
     print(f"  Всего {total} примеров, obs_dim={obs_dim}, mask_dim={mask_dim}, has_ret={has_ret}")
     # Preallocate arrays (peak ~3.6GB for 50k, vs 61GB swap before)
     obs_arr = np.empty((total, obs_dim), dtype=np.float32)
-    # mask may be 2D (N, 9) or 1D? Check features: action mask size is 9? Actually depends on SinglesEnv
-    # We'll handle both
-    sample_mask = np.load(chunk_files[0])["mask"]
-    if sample_mask.ndim == 2:
-        mask_arr = np.empty((total, sample_mask.shape[1]), dtype=np.int8)
-    else:
-        mask_arr = np.empty((total,), dtype=np.int8)
+    mask_1d = mask_dim == 1        # 1D-маску сохраняем плоской, как в исходных чанках
+    mask_arr = np.empty((total,) if mask_1d else (total, mask_dim), dtype=np.int8)
     action_arr = np.empty((total,), dtype=np.int64)
-    ret_arr = np.empty((total,), dtype=np.float32) if has_ret else None
+    ret_arr = np.zeros((total,), dtype=np.float32) if has_ret else None
 
     offset = 0
-    for cf in chunk_files:
+    for cf in usable:
         d = np.load(cf)
-        n = len(d["obs"])
+        n = int(d["obs"].shape[0])
         obs_arr[offset:offset+n] = d["obs"]
         mask_arr[offset:offset+n] = d["mask"]
         action_arr[offset:offset+n] = d["action"]
@@ -324,13 +411,135 @@ def _merge_dataset_chunks(chunk_files: list, final_path: str):
         del ret_arr
     gc.collect()
 
+def _features_fingerprint() -> str:
+    """Хеш кода, который считает признаки (features.py + damage.py + config.py).
+
+    Нужен, чтобы кэш пересчёта (`models/heuristic_dataset_tmp_recompute/_merged.npz`) не был
+    использован после правок, меняющих ЗНАЧЕНИЯ признаков при той же размерности: obs_dim
+    в такой ситуации совпадает, а раскладка/значения колонок уже другие.
+    """
+    import hashlib
+    h = hashlib.md5()
+    base = os.path.dirname(os.path.abspath(__file__))
+    for name in ("features.py", "damage.py", "config.py"):
+        try:
+            with open(os.path.join(base, name), "rb") as f:
+                h.update(f.read())
+        except Exception:
+            h.update(name.encode())
+    return h.hexdigest()
+
+
+def _raw_chunks_fingerprint(chunk_files: list) -> list:
+    """Отпечаток набора сырых чанков: имя + размер + mtime (меняется при доборе боёв)."""
+    out = []
+    for f in chunk_files:
+        try:
+            st = os.stat(f)
+            out.append([os.path.basename(f), int(st.st_size), int(st.st_mtime_ns)])
+        except Exception:
+            out.append([os.path.basename(f), -1, -1])
+    return out
+
+
+def _store_dataset(dataset: list, path: str) -> str:
+    """Сохраняет УЖЕ СОБРАННЫЙ в памяти датасет в `path`, не подмешивая чужие чанки с диска.
+
+    Раньше здесь предпочитался мерж `models/heuristic_dataset_tmp/dataset_chunk_*.npz`, если их
+    больше одного. Это ломается, когда чанки остались от прошлого прогона: в памяти лежит
+    свежий (текущий N_FEATURES) датасет, а из чанков подмешиваются признаки прежних версий —
+    отсюда `could not broadcast input array from shape (N,715) into shape (N,713)`, а если бы
+    размерности совпали, на диск молча ушли бы устаревшие данные.
+
+    Порядок: свежий recompute-мерж (копирование файла вместо повторного stack на ~3 ГБ),
+    иначе — save_dataset из памяти.
+    """
+    _ensure_dir(os.path.dirname(path) or ".")
+    merged = os.path.join(HEURISTIC_DATASET_TMP_DIR + "_recompute", "_merged.npz")
+    try:
+        if os.path.exists(merged) and len(dataset) > 0:
+            dim = _get_npz_obs_dim(merged)
+            n = _get_npz_n_transitions(merged)
+            mem_dim = int(np.asarray(dataset[0][0]).shape[0])
+            if dim == mem_dim and n == len(dataset):
+                import shutil
+                shutil.copyfile(merged, path)
+                print(f"Датасет скопирован из recompute-мержа: {path} ({n} примеров, obs {dim})")
+                return path
+            print(f"  recompute-мерж не совпадает с датасетом в памяти "
+                  f"(obs {dim} vs {mem_dim}, примеров {n} vs {len(dataset)}) — пишу из памяти")
+    except Exception as e:
+        print(f"  не удалось использовать recompute-мерж: {e}")
+    save_dataset(dataset, path)
+    return path
+
+
 def _recompute_from_chunked_cache(n_battles: int) -> list:
     """Пересобирает датасет из chunked raw cache без новых боёв, но стримингово (по чанкам) чтобы не держать 1.2M battle_copy в памяти."""
     from .features import embed_battle_with_fusion
+    from .config import N_FEATURES
     from collections import defaultdict
     chunk_files = _list_raw_chunk_files()
     if not chunk_files:
         return None
+    merged_path = os.path.join(HEURISTIC_DATASET_TMP_DIR + "_recompute", "_merged.npz")
+    meta_path = merged_path + ".meta.json"
+    fingerprint = _raw_chunks_fingerprint(chunk_files)
+    feature_hash = _features_fingerprint()
+    # Готовый мерж: то же число боёв, тот же сырой кэш, тот же код признаков.
+    # Иначе пересчёт 800k+ переходов повторяется с нуля (десятки минут) на каждом запуске.
+    try:
+        if os.path.exists(merged_path) and os.path.exists(meta_path):
+            import json
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            if (int(meta.get("obs_dim", -1)) == int(N_FEATURES)
+                    and int(meta.get("battles_requested", -1)) == int(n_battles)
+                    and meta.get("chunks") == fingerprint
+                    and meta.get("features_hash") == feature_hash):
+                data = np.load(merged_path)
+                if "ret" in data:
+                    dataset = list(zip(data["obs"], data["mask"], data["action"], data["ret"]))
+                else:
+                    dataset = list(zip(data["obs"], data["mask"], data["action"]))
+                print(f"Recompute: готовый мерж {merged_path} подходит "
+                      f"(obs {meta['obs_dim']}, {len(dataset)} примеров, код признаков тот же) — "
+                      f"пересчёт не нужен")
+                return dataset
+            print("Recompute: готовый мерж не подходит (другие бои/код признаков) — пересобираю")
+        elif os.path.exists(merged_path):
+            # Сайдкара ещё нет (мерж от прежней версии кода). Принимаем его только если он
+            # НОВЕЕ кода признаков: значит пересчёт делался уже текущими features/damage/config.
+            # Так первый запуск после этого обновления не пересчитывает 800k переходов заново,
+            # а любая правка кода признаков (или git pull) автоматически инвалидирует кэш.
+            try:
+                code_files = [os.path.join(os.path.dirname(os.path.abspath(__file__)), n)
+                              for n in ("features.py", "damage.py", "config.py")]
+                code_mtime = max(os.path.getmtime(f) for f in code_files if os.path.exists(f))
+                if int(_get_npz_obs_dim(merged_path) or -1) == int(N_FEATURES) \
+                        and os.path.getmtime(merged_path) > code_mtime:
+                    data = np.load(merged_path)
+                    if "ret" in data:
+                        dataset = list(zip(data["obs"], data["mask"], data["action"], data["ret"]))
+                    else:
+                        dataset = list(zip(data["obs"], data["mask"], data["action"]))
+                    print(f"Recompute: использую мерж {merged_path} без сайдкара "
+                          f"(obs {N_FEATURES}, {len(dataset)} примеров, файл новее кода признаков)")
+                    try:
+                        import json
+                        with open(meta_path, "w", encoding="utf-8") as f:
+                            json.dump({"obs_dim": int(N_FEATURES), "battles_requested": int(n_battles),
+                                       "chunks": fingerprint, "features_hash": feature_hash,
+                                       "examples": len(dataset), "adopted_without_sidecar": True},
+                                      f, ensure_ascii=False)
+                    except Exception:
+                        pass
+                    return dataset
+                print("Recompute: мерж без сайдкара старше кода признаков — пересобираю")
+            except Exception as e:
+                print(f"Recompute: мерж без сайдкара не удалось использовать ({e}) — пересобираю")
+    except Exception as e:
+        print(f"Recompute: готовый мерж не удалось использовать ({e}) — пересобираю")
     print(f"Кэш хит (chunked): {len(chunk_files)} чанков, пересобираю obs без новых боёв для {n_battles} боёв")
     # Need to collect up to n_battles battles worth of tags
     # First, iterate chunks to collect tags until we have n_battles
@@ -369,11 +578,8 @@ def _recompute_from_chunked_cache(n_battles: int) -> list:
         from collections import defaultdict as dd
         grouped = dd(list)
         for entry in raw_dataset:
-            if len(entry) == 8:
-                tag = entry[3]
-                grouped[tag].append(entry)
-            elif len(entry) == 4:
-                continue
+            if len(entry) in (8, 9):
+                grouped[entry[3]].append(entry)
         tags_in_chunk = list(grouped.keys())
         # If we would exceed, truncate
         if len(tags_in_chunk) > remaining:
@@ -390,11 +596,17 @@ def _recompute_from_chunked_cache(n_battles: int) -> list:
         # Now recompute obs for this chunk's raw_dataset
         recomputed = []
         for entry in raw_dataset:
-            if len(entry) != 8:
+            fields = _raw_entry_fields(entry)
+            if fields is None:
                 continue
-            battle_copy, mask, action, tag, our_fusion, opp_fusion, our_protect, opp_protect = entry
+            (battle_copy, mask, action, tag, our_fusion, opp_fusion, our_protect, opp_protect,
+             our_team_fusions, opp_team_fusions) = fields
             try:
-                obs = embed_battle_with_fusion(battle_copy, our_fusion, opp_fusion, our_protected_last_turn=our_protect, opp_protected_last_turn=opp_protect)
+                obs = embed_battle_with_fusion(
+                    battle_copy, our_fusion, opp_fusion,
+                    our_protected_last_turn=our_protect, opp_protected_last_turn=opp_protect,
+                    our_team_fusions=our_team_fusions, opp_team_fusions=opp_team_fusions,
+                )
                 recomputed.append((obs, mask, action, tag))
             except Exception:
                 continue
@@ -431,6 +643,20 @@ def _recompute_from_chunked_cache(n_battles: int) -> list:
     # We can directly load merged via _merge_dataset_chunks to a temp final path and then load
     merged_path = os.path.join(recompute_tmp, "_merged.npz")
     _merge_dataset_chunks(chunk_files_out, merged_path)
+    # сайдкар: по нему следующий запуск поймёт, что пересчёт можно не повторять
+    try:
+        import json
+        with open(merged_path + ".meta.json", "w", encoding="utf-8") as f:
+            json.dump({
+                "obs_dim": int(N_FEATURES),
+                "battles_requested": int(n_battles),
+                "battles_processed": int(tag_count),
+                "chunks": fingerprint,
+                "features_hash": feature_hash,
+                "examples": int(_get_npz_n_transitions(merged_path) or 0),
+            }, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"  не удалось записать метаданные пересчёта: {e}")
     # Load as list
     data = np.load(merged_path)
     if "ret" in data:
@@ -538,14 +764,7 @@ def collect_or_load_dataset(n_battles: int, path: str, force_recollect: bool = F
                     if os.path.isdir(HEURISTIC_RAW_CACHE_DIR) and _count_raw_chunk_battles() >= n_battles:
                         dataset = _recompute_from_chunked_cache(n_battles)
                         if dataset is not None and len(dataset) > 0:
-                            _ensure_dir(os.path.dirname(path) or ".")
-                            import shutil
-                            recompute_merged = os.path.join(HEURISTIC_DATASET_TMP_DIR + "_recompute", "_merged.npz")
-                            if os.path.exists(recompute_merged):
-                                shutil.copyfile(recompute_merged, path)
-                                print(f"Пересобранный датасет скопирован в {path}")
-                            else:
-                                save_dataset(dataset, path)
+                            _store_dataset(dataset, path)
                             return dataset
                     # legacy — только если не огромный (иначе chunked уже покрыл)
                     n_legacy = _get_legacy_battle_count_fast()
@@ -598,16 +817,8 @@ def collect_or_load_dataset(n_battles: int, path: str, force_recollect: bool = F
         # Check if path exists and is recent (merged from chunks)
         # For simplicity, if dataset is list and path not exists or force, save
         if not os.path.exists(path) or force_recollect:
-            # For large dataset, use chunked merge path if available
-            # If chunk files exist, merge them directly to path to avoid double save
-            chunk_files = _list_dataset_chunk_files()
-            if len(chunk_files) > 1 and len(dataset) > 10000:
-                # prefer merge from chunks (more memory efficient than save_dataset which stacks again)
-                print(f"Сохраняю датасет через мерж чанков в {path}")
-                _merge_dataset_chunks(chunk_files, path)
-                # reload dataset from file to ensure consistency? Keep returned list
-            else:
-                save_dataset(dataset, path)
+            # датасет уже собран в памяти — пишем его, а не чанки неизвестного происхождения
+            _store_dataset(dataset, path)
         else:
             # path exists, maybe already merged
             pass
@@ -681,21 +892,43 @@ def _load_heuristic_raw_cache():
         print(f"Не удалось загрузить сырой кэш: {e}")
         return None, None
 
+def _raw_entry_fields(entry) -> tuple | None:
+    """Разбирает запись сырого кэша: (battle_copy, mask, action, tag, our_fusion, opp_fusion,
+    our_protect, opp_protect, our_team_fusions, opp_team_fusions).
+
+    Записи бывают 8-элементные (до добавления командных карт) и 9-элементные; у 8-элементных
+    командные карты = (None, None), то есть прежнее поведение. None — если запись не подходит.
+    """
+    if len(entry) < 8:
+        return None
+    bc, mask, action, tag, our_fusion, opp_fusion, our_protect, opp_protect = entry[:8]
+    teams = entry[8] if len(entry) > 8 else None
+    if isinstance(teams, (tuple, list)) and len(teams) >= 2:
+        our_team_fusions, opp_team_fusions = teams[0], teams[1]
+    else:
+        our_team_fusions, opp_team_fusions = None, None
+    return bc, mask, action, tag, our_fusion, opp_fusion, our_protect, opp_protect, \
+        our_team_fusions, opp_team_fusions
+
+
 def _recompute_dataset_from_raw(raw_dataset: list, battles: dict) -> list:
     """Пересобирает (obs, mask, action, tag) из сырого кэша с текущими признаками (N_FEATURES)."""
     from .features import embed_battle_with_fusion
     recomputed = []
     for entry in raw_dataset:
-        if len(entry) == 8:
-            battle_copy, mask, action, tag, our_fusion, opp_fusion, our_protect, opp_protect = entry
-        elif len(entry) == 4:
+        fields = _raw_entry_fields(entry)
+        if fields is None:
             continue
-        else:
-            continue
+        (battle_copy, mask, action, tag, our_fusion, opp_fusion, our_protect, opp_protect,
+         our_team_fusions, opp_team_fusions) = fields
         try:
-            obs = embed_battle_with_fusion(battle_copy, our_fusion, opp_fusion, our_protected_last_turn=our_protect, opp_protected_last_turn=opp_protect)
+            obs = embed_battle_with_fusion(
+                battle_copy, our_fusion, opp_fusion,
+                our_protected_last_turn=our_protect, opp_protected_last_turn=opp_protect,
+                our_team_fusions=our_team_fusions, opp_team_fusions=opp_team_fusions,
+            )
             recomputed.append((obs, mask, action, tag))
-        except Exception as e:
+        except Exception:
             continue
     return recomputed
 
@@ -813,7 +1046,7 @@ def collect_heuristic_dataset(n_battles: int = 200, force_recollect: bool = Fals
                     from collections import defaultdict as dd
                     grouped_raw = dd(list)
                     for entry in raw_cached:
-                        if len(entry) == 8:
+                        if len(entry) in (8, 9):
                             grouped_raw[entry[3]].append(entry)
                     tags = list(grouped_raw.keys())
                     for idx in range(0, len(tags), chunk_size):
@@ -878,6 +1111,8 @@ def collect_heuristic_dataset(n_battles: int = 200, force_recollect: bool = Fals
         gc.collect()
 
     # Определяем сколько уже собрано в chunked кэше (для resume / добора)
+    from .config import N_FEATURES as _N_FEATURES_CHECK
+    N_FEATURES = _N_FEATURES_CHECK
     n_cached_chunked = _count_raw_chunk_battles()
     # Определяем стартовый индекс чанка
     existing_raw_chunks = _list_raw_chunk_files()
@@ -891,6 +1126,13 @@ def collect_heuristic_dataset(n_battles: int = 200, force_recollect: bool = Fals
         # всё уже есть, просто мержим и возвращаем
         print(f"Chunked кэш уже содержит {n_cached_chunked} боёв >= {n_battles}, мержу чанки")
         chunk_files = _list_dataset_chunk_files()
+        # чанки могли остаться от прежней версии признаков: такие данные нельзя отдавать в
+        # обучение (колонки сдвинуты), поэтому пересчитываем obs из сырого кэша текущим кодом
+        bad_dims = _wrong_dim_dataset_chunks(chunk_files, N_FEATURES)
+        if bad_dims:
+            print(f"  Датасет чанки старой размерности {bad_dims} (текущая {N_FEATURES}) — "
+                  f"пересобираю из сырого кэша")
+            return _recompute_from_chunked_cache(n_battles)
         # Обрезаем до нужного кол-ва боёв если есть лишние (редко)
         # Для простоты: если есть 50 чанков по 1000 и нужно 50000, берём все
         # Если нужно меньше, пересобираем через _recompute

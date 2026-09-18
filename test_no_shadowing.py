@@ -92,7 +92,11 @@ def _assigned_names(node):
             if t is None or line is None:
                 continue
             for sub in ast.walk(t):
-                if isinstance(sub, ast.Name):
+                # только РЕАЛЬНЫЕ цели связывания: `a, b = ...`, `for x in ...`.
+                # В `mod.attr = ...` и `arr[i] = ...` внутренние имена имеют ctx=Load —
+                # они не становятся локальными, и учитывать их = ложное срабатывание
+                # (именно так всплыло на `T.HEURISTIC_TMP_DIR = ...` в тестах).
+                if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
                     defined[sub.id] = min(defined.get(sub.id, 10**9), line)
     return defined
 
@@ -190,6 +194,42 @@ def test_resolve_checkpoint_path():
               "model.zip" in hint and "не найден" in hint, hint.replace("\n", " | ")[:90])
 
 
+def test_detector_ignores_attribute_targets(tmpdir=None):
+    """Детектор не должен считать локальной переменной модуль в `mod.attr = ...`.
+
+    Такое присваивание НЕ делает имя локальным, а раньше давало ложное срабатывание
+    («использование раньше определения») на легитимном коде тестов.
+    """
+    import tempfile as _tf
+    src_ok = (
+        "import agents.training as T\n"
+        "def f(tmpdir):\n"
+        "    old = T.DIR\n"
+        "    try:\n"
+        "        T.DIR = tmpdir\n"
+        "        T.LIST[0] = 1\n"
+        "    finally:\n"
+        "        T.DIR = old\n"
+    )
+    src_bad = (
+        "import agents.config as C\n"
+        "def g():\n"
+        "    print(C.N_FEATURES)\n"
+        "    C = 1\n"
+    )
+    with _tf.TemporaryDirectory() as td:
+        ok_path = os.path.join(td, "ok_mod.py")
+        bad_path = os.path.join(td, "bad_mod.py")
+        with open(ok_path, "w", encoding="utf-8") as f:
+            f.write(src_ok)
+        with open(bad_path, "w", encoding="utf-8") as f:
+            f.write(src_bad)
+        check("присваивание атрибута модуля не считается локальным именем",
+              not find_shadow_problems(ok_path), True)
+        check("реальное затенение по-прежнему ловится",
+              any(pr[0] == "C" for pr in find_shadow_problems(bad_path)), True)
+
+
 def main():
     files = []
     for base, dirs, names in os.walk(ROOT):
@@ -201,6 +241,7 @@ def main():
     for f in files:
         check_file(f)
     test_detector_catches_bug()
+    test_detector_ignores_attribute_targets()
     test_resolve_checkpoint_path()
 
     print("-" * 74)

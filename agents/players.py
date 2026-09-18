@@ -74,7 +74,12 @@ class PolicyPlayer(FusionInfoParser, Player):
 
 class HeuristicRecorder(FusionInfoParser, SimpleHeuristicsPlayer):
     """Играет как SimpleHeuristicsPlayer, попутно записывая (obs, mask, action) для BC.
-    Также сохраняет сырые снапшоты битв для кэша: raw_dataset = (battle_copy, mask, action, tag, fusion, protect)
+    Также сохраняет сырые снапшоты битв для кэша:
+    raw_dataset = (battle_copy, mask, action, tag, fusion, protect, team_fusions),
+    где team_fusions = (our_team_fusions, opp_team_fusions) — командные фьюжн-карты по species.
+    Без них пересчёт из кэша считал bench/зеркало по дексу, хотя в живом бою (и в исходной
+    записи obs) они передаются: пересобранный датасет расходился с тем, что видит модель
+    на инференсе (это 155-мерный блок урона). Записи старого формата читаются как (None, None).
     чтобы при смене N_FEATURES пересобирать датасет без новых боёв.
     """
 
@@ -125,7 +130,9 @@ class HeuristicRecorder(FusionInfoParser, SimpleHeuristicsPlayer):
                     except Exception:
                         battle_copy = None
                 if battle_copy is not None:
-                    self.raw_dataset.append((battle_copy, mask, action, battle.battle_tag, our_fusion, opp_fusion, our_protect, opp_protect))
+                    self.raw_dataset.append((battle_copy, mask, action, battle.battle_tag, our_fusion,
+                                             opp_fusion, our_protect, opp_protect,
+                                             (our_team_fusions, opp_team_fusions)))
                 else:
                     # не удалось получить копию — пропускаем сырой кэш, но всё равно пишем obs
                     pass
