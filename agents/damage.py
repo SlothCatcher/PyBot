@@ -503,6 +503,204 @@ def best_move_damage(atk: Optional[dict], dfn: Optional[dict], ctx: Optional[Dam
     return best
 
 
+OPP_MOVE_SLOTS = 4        # сколько известных приёмов противника описываем
+OUR_TEAM_SLOTS = 6        # слотов в наших матрицах
+
+# Флаги «у противника есть приём с особым эффектом». Порядок фиксирован — он же порядок
+# признаков; менять состав можно только в конец (иначе сдвинутся индексы для уже обученных
+# моделей). Структурные поля Move (side_condition/volatile_status/force_switch/...) дают почти
+# всё, там где движок признак явно не хранит — небольшие id-наборы.
+EFFECT_FLAGS = (
+    # входные опасности (hazards)
+    "hazard_stealthrock", "hazard_spikes", "hazard_toxicspikes", "hazard_stickyweb", "hazard_any",
+    # статусы
+    "status_burn", "status_para", "status_poison", "status_sleep", "status_freeze",
+    "status_confuse", "status_any",
+    # контроль и защита
+    "phazing", "protect", "screens", "substitute", "taunt_or_disable",
+    # восстановление
+    "healing_move", "drain_move", "leechseed",
+    # поле
+    "weather_setter", "terrain_setter", "self_switch",
+    # прямая угроза
+    "priority_attack", "setup_booster", "target_debuff", "trick_item", "knockoff",
+    # счётчики (нормированы на 4 приёма)
+    "count_status_moves", "count_setup_moves", "count_damaging_moves", "count_hazard_moves",
+)
+EFFECT_FLAG_COUNT = len(EFFECT_FLAGS)
+
+HAZARD_MOVE_IDS = {"stealthrock", "spikes", "toxicspikes", "stickyweb", "stoneaxe", "ceaselessedge"}
+HEAL_MOVE_IDS = {"recover", "roost", "slackoff", "softboiled", "milkdrink", "shoreup", "synthesis",
+                 "moonlight", "morningsun", "wish", "rest", "lifedew", "junglehealing", "healorder",
+                 "strengthsap", "floralhealing", "painsplit", "present"}
+TRICK_MOVE_IDS = {"trick", "switcheroo", "thief", "covet", "bestow"}
+KNOCKOFF_MOVE_IDS = {"knockoff", "corrosivegas"}
+TAUNT_DISABLE_MOVE_IDS = {"taunt", "encore", "torment", "disable", "imprison", "healblock"}
+DEBUFF_MOVE_IDS = {"partingshot", "memento", "charm", "growl", "leer", "tailwhip", "screech",
+                   "metalsound", "faketears", "captivate", "venomdrench", "nobleroar", "tickle",
+                   "babydolleyes", "stringshot", "cottonspore", "scaryface"}
+
+
+def _move_statuses(move) -> set:
+    """Статусы/волатильные эффекты приёма: собственный status + secondary-эффекты."""
+    out = set()
+    st = getattr(move, "status", None)
+    if st is not None:
+        out.add(str(getattr(st, "name", st)).upper())
+    vs = getattr(move, "volatile_status", None)
+    if vs is not None:
+        out.add(str(getattr(vs, "name", vs)).upper())
+    for sec in (getattr(move, "secondary", None) or []):
+        if isinstance(sec, dict):
+            for key in ("status", "volatileStatus", "volatile_status"):
+                v = sec.get(key)
+                if v:
+                    out.add(str(v).upper())
+    return out
+
+
+def known_opponent_moves(mon) -> list:
+    """Раскрытые приёмы покемона в детерминированном порядке (сортировка по id)."""
+    moves = [m for m in (getattr(mon, "moves", None) or {}).values() if m is not None]
+    return sorted(moves, key=lambda m: _id(getattr(m, "id", "")))
+
+
+def _all_known_moves(mons) -> list:
+    seen, out = set(), []
+    for mon in (mons or []):
+        for mv in known_opponent_moves(mon):
+            mid = _id(getattr(mv, "id", ""))
+            if mid not in seen:
+                seen.add(mid)
+                out.append(mv)
+    return out
+
+
+def opponent_effect_flags(opp_mons) -> list:
+    """Флаги особых эффектов по ВСЕМ известным приёмам команды противника.
+
+    Берём union по команде, а не только по активному: сеттер хазардов/статусов часто сидит
+    на скамейке, и знать об этом заранее полезно.
+    """
+    flags = dict.fromkeys(EFFECT_FLAGS, 0.0)
+    moves = _all_known_moves(opp_mons)
+    if not moves:
+        return [0.0] * EFFECT_FLAG_COUNT
+
+    hazard_ids, screen_ids, weather_ids, terrain_ids = set(), set(), set(), set()
+    status_moves = setup_moves = damaging_moves = 0
+    for mv in moves:
+        mid = _id(getattr(mv, "id", ""))
+        side = getattr(mv, "side_condition", None)
+        side_name = str(getattr(side, "name", side) or "").upper()
+        statuses = _move_statuses(mv)
+        cat = _move_category(mv)   # .name, иначе str(category) даёт "PHYSICAL (MOVE CATEGORY) OBJECT"
+        boosts = getattr(mv, "boosts", None) or {}
+        is_status_move = cat == "STATUS"
+        is_damaging = cat in ("PHYSICAL", "SPECIAL")
+
+        if mid == "stealthrock" or side_name == "STEALTH_ROCK":
+            hazard_ids.add("stealthrock")
+        if mid == "spikes" or side_name == "SPIKES":
+            hazard_ids.add("spikes")
+        if mid == "toxicspikes" or side_name == "TOXIC_SPIKES":
+            hazard_ids.add("toxicspikes")
+        if mid == "stickyweb" or side_name == "STICKY_WEB":
+            hazard_ids.add("stickyweb")
+        if mid in HAZARD_MOVE_IDS and side_name in ("", "NONE"):
+            hazard_ids.add(mid)
+        if side_name in ("REFLECT", "LIGHT_SCREEN", "AURORA_VEIL"):
+            screen_ids.add(side_name)
+        if getattr(mv, "weather", None) is not None:
+            weather_ids.add(mid)
+        if getattr(mv, "terrain", None) is not None:
+            terrain_ids.add(mid)
+
+        if "BRN" in statuses:
+            flags["status_burn"] = 1.0
+        if "PAR" in statuses:
+            flags["status_para"] = 1.0
+        if statuses & {"PSN", "TOX"}:
+            flags["status_poison"] = 1.0
+        if "SLP" in statuses:
+            flags["status_sleep"] = 1.0
+        if "FRZ" in statuses:
+            flags["status_freeze"] = 1.0
+        if "CONFUSION" in statuses or mid == "confuseray":
+            flags["status_confuse"] = 1.0
+
+        if getattr(mv, "force_switch", False):
+            flags["phazing"] = 1.0
+        if getattr(mv, "is_protect_move", False) or getattr(mv, "stalling_move", False):
+            flags["protect"] = 1.0
+        if getattr(mv, "self_switch", False):
+            flags["self_switch"] = 1.0
+        if "SUBSTITUTE" in statuses or mid == "substitute":
+            flags["substitute"] = 1.0
+        if "TAUNT" in statuses or mid in TAUNT_DISABLE_MOVE_IDS:
+            flags["taunt_or_disable"] = 1.0
+
+        if float(getattr(mv, "heal", 0) or 0) > 0 or mid in HEAL_MOVE_IDS:
+            flags["healing_move"] = 1.0
+        if float(getattr(mv, "drain", 0) or 0) > 0:
+            flags["drain_move"] = 1.0
+        if "LEECH_SEED" in statuses or mid == "leechseed":
+            flags["leechseed"] = 1.0
+
+        if float(getattr(mv, "priority", 0) or 0) > 0 and is_damaging:
+            flags["priority_attack"] = 1.0
+        if (boosts and any(float(v) > 0 for v in boosts.values())) or getattr(mv, "self_boost", None):
+            flags["setup_booster"] = 1.0
+            setup_moves += 1
+        if (boosts and any(float(v) < 0 for v in boosts.values())) or mid in DEBUFF_MOVE_IDS:
+            flags["target_debuff"] = 1.0
+        if mid in TRICK_MOVE_IDS:
+            flags["trick_item"] = 1.0
+        if mid in KNOCKOFF_MOVE_IDS:
+            flags["knockoff"] = 1.0
+
+        if is_status_move:
+            status_moves += 1
+        if is_damaging:
+            damaging_moves += 1
+
+    flags["hazard_stealthrock"] = 1.0 if "stealthrock" in hazard_ids else 0.0
+    flags["hazard_spikes"] = 1.0 if "spikes" in hazard_ids else 0.0
+    flags["hazard_toxicspikes"] = 1.0 if "toxicspikes" in hazard_ids else 0.0
+    flags["hazard_stickyweb"] = 1.0 if "stickyweb" in hazard_ids else 0.0
+    flags["hazard_any"] = 1.0 if hazard_ids else 0.0
+    flags["screens"] = 1.0 if screen_ids else 0.0
+    flags["weather_setter"] = 1.0 if weather_ids else 0.0
+    flags["terrain_setter"] = 1.0 if terrain_ids else 0.0
+    flags["status_any"] = 1.0 if any(
+        flags[k] for k in ("status_burn", "status_para", "status_poison", "status_sleep",
+                           "status_freeze", "status_confuse")) else 0.0
+    flags["count_status_moves"] = min(status_moves / 4.0, 1.0)
+    flags["count_setup_moves"] = min(setup_moves / 4.0, 1.0)
+    flags["count_damaging_moves"] = min(damaging_moves / 4.0, 1.0)
+    flags["count_hazard_moves"] = min(len(hazard_ids) / 4.0, 1.0)
+    return [float(flags[k]) for k in EFFECT_FLAGS]
+
+
+def cached_move_damage(atk: Optional[dict], dfn: Optional[dict], move, ctx: Optional[DamageContext] = None):
+    """estimate_damage с кэшем по (атакующий, защитник, приём, поле)."""
+    if atk is None or dfn is None or move is None:
+        return None
+    ctx = ctx or DamageContext()
+    key = (_mon_sig(atk, True), _mon_sig(dfn, False), _id(getattr(move, "id", "")),
+           ctx.weather, ctx.terrain, ctx.defender_screens)
+    hit = _MOVE_DMG_CACHE.get(key)
+    if hit is not None:
+        return hit
+    val = estimate_damage(atk, dfn, move, ctx)
+    if len(_MOVE_DMG_CACHE) > 60_000:
+        _MOVE_DMG_CACHE.clear()
+    _MOVE_DMG_CACHE[key] = val
+    return val
+
+
+_MOVE_DMG_CACHE: dict = {}
+
 _PAIR_CACHE: dict = {}
 
 
@@ -555,7 +753,10 @@ def damage_frac(dmg: float, hp_now: Optional[int], hp_max: Optional[int], cap: f
 #  матрица «наш покемон -> покемон противника» (6x6, min_frac) = 36
 #  матрица «покемон противника -> наш покемон» (6x6, min_frac) = 36
 DAMAGE_MOVES = 4
-DAMAGE_BLOCK_SIZE = DAMAGE_MOVES * 3 + 3 + 36 + 36
+DAMAGE_BLOCK_SIZE = (DAMAGE_MOVES * 3 + 3 + 36 + 36          # наши приёмы, входящий, матрицы
+                     + OPP_MOVE_SLOTS * 3                     # их известные приёмы по нашему активному
+                     + OPP_MOVE_SLOTS * OUR_TEAM_SLOTS        # их приёмы по нашим слотам
+                     + EFFECT_FLAG_COUNT)                     # флаги особых эффектов у противника
 
 
 def team_slots(team) -> list:
@@ -566,6 +767,59 @@ def team_slots(team) -> list:
     """
     mons = [m for m in (team or {}).values() if m is not None]
     return sorted(mons, key=lambda m: str(getattr(m, "species", "") or ""))
+
+
+def their_known_moves_damage(opp_active: Optional[dict], our_active: Optional[dict],
+                             our_prepared: Optional[list] = None,
+                             ctx: Optional[DamageContext] = None,
+                             n_slots: int = OPP_MOVE_SLOTS) -> tuple:
+    """Урон от известных приёмов противника по НАМ (зеркало к нашему блоку урона).
+
+    Возвращает (active_block, team_block):
+      * active_block — n_slots x (min_frac, max_frac, guaranteed_KO) по нашему активному;
+      * team_block  — n_slots x len(our_prepared) min_frac по нашим слотам (для решений о свитче).
+
+    Порядок приёмов — по убыванию минимального урона в наш активный, затем по id: результат
+    не зависит от порядка раскрытия приёмов.
+    """
+    ctx = ctx or DamageContext()
+    our_prepared = list(our_prepared or [])
+    out_active = [0.0] * (n_slots * 3)
+    out_team = [0.0] * (n_slots * max(len(our_prepared), 1))
+    if opp_active is None or our_active is None:
+        return out_active, out_team
+
+    opp_mon = opp_active["mon"] if isinstance(opp_active, dict) else opp_active
+    moves = known_opponent_moves(opp_mon)
+    if not moves:
+        return out_active, out_team
+
+    scored = []
+    for mv in moves:
+        dmg = cached_move_damage(opp_active, our_active, mv, ctx)
+        scored.append((float(dmg[0]) if dmg else 0.0, _id(getattr(mv, "id", "")), mv, dmg))
+    scored.sort(key=lambda x: (-x[0], x[1]))
+
+    hp_now = our_active.get("hp_now")
+    hp_max = our_active.get("hp_max")
+    for slot, (_, _, mv, dmg) in enumerate(scored[:n_slots]):
+        if dmg is None:
+            out_active[slot * 3 + 0] = 0.0
+            out_active[slot * 3 + 1] = 0.0
+            out_active[slot * 3 + 2] = 0.0
+        else:
+            out_active[slot * 3 + 0] = damage_frac(dmg[0], hp_now, hp_max)
+            out_active[slot * 3 + 1] = damage_frac(dmg[1], hp_now, hp_max)
+            out_active[slot * 3 + 2] = 1.0 if (dmg[1] is not None and hp_now is not None
+                                               and dmg[1] >= hp_now) else 0.0
+        for j, dfn in enumerate(our_prepared):
+            if dfn is None:
+                continue
+            d = dmg if (j == 0 and dfn is our_active) else cached_move_damage(opp_active, dfn, mv, ctx)
+            if d is None:
+                continue
+            out_team[slot * len(our_prepared) + j] = damage_frac(d[0], dfn["hp_now"], dfn["hp_max"])
+    return out_active, out_team
 
 
 def team_damage_matrix(attackers_prepared: list, defenders_prepared: list,

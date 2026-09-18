@@ -10,13 +10,17 @@ except ImportError:  # запуск модуля вне пакета
 
 try:
     from .damage import (
-        DAMAGE_BLOCK_SIZE, DamageContext, cached_best_move_damage, damage_frac,
-        estimate_damage, prepare_mon, team_damage_matrix, team_slots,
+        DAMAGE_BLOCK_SIZE, EFFECT_FLAG_COUNT, OPP_MOVE_SLOTS, OUR_TEAM_SLOTS,
+        DamageContext, cached_best_move_damage, damage_frac, estimate_damage,
+        opponent_effect_flags, prepare_mon, team_damage_matrix, team_slots,
+        their_known_moves_damage,
     )
 except ImportError:  # запуск модуля вне пакета
     from damage import (
-        DAMAGE_BLOCK_SIZE, DamageContext, cached_best_move_damage, damage_frac,
-        estimate_damage, prepare_mon, team_damage_matrix, team_slots,
+        DAMAGE_BLOCK_SIZE, EFFECT_FLAG_COUNT, OPP_MOVE_SLOTS, OUR_TEAM_SLOTS,
+        DamageContext, cached_best_move_damage, damage_frac, estimate_damage,
+        opponent_effect_flags, prepare_mon, team_damage_matrix, team_slots,
+        their_known_moves_damage,
     )
 
 _STATUSES = [None, Status.BRN, Status.PAR, Status.SLP, Status.FRZ, Status.PSN, Status.TOX]
@@ -1024,6 +1028,9 @@ def _damage_block(battle, our_fusion, opp_fusion, our_team_fusions=None, opp_tea
       [12:15] лучший приём противника по нашему активному: min_frac, max_frac, guaranteed_ko
       [15:51] матрица «наш i -> их j»: min_frac урона по текущему HP цели
       [51:87] матрица «их j -> наш i»: min_frac урона по текущему HP нашей цели
+      [87:99] известные приёмы противника по нашему активному: min_frac, max_frac, guaranteed_KO
+      [99:123] те же приёмы противника x наши 6 слотов: min_frac
+      [123:155] флаги особых эффектов у противника (см. damage.EFFECT_FLAGS)
 
     Доли нормированы 0..1 (cap 2x HP). Нет данных/фейнт/неизвестно -> 0.
     """
@@ -1103,6 +1110,32 @@ def _damage_block(battle, our_fusion, opp_fusion, our_team_fusions=None, opp_tea
                 hp_now = dfn["hp_now"] if dfn else None
                 hp_max = dfn["hp_max"] if dfn else None
                 out[51 + j * 6 + i] = damage_frac(dmg, hp_now, hp_max)
+
+        # --- 5) зеркальный урон: известные приёмы противника по НАМ ---
+        base_active = 87
+        base_team = base_active + OPP_MOVE_SLOTS * 3
+        active_block, team_block = their_known_moves_damage(
+            opp_active, our_active, our_prepared, ctx_theirs, n_slots=OPP_MOVE_SLOTS)
+        for k, v in enumerate(active_block[:OPP_MOVE_SLOTS * 3]):
+            out[base_active + k] = v
+        our_width = max(len(our_prepared), 1)
+        for slot in range(OPP_MOVE_SLOTS):
+            for j in range(min(len(our_prepared), OUR_TEAM_SLOTS)):
+                src = slot * our_width + j
+                if src < len(team_block):
+                    out[base_team + slot * OUR_TEAM_SLOTS + j] = team_block[src]
+
+        # --- 6) флаги особых эффектов у противника (по всей раскрытой команде) ---
+        base_flags = base_team + OPP_MOVE_SLOTS * OUR_TEAM_SLOTS
+        opp_mons = []
+        try:
+            opp_mons = list((getattr(battle, "opponent_team", None) or {}).values())
+        except Exception:
+            opp_mons = []
+        if not opp_mons and isinstance(opp_active, dict):
+            opp_mons = [opp_active["mon"]]
+        for k, v in enumerate(opponent_effect_flags(opp_mons)[:EFFECT_FLAG_COUNT]):
+            out[base_flags + k] = v
     except Exception:
         # молчаливое проглатывание уже один раз стоило нам нулевой матрицы — логируем один раз
         global _DAMAGE_BLOCK_ERROR_LOGGED
