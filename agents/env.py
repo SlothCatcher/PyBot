@@ -53,7 +53,7 @@ HEAL_WASTED_PENALTY = 0.06
 SHAPING_EPISODE_CAP = 12.0         # макс суммарный shaping за бой (меньше victory 30)
 SHAPING_STEP_CLIP = 0.50           # клип на ход (было 2.0) — ещё сильнее жмём одиночный всплеск
 WASTED_MOVE_PENALTY = 0.06       # универсальный штраф за любой wasted приём (если ещё не наказан спецификой)
-WASTED_MOVE_IDS_SKIP = {"sunnyday","raindance","sandstorm","snowscape","chillyreception","electricterrain","grassyterrain","mistyterrain","psychicterrain","substitute","leechseed"}  # уже есть специфика
+WASTED_MOVE_IDS_SKIP = {"leechseed"}  # только leech уже имеет спец-штраф; погода/терен/саб теперь идут через generic wasted (фикс: раньше не штрафовались когда уже активны)
 WEATHER_MOVE_IDS = {"sunnyday","raindance","sandstorm","snowscape","chillyreception"}
 TERRAIN_MOVE_IDS = {"electricterrain","grassyterrain","mistyterrain","psychicterrain"}
 STATUS_IMMUNE_TYPES = {
@@ -86,14 +86,52 @@ def _make_self_play_opponents():
                 use_fallback = True
         except Exception:
             pass
+    # если есть meta — сортируем qualified по winrate, иначе по номеру
+    meta_path = "models/qualified_meta.json"
+    winrate_map = {}
+    try:
+        import json, os
+        if os.path.isfile(meta_path):
+            with open(meta_path, "r") as f:
+                meta = json.load(f)
+                for h in meta.get("history", []):
+                    fn = h.get("file", "")
+                    # candidates включает расширение? в listdir без пути, сравниваем basename
+                    winrate_map[fn] = float(h.get("winrate_vs_heuristics", 0))
+                    # также без расширения zip?
+                    if fn.endswith(".zip"):
+                        winrate_map[fn] = float(h.get("winrate_vs_heuristics", 0))
+                    else:
+                        winrate_map[fn + ".zip"] = float(h.get("winrate_vs_heuristics", 0))
+                        winrate_map[fn] = float(h.get("winrate_vs_heuristics", 0))
+    except Exception:
+        winrate_map = {}
     numbered = [(f, _snapshot_number(f)) for f in candidates]
     numbered = [(f, n) for f, n in numbered if n is not None]
-    files = [f for f, _ in sorted(numbered, key=lambda pair: pair[1])][-3:]
+    if winrate_map and any(f in winrate_map for f,_ in numbered):
+        # сортируем по winrate desc, затем по номеру desc (свежие сильнее при равных)
+        def _key(pair):
+            f,n = pair
+            return (winrate_map.get(f, -1), n or -1)
+        files = [f for f,_ in sorted(numbered, key=_key)][-3:]
+        # но если winrate_map содержит не все файлы (старые без meta), fallback к номеру для них
+    else:
+        files = [f for f, _ in sorted(numbered, key=lambda pair: pair[1])][-3:]
     # лог только 1 раз из главного процесса, иначе 8 воркеров спамят (на Windows spawn _MAIN_PID не работает)
     if use_fallback and files and multiprocessing.current_process().name == "MainProcess":
         try:
             from agents.config import MIN_WINRATE_TO_QUALIFY
-            print(f"self_play fallback: нет qualified (порог {MIN_WINRATE_TO_QUALIFY}), беру последние {len(files)} обычных снапшотов: {files}")
+            # динамический порог если есть meta
+            thr = MIN_WINRATE_TO_QUALIFY
+            try:
+                import json, os
+                if os.path.isfile(meta_path):
+                    with open(meta_path) as f:
+                        meta = json.load(f)
+                        thr = int(meta.get("threshold", thr))
+            except Exception:
+                pass
+            print(f"self_play fallback: нет qualified (порог {thr}), беру последние {len(files)} обычных снапшотов: {files}")
         except Exception:
             pass
 
@@ -400,7 +438,7 @@ class ExampleEnv(SinglesEnv):
         if field is None:
             return False
         try:
-            fname = getattr(field, "name", str(field)).lower()
+            fname = getattr(field, "name", str(field)).lower().replace("_","").replace(" ","").replace("-","")
             for mon in team.values():
                 if mon.fainted:
                     continue
@@ -545,10 +583,23 @@ class ExampleEnv(SinglesEnv):
                 extra += abs(d_own_haz) * HAZARD_CLEAR_BONUS
 
             # 2) Урон: по активному противнику (учитывает DEF/SPD уже через HP дельту)
+            # FIX: dmg_taken раньше считался даже при своём свитче (prev hp vs new mon hp) — теперь скипаем если был свитч
             prev_opp_active_species = prev.get("opp_active_species", "")
             curr_opp_species = getattr(getattr(battle.opponent_active_pokemon, "species", None), "lower", lambda: "")() if battle.opponent_active_pokemon else ""
             opp_switched = prev_opp_active_species and curr_opp_species and prev_opp_active_species != curr_opp_species
-            if not opp_switched:
+            # считаем was_switch заранее чтобы не путать урон при свитче (баг: раньше dmg_taken считался по разным покемонам)
+            prev_species_for_dmg = prev.get("active_species", "")
+            was_switch_for_dmg = False
+            if prev_species_for_dmg and curr_active_species and prev_species_for_dmg != curr_active_species:
+                try:
+                    _prev_hp_for_dmg = prev.get("active_hp", 1.0)
+                    _curr_turn_for_dmg = getattr(battle, "turn", 0)
+                    _prev_turn_for_dmg = prev.get("turn", 0)
+                    if _prev_hp_for_dmg > 0.05 and _curr_turn_for_dmg > _prev_turn_for_dmg:
+                        was_switch_for_dmg = True
+                except Exception:
+                    was_switch_for_dmg = False
+            if not opp_switched and not was_switch_for_dmg:
                 dmg_dealt = prev["opp_hp"] - curr_opp_hp
                 if dmg_dealt > 1e-6:
                     extra += dmg_dealt * DAMAGE_WEIGHT
@@ -721,8 +772,36 @@ class ExampleEnv(SinglesEnv):
             # клин статуса (Heal Bell / Natural Cure)
             try:
                 prev_status = prev.get("status", None)
+                # FIX: не давать бонус при свитче на здорового (false positive), но разрешаем Natural Cure / Shed Skin абилки
+                _was_switch_for_cure = False
+                try:
+                    if "was_switch_for_dmg" in locals() and was_switch_for_dmg:
+                        _was_switch_for_cure = True
+                    if "was_switch" in locals() and was_switch:
+                        _was_switch_for_cure = True
+                except Exception:
+                    pass
+                # проверяем Natural Cure / Healer etc. — тогда свитч-лечение засчитываем
+                _is_natural_cure = False
+                if _was_switch_for_cure:
+                    try:
+                        # prev мон — тот что был со статусом, его абилка
+                        prev_mon_species = prev.get("active_species","")
+                        # ищем prev_mon в team
+                        for mon in battle.team.values():
+                            if str(getattr(mon, "species","")).lower() == prev_mon_species.lower():
+                                ab = str(getattr(mon, "ability","") or "").lower().replace(" ","").replace("-","")
+                                if ab in ("naturalcure","shedskin","hydration"):
+                                    _is_natural_cure = True
+                                    break
+                        # Hydration только если дождь — но упростим: засчитаем
+                    except Exception:
+                        pass
                 if prev_status is not None and curr_status is None and curr_own_hp > 0.05:
-                    extra += STATUS_CURE_BONUS
+                    if not _was_switch_for_cure and prev.get("active_species","") == curr_active_species:
+                        extra += STATUS_CURE_BONUS
+                    elif _was_switch_for_cure and _is_natural_cure:
+                        extra += STATUS_CURE_BONUS
             except Exception:
                 pass
 
@@ -836,16 +915,20 @@ class ExampleEnv(SinglesEnv):
             try:
                 # heal только если последний ход был хилом — иначе это пассивы (Leftovers/Grassy) и не даём бонуса/штрафа
                 last_id = self._last_move_id.get(tag, "")
-                # считаем хил-приёмами те что дают heal>0 или drain>0 (покрываем Recover, Roost, Slack Off, Synthesis и т.д.)
+                # считаем хил-приёмами те что дают heal>0 (покрываем Recover, Roost, Slack Off, Synthesis и т.д.)
                 is_heal_move = False
                 try:
-                    # быстрый чек по id
-                    if last_id in ("recover","roost","softboiled","morningsun","moonlight","synthesis","healorder","slackoff","milkdrink","swallow","rest","shoreup","strengthsap","wish","healingwish","lunardance","purify","lifedew","junglehealing"):
+                    # быстрый чек по id (расширен)
+                    if last_id in ("recover","roost","softboiled","morningsun","moonlight","synthesis","healorder","slackoff","milkdrink","swallow","rest","shoreup","strengthsap","wish","healingwish","lunardance","purify","lifedew","junglehealing","shoreup","rest","healbell","aromatherapy"):
                         is_heal_move = True
-                    else:
-                        # fallback через _move_heal_pct если вдруг другой хил (например Drain)
-                        # Draining moves (Giga Drain) тоже хилят но наносимый урон уже наградили, дополнительно не бафаем
-                        pass
+                    # также чекаем через move entry heal если вдруг другой хил (например Floral Healing)
+                    if not is_heal_move:
+                        try:
+                            # пытаемся достать последний move объект если есть
+                            # fallback: если heal_amount >0 и не было свитча и не было урона оппа — считаем хилом
+                            pass
+                        except Exception:
+                            pass
                 except Exception:
                     pass
                 heal_amount = curr_own_hp - prev.get("own_hp", curr_own_hp)

@@ -8,6 +8,87 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
 from agents.training import collect_or_load_dataset
 from agents.config import BATTLE_FORMAT, MIN_WINRATE_TO_QUALIFY, QUALIFIED_PREFIX, SELF_PLAY_PATH, VECNORM_PATH
+import json as _json
+_QUALIFIED_META_PATH = "models/qualified_meta.json"
+
+def _load_qualified_meta(base_min: int = 25) -> dict:
+    """Грузит meta qualified: threshold + history. Если нет — создаём с base_min."""
+    try:
+        if os.path.isfile(_QUALIFIED_META_PATH):
+            with open(_QUALIFIED_META_PATH, "r") as f:
+                meta = _json.load(f)
+                # валидация
+                if "threshold" not in meta:
+                    meta["threshold"] = base_min
+                if "history" not in meta:
+                    meta["history"] = []
+                if "base" not in meta:
+                    meta["base"] = base_min
+                return meta
+    except Exception as e:
+        print(f"warn _load_qualified_meta: {e}")
+    return {"threshold": int(base_min), "base": int(base_min), "history": []}
+
+def _save_qualified_meta(meta: dict):
+    try:
+        os.makedirs(os.path.dirname(_QUALIFIED_META_PATH), exist_ok=True)
+        # atomic write
+        tmp = _QUALIFIED_META_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            _json.dump(meta, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, _QUALIFIED_META_PATH)
+    except Exception as e:
+        print(f"warn _save_qualified_meta: {e}")
+
+def _get_current_threshold(base_min: int) -> int:
+    """Рэтчет-порог: max(base_min, max(history winrate), saved threshold). Никогда не падает."""
+    meta = _load_qualified_meta(base_min)
+    thr = int(meta.get("threshold", base_min))
+    # также смотрим history — вдруг ручной правкой threshold занизили, но в history есть выше
+    try:
+        max_hist = max([int(round(h.get("winrate_vs_heuristics", 0))) for h in meta.get("history",[])] or [thr])
+        thr = max(thr, max_hist)
+    except Exception:
+        pass
+    # если base_min подняли аргументом — тоже учитываем
+    thr = max(thr, int(base_min))
+    return int(thr)
+
+def _record_qualified(save_path: str, win_rates: dict, base_min: int, phase_counter: int):
+    """Пишет history + обновляет threshold = max(threshold, heuristics_rate). Также пишет per-file json рядом с моделью."""
+    try:
+        meta = _load_qualified_meta(base_min)
+        heur = float(win_rates.get("SimpleHeuristicsPlayer", 0))
+        # обновляем threshold рэтчетом
+        old_thr = int(meta.get("threshold", base_min))
+        new_thr = max(old_thr, int(round(heur)), int(base_min))
+        meta["threshold"] = new_thr
+        meta["base"] = int(base_min)
+        entry = {
+            "file": os.path.basename(save_path),
+            "path": save_path,
+            "winrate_vs_heuristics": float(heur),
+            "win_rates": {k: float(v) for k,v in win_rates.items()},
+            "threshold_before": int(old_thr),
+            "threshold_after": int(new_thr),
+            "phase": int(phase_counter),
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        meta["history"].append(entry)
+        _save_qualified_meta(meta)
+        # per-file json для удобства
+        per_file = save_path + ".json"
+        try:
+            with open(per_file, "w") as f:
+                _json.dump(entry, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"warn per-file meta {per_file}: {e}")
+        print(f"[qualified meta] порог {old_thr}% -> {new_thr}%, записан {save_path}.json (heur {heur}%)")
+        return meta
+    except Exception as e:
+        print(f"warn _record_qualified: {e}")
+        import traceback; traceback.print_exc()
+        return None
 from agents.env import ExampleEnv
 from agents.policy import MaskedActorCriticPolicy
 from agents.players import PolicyPlayer
@@ -443,6 +524,15 @@ def run(
     ppo.set_env(env)
 
     counter = _next_snapshot_index()
+    # динамический порог на старте
+    try:
+        init_thr = _get_current_threshold(min_winrate)
+        if init_thr != min_winrate:
+            print(f"[init] qualified порог рэтчет: база {min_winrate}% -> текущий {init_thr}% (из { _QUALIFIED_META_PATH })")
+        else:
+            print(f"[init] qualified порог {init_thr}% (база {min_winrate}%)")
+    except Exception as e:
+        print(f"warn init threshold: {e}")
     # для адаптации opponent_weights: запомним последний словарь весов
     current_weights: dict[str, float] | None = None
 
@@ -505,14 +595,20 @@ def run(
                 import traceback; traceback.print_exc()
                 win_rates = {"SimpleHeuristicsPlayer": 0, "RandomPlayer": 0, "MaxBasePowerPlayer": 0, "self_play": 0}
         heuristics_rate = win_rates.get("SimpleHeuristicsPlayer", 0)
+        # динамический рэтчет-порог: если уже пробивали выше — требуем не меньше прошлого максимума
+        cur_threshold = _get_current_threshold(min_winrate)
+        if cur_threshold != min_winrate:
+            print(f"[phase {counter}] динамический порог {cur_threshold}% (база {min_winrate}%) — рэтчет с прошлого максимума")
         # иногда ключа нет если оценка упала — fallback
-        if heuristics_rate >= min_winrate:
+        if heuristics_rate >= cur_threshold:
             # дополнительно проверяем что файл не перезапишет существующий qualified
             save_path = f"models/{QUALIFIED_PREFIX}{counter}"
             ppo.save(save_path)
-            print(f"[phase {counter}] снапшот прошёл порог ({heuristics_rate}% >= {min_winrate}%) -> {save_path}")
+            print(f"[phase {counter}] снапшот прошёл порог ({heuristics_rate}% >= {cur_threshold}%) -> {save_path}")
+            # мета-запись + рэтчет threshold
+            _record_qualified(save_path, win_rates, min_winrate, counter)
         else:
-            print(f"[phase {counter}] снапшот НЕ прошёл порог ({heuristics_rate}% < {min_winrate}%) -> пропущен")
+            print(f"[phase {counter}] снапшот НЕ прошёл порог ({heuristics_rate}% < {cur_threshold}%) -> пропущен (база {min_winrate}%)")
 
         _update_opponent_weights(win_rates)
         # формируем веса для следующей фазы: ключи должны совпадать с тем, что ждёт env.create_env

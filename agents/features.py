@@ -890,8 +890,55 @@ def _move_wasted_flag(move, battle) -> float:
         return 1.0
     if move_id in _TERRAIN_MOVES and _TERRAIN_MOVES[move_id] in battle.fields:
         return 1.0
-    if move_id == "substitute" and Effect.SUBSTITUTE in (battle.active_pokemon.effects if battle.active_pokemon else {}):
-        return 1.0
+    if move_id == "substitute":
+        # уже есть кукла
+        if Effect.SUBSTITUTE in (battle.active_pokemon.effects if battle.active_pokemon else {}):
+            return 1.0
+        # hp <=25% — не поставится (25% стоит кукла), wasted
+        try:
+            if battle.active_pokemon is not None and getattr(battle.active_pokemon, "current_hp_fraction", 1.0) <= 0.26:
+                return 1.0
+        except Exception:
+            pass
+    # хил при полном HP — wasted
+    try:
+        entry = getattr(move, "entry", {}) or {}
+        is_heal = False
+        if entry.get("heal", None) is not None:
+            is_heal = True
+        elif move_id in ("recover","roost","softboiled","morningsun","moonlight","synthesis","healorder","slackoff","milkdrink","swallow","rest","shoreup","strengthsap","wish","healingwish","lunardance","purify","lifedew","junglehealing"):
+            is_heal = True
+        is_drain = entry.get("drain", None) is not None
+        if is_heal and not is_drain and battle.active_pokemon is not None:
+            if getattr(battle.active_pokemon, "current_hp_fraction", 0) >= 0.98:
+                return 1.0
+    except Exception:
+        pass
+    # буст уже на +6 / -6 — wasted
+    try:
+        boosts = getattr(move, "boosts", None)
+        if boosts is None:
+            boosts = (getattr(move, "entry", {}) or {}).get("boosts", None)
+        if boosts:
+            # определяем цель буста: положительные -> на себя, отрицательные -> на оппа
+            has_pos = any(v>0 for v in boosts.values())
+            has_neg = any(v<0 for v in boosts.values())
+            if has_pos and battle.active_pokemon is not None:
+                cur = getattr(battle.active_pokemon, "boosts", {}) or {}
+                for stat, delta in boosts.items():
+                    if stat not in ("atk","def","spa","spd","spe","accuracy","evasion"):
+                        continue
+                    if delta > 0 and cur.get(stat, 0) >= 6:
+                        return 1.0
+            if has_neg and opp is not None:
+                cur = getattr(opp, "boosts", {}) or {}
+                for stat, delta in boosts.items():
+                    if stat not in ("atk","def","spa","spd","spe","accuracy","evasion"):
+                        continue
+                    if delta < 0 and cur.get(stat, 0) <= -6:
+                        return 1.0
+    except Exception:
+        pass
         
     if move_id in _HAZARD_MOVES:
         condition, max_layers = _HAZARD_MOVES[move_id]
@@ -901,9 +948,38 @@ def _move_wasted_flag(move, battle) -> float:
 
     if move_id in _SCREEN_MOVES:
         return 1.0 if _SCREEN_MOVES[move_id] in battle.side_conditions else 0.0
+    # Defog/Rapid Spin когда нет хазардов — wasted (нет смысла)
+    if move_id in ("rapidspin","mortalspin","tidyup"):
+        # эти чистят только свои хазарды
+        if not battle.side_conditions:
+            # проверяем есть ли хоть один хазард
+            has_haz = any(c in battle.side_conditions for c in (SideCondition.STEALTH_ROCK, SideCondition.SPIKES, SideCondition.TOXIC_SPIKES, SideCondition.STICKY_WEB))
+            if not has_haz:
+                return 1.0
+    if move_id in ("defog","courtchange"):
+        has_own = any(c in battle.side_conditions for c in (SideCondition.STEALTH_ROCK, SideCondition.SPIKES, SideCondition.TOXIC_SPIKES, SideCondition.STICKY_WEB))
+        has_opp = any(c in battle.opponent_side_conditions for c in (SideCondition.STEALTH_ROCK, SideCondition.SPIKES, SideCondition.TOXIC_SPIKES, SideCondition.STICKY_WEB))
+        if not has_own and not has_opp:
+            return 1.0
 
     if move.status is not None and opp is not None and opp.status is not None:
         return 1.0
+    # статус на иммунный тип (яд на сталь, ожог на огонь и т.д.) — тоже wasted
+    if move.status is not None and opp is not None:
+        try:
+            # move.status может быть Status enum или строка, приводим к строке типа "brn"/"psn"
+            s = str(getattr(move.status, "name", str(move.status))).lower()
+            # нормализуем "burn" -> "brn" и т.д.
+            s_map = {"burn":"brn","paralyze":"par","paralysis":"par","poison":"psn","toxic":"tox","sleep":"slp","freeze":"frz","brn":"brn","par":"par","psn":"psn","tox":"tox","slp":"slp","frz":"frz"}
+            s_key = s_map.get(s, s[:3])
+            immune_types = {"brn": ["fire"], "par": ["electric","ground"], "psn": ["poison","steel"], "tox": ["poison","steel"], "slp": [], "frz": []}.get(s_key, [])
+            if immune_types:
+                # проверяем типы оппа
+                for t in [getattr(opp, "type_1", None), getattr(opp, "type_2", None)]:
+                    if t is not None and getattr(t, "name", str(t)).lower() in immune_types:
+                        return 1.0
+        except Exception:
+            pass
 
     if opp is not None and opp.ability is not None:
         immune_type = _IMMUNITY_ABILITIES.get(opp.ability)
