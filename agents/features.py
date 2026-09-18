@@ -8,6 +8,17 @@ try:
 except ImportError:  # запуск модуля вне пакета
     from type_utils import damage_multiplier_safe
 
+try:
+    from .damage import (
+        DAMAGE_BLOCK_SIZE, DamageContext, cached_best_move_damage, damage_frac,
+        estimate_damage, prepare_mon, team_damage_matrix, team_slots,
+    )
+except ImportError:  # запуск модуля вне пакета
+    from damage import (
+        DAMAGE_BLOCK_SIZE, DamageContext, cached_best_move_damage, damage_frac,
+        estimate_damage, prepare_mon, team_damage_matrix, team_slots,
+    )
+
 _STATUSES = [None, Status.BRN, Status.PAR, Status.SLP, Status.FRZ, Status.PSN, Status.TOX]
 
 _HAZARD_MOVES = {
@@ -1005,6 +1016,107 @@ def _move_wasted_flag(move, battle) -> float:
     return 0.0
 
 
+def _damage_block(battle, our_fusion, opp_fusion, our_team_fusions=None, opp_team_fusions=None) -> np.ndarray:
+    """Признаки потенциального урона: по приёмам активного, входящий удар и матрицы 6x6.
+
+    Порядок (см. damage.DAMAGE_BLOCK_SIZE):
+      [0:12]  4 приёма активного против активного противника: min_frac, max_frac, guaranteed_ko
+      [12:15] лучший приём противника по нашему активному: min_frac, max_frac, guaranteed_ko
+      [15:51] матрица «наш i -> их j»: min_frac урона по текущему HP цели
+      [51:87] матрица «их j -> наш i»: min_frac урона по текущему HP нашей цели
+
+    Доли нормированы 0..1 (cap 2x HP). Нет данных/фейнт/неизвестно -> 0.
+    """
+    out = np.zeros(DAMAGE_BLOCK_SIZE, dtype=np.float32)
+    try:
+        tag = str(getattr(battle, "battle_tag", "") or "")
+        ctx_ours = DamageContext.ours(battle)
+        ctx_theirs = DamageContext.theirs(battle)
+        our_active = prepare_mon(getattr(battle, "active_pokemon", None), our_fusion)
+        opp_active = prepare_mon(getattr(battle, "opponent_active_pokemon", None), opp_fusion)
+
+        # --- 1) по приёмам нашего активного против их активного ---
+        moves = list(getattr(battle, "available_moves", []) or [])[:4]
+        if our_active is not None and opp_active is not None:
+            hp_now, hp_max = opp_active["hp_now"], opp_active["hp_max"]
+            for i, move in enumerate(moves):
+                r = estimate_damage(our_active, opp_active, move, ctx_ours)
+                if not r:
+                    continue
+                out[3 * i + 0] = damage_frac(r[0], hp_now, hp_max)
+                out[3 * i + 1] = damage_frac(r[1], hp_now, hp_max)
+                out[3 * i + 2] = 1.0 if (hp_now is not None and r[0] >= hp_now) else 0.0
+
+        # --- 2) лучший известный приём противника по нашему активному ---
+        if opp_active is not None and our_active is not None:
+            dmin, dmax, _ = cached_best_move_damage(opp_active, our_active, ctx_theirs, tag)
+            hp_now, hp_max = our_active["hp_now"], our_active["hp_max"]
+            out[12] = damage_frac(dmin, hp_now, hp_max)
+            out[13] = damage_frac(dmax, hp_now, hp_max)
+            out[14] = 1.0 if (hp_now is not None and dmin >= hp_now) else 0.0
+
+        # --- 3-4) матрицы 6x6 (канонический порядок слотов по species) ---
+        our_slots = team_slots(getattr(battle, "team", None))
+        opp_slots = team_slots(getattr(battle, "opponent_team", None))
+        our_team_fusions = our_team_fusions or {}
+        opp_team_fusions = opp_team_fusions or {}
+
+        def _fusion_for(mon):
+            sid = str(getattr(mon, "species", "") or "")
+            try:
+                from poke_env.data.normalize import to_id_str
+                sid = to_id_str(sid) or sid
+            except Exception:
+                pass
+            return our_team_fusions.get(sid) or opp_team_fusions.get(sid)
+
+        our_prepared = []
+        for mon in our_slots:
+            f = _fusion_for(mon)
+            if f is None and mon is getattr(battle, "active_pokemon", None):
+                f = our_fusion
+            our_prepared.append(prepare_mon(mon, f))
+        opp_prepared = []
+        for mon in opp_slots:
+            f = _fusion_for(mon)
+            if f is None and mon is getattr(battle, "opponent_active_pokemon", None):
+                f = opp_fusion
+            opp_prepared.append(prepare_mon(mon, f))
+
+        our_slots = our_slots[:6]
+        opp_slots = opp_slots[:6]
+        our_prepared = our_prepared[:6]
+        opp_prepared = opp_prepared[:6]
+
+        m_our_to_opp = team_damage_matrix(our_prepared, opp_prepared, ctx_ours, tag)
+        for i, row in enumerate(m_our_to_opp[:6]):
+            for j, dmg in enumerate(row[:6]):
+                dfn = opp_prepared[j] if j < len(opp_prepared) else None
+                hp_now = dfn["hp_now"] if dfn else None
+                hp_max = dfn["hp_max"] if dfn else None
+                out[15 + i * 6 + j] = damage_frac(dmg, hp_now, hp_max)
+
+        m_opp_to_our = team_damage_matrix(opp_prepared, our_prepared, ctx_theirs, tag)
+        for j, row in enumerate(m_opp_to_our[:6]):
+            for i, dmg in enumerate(row[:6]):
+                dfn = our_prepared[i] if i < len(our_prepared) else None
+                hp_now = dfn["hp_now"] if dfn else None
+                hp_max = dfn["hp_max"] if dfn else None
+                out[51 + j * 6 + i] = damage_frac(dmg, hp_now, hp_max)
+    except Exception:
+        # молчаливое проглатывание уже один раз стоило нам нулевой матрицы — логируем один раз
+        global _DAMAGE_BLOCK_ERROR_LOGGED
+        if not _DAMAGE_BLOCK_ERROR_LOGGED:
+            _DAMAGE_BLOCK_ERROR_LOGGED = True
+            import traceback
+            print("[damage] ошибка построения блока признаков урона:")
+            traceback.print_exc()
+    return out
+
+
+_DAMAGE_BLOCK_ERROR_LOGGED = False
+
+
 def embed_battle_with_fusion(battle, our_fusion, opp_fusion, our_protected_last_turn=0.0, opp_protected_last_turn=0.0, our_team_fusions: dict | None = None, opp_team_fusions: dict | None = None, debug: bool = False):
     from poke_env.data import GenData
 
@@ -1124,6 +1236,7 @@ def embed_battle_with_fusion(battle, our_fusion, opp_fusion, our_protected_last_
     opp_actual_stats = _actual_stats_vec(battle.opponent_active_pokemon, opp_fusion)
     our_ability = _ability_vec(battle.active_pokemon)
     opp_ability = _ability_vec(battle.opponent_active_pokemon)
+    damage_feats = _damage_block(battle, our_fusion, opp_fusion, our_team_fusions, opp_team_fusions)
     moves_boost_own_flat = moves_boost_own.flatten()
     moves_drop_opp_flat = moves_drop_opp.flatten()
     moves_hazard_clear_flat = moves_hazard_clear.flatten()
@@ -1150,7 +1263,8 @@ def embed_battle_with_fusion(battle, our_fusion, opp_fusion, our_protected_last_
             [our_can_tera_now, our_used_tera, opp_used_tera],
             [our_is_tera, opp_is_tera],
             our_tera_type,
-            [our_protected_last_turn, opp_protected_last_turn]
+            [our_protected_last_turn, opp_protected_last_turn],
+            damage_feats,
         ],
         dtype=np.float32,
     )
@@ -1160,6 +1274,9 @@ def embed_battle_with_fusion(battle, our_fusion, opp_fusion, our_protected_last_
         obs = np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
     # защита от рассинхрона N_FEATURES (было 3 инцидента ручного подсчёта)
     from .config import N_FEATURES
+    if damage_feats.shape[0] != DAMAGE_BLOCK_SIZE:  # страховка от рассинхрона блока
+        raise AssertionError(f"damage-блок {damage_feats.shape[0]} != DAMAGE_BLOCK_SIZE {DAMAGE_BLOCK_SIZE}")
     if obs.shape[0] != N_FEATURES:
-        raise AssertionError(f"embed_battle_with_fusion вернула {obs.shape[0]}, а N_FEATURES={N_FEATURES}. Обнови config.py (ожидалось 713+2 тера-флага=715).")
+        raise AssertionError(f"embed_battle_with_fusion вернула {obs.shape[0]}, а N_FEATURES={N_FEATURES}. "
+                         f"Обнови config.py (715 + {DAMAGE_BLOCK_SIZE} признаков урона = {715 + DAMAGE_BLOCK_SIZE}).")
     return obs

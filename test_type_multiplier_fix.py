@@ -81,7 +81,8 @@ def test_wasted_flag_and_obs():
                          (PT.FLYING, PT.THREE_QUESTION_MARKS))
     check("E2E earthquake vs FLYING+???: wasted", _move_wasted_flag(mv[0], b), 1.0)
     # obs не должен поменять размер
-    check("E2E obs shape == N_FEATURES", embed_battle_with_fusion(b, None, None).shape[0], 715)
+    from agents.config import N_FEATURES
+    check("E2E obs shape == N_FEATURES", embed_battle_with_fusion(b, None, None).shape[0], N_FEATURES)
 
 
 def main() -> int:

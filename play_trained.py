@@ -12,6 +12,10 @@
     python play_trained.py --ladder 10                     # лестница
     python play_trained.py --challenge Someone             # принять/бросить вызовы от игрока
     python play_trained.py --challenge-any                 # принимать любые вызовы
+
+Если снапшот обучен на старой размерности признаков (например 715, а в config уже 802),
+веса автоматически добиваются нулями (`--no-migrate` отключает) — модель играет как раньше
+и может дообучаться уже на новых признаках.
 """
 from __future__ import annotations
 
@@ -51,17 +55,23 @@ def selfcheck(model_path: str, vecnorm_path: str) -> int:
         print(f"[1] модель {model_path}: obs dim = {model_dim}")
         print(f"    N_FEATURES в config = {N_FEATURES} -> "
               f"{'СОВПАДАЕТ ✓' if model_dim == N_FEATURES else 'НЕ СОВПАДАЕТ ✗ (снапшот от другой версии признаков)'}")
-        ok &= model_dim == N_FEATURES
+        if model_dim != N_FEATURES:
+            print(f"    -> сработает авто-миграция весов: {model_dim} -> {N_FEATURES} (warm start)")
     except Exception as e:
         print(f"[1] не удалось прочитать метаданные модели: {e}")
         ok = False
 
-    # 1b. веса реально грузятся в текущую политику?
+    # 1b. веса реально грузятся в текущую политику? (при несовпадении — через авто-миграцию)
     try:
-        from stable_baselines3 import PPO
-
-        PPO.load(model_path, device="cpu")
-        print("    веса применяются к текущей политике: ✓")
+        ppo_probe, migrated_from = load_policy(model_path, allow_migrate=True)
+        _w = ppo_probe.policy.features_extractor.net[0].weight
+        if migrated_from is None:
+            print("    веса применяются к текущей политике: ✓")
+        else:
+            print(f"    веса применяются после авто-миграции {migrated_from}->{N_FEATURES} ✓ "
+                  f"(первый слой {tuple(_w.shape)}, новые признаки с нулевыми весами)")
+            print("    POLICY BEHAVIOUR: старые признаки дают тот же результат, что и раньше; "
+                  "новые включатся по мере дообучения")
     except Exception as e:
         first = str(e).splitlines()[0] if str(e) else type(e).__name__
         print(f"    веса НЕ применяются к текущей политике ✗: {first}")
@@ -107,6 +117,30 @@ def selfcheck(model_path: str, vecnorm_path: str) -> int:
     return 0 if ok else 1
 
 
+def load_policy(model_path: str, allow_migrate: bool = True):
+    """Грузит PPO; при несовпадении размерности obs добивает веса до N_FEATURES.
+
+    Возвращает (ppo, исходная_размерность). Если размерность совпадала, второй элемент None.
+    """
+    from stable_baselines3 import PPO
+
+    from agents.policy_player import _checkpoint_obs_dim, _migrate_checkpoint_dim
+
+    dim = _checkpoint_obs_dim(model_path)
+    if dim is None:
+        return PPO.load(model_path, device="cpu"), None
+    if dim == N_FEATURES:
+        return PPO.load(model_path, device="cpu"), None
+    if not allow_migrate:
+        raise SystemExit(
+            f"Модель {model_path} обучена на {dim} признаках, а в env сейчас {N_FEATURES}. "
+            f"Запусти без --no-migrate (веса будут добиты нулями) или возьми снапшот под текущие признаки."
+        )
+    print(f"  снапшот {model_path}: {dim} признаков -> {N_FEATURES}, мигрирую (warm start): "
+          f"старые веса сохранены, {N_FEATURES - dim} новых признаков входят с нулевыми весами")
+    return _migrate_checkpoint_dim(model_path, target_dim=N_FEATURES), dim
+
+
 def build_player(ppo, vecnorm_path: str, deterministic: bool, use_norm: bool):
     agent = PolicyPlayer(policy=ppo.policy, battle_format=BATTLE_FORMAT, max_concurrent_battles=10)
     if use_norm and os.path.isfile(vecnorm_path):
@@ -120,7 +154,7 @@ def build_player(ppo, vecnorm_path: str, deterministic: bool, use_norm: bool):
             agent.embed_battle = norm_embed  # type: ignore
             print(f"  {stats.describe()} -> нормализация включена")
 
-    # модель с 418/713 признаками не совместима с текущим embed (715)
+    # сюда модель уже приходит совместимой по размерности (см. load_policy)
     try:
         dim = int(ppo.observation_space["observation"].shape[0])
         if dim != N_FEATURES:
@@ -149,14 +183,14 @@ def main() -> int:
     ap.add_argument("--challenge-any", action="store_true", help="принимать любые вызовы")
     ap.add_argument("--no-normalize", action="store_true", help="не применять VecNormalize")
     ap.add_argument("--deterministic", action="store_true")
+    ap.add_argument("--no-migrate", action="store_true",
+                    help="не мигрировать снапшот со старой размерностью признаков (жёсткая ошибка)")
     args = ap.parse_args()
 
     if args.selfcheck or not (args.ladder or args.challenge or args.challenge_any):
         return selfcheck(args.model, args.vecnorm)
 
-    from stable_baselines3 import PPO
-
-    ppo = PPO.load(args.model, device="cpu")
+    ppo, _ = load_policy(args.model, allow_migrate=not args.no_migrate)
     agent = build_player(ppo, args.vecnorm, args.deterministic, use_norm=not args.no_normalize)
 
     async def run():

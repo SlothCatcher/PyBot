@@ -7,7 +7,8 @@ from poke_env.player import MaxBasePowerPlayer, RandomPlayer, SimpleHeuristicsPl
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
 from agents.training import collect_or_load_dataset
-from agents.config import BATTLE_FORMAT, MIN_WINRATE_TO_QUALIFY, QUALIFIED_PREFIX, SELF_PLAY_PATH, VECNORM_PATH
+import numpy as np
+from agents.config import BATTLE_FORMAT, MIN_WINRATE_TO_QUALIFY, N_FEATURES, QUALIFIED_PREFIX, SELF_PLAY_PATH, VECNORM_PATH
 import json as _json
 _QUALIFIED_META_PATH = "models/qualified_meta.json"
 
@@ -112,14 +113,43 @@ except Exception:
     ICM = None
     CuriosityVecWrapper = None
 
-def _migrate_ppo_713_to_715(ppp_path: str):
-    """Надёжная миграция 713->715 через паддинг весов в zip. Не зависит от глобального N_FEATURES."""
+def _migrate_ppo_713_to_715(ppp_path: str, target_dim: int | None = None):
+    """Старое имя миграции (713->715). Сохранено для совместимости со скриптами."""
+    return _migrate_checkpoint_dim(ppp_path, target_dim=target_dim)
+
+
+def _checkpoint_obs_dim(path: str):
+    """Размерность obs из метаданных чекпоинта (без загрузки весов). None, если не прочитать."""
+    try:
+        from stable_baselines3.common.save_util import load_from_zip_file
+        data, _, _ = load_from_zip_file(path, device="cpu")
+        space = data["observation_space"]
+        try:
+            return int(space["observation"].shape[0])
+        except Exception:
+            return int(np.prod(getattr(space, "shape", [0]))) or None
+    except Exception:
+        return None
+
+
+def _migrate_checkpoint_dim(ppp_path: str, target_dim: int | None = None):
+    """Миграция чекпоинта на актуальный N_FEATURES через паддинг весов в zip.
+
+    Обобщено: раньше умела ровно 713->715, теперь определяет старую размерность из самих
+    весов и добивает до target_dim (по умолчанию N_FEATURES из config). Новые признаки
+    получают нулевые веса — модель стартует с того же поведения, что и раньше, и доучивает
+    вклад новых признаков (warm start вместо обучения с нуля).
+    """
     import torch
     import tempfile
     import os
-    OLD_N = 713
-    NEW_N = 715
-    print(f"  Миграция 713->715 для {ppp_path}...")
+    OLD_N = _checkpoint_obs_dim(ppp_path)
+    NEW_N = int(target_dim or N_FEATURES)
+    if OLD_N is not None and OLD_N == NEW_N:
+        print(f"  {ppp_path}: уже {NEW_N} признаков — миграция не нужна")
+        from stable_baselines3 import PPO as _PPO
+        return _PPO.load(ppp_path, device="cpu")
+    print(f"  Миграция {OLD_N}->{NEW_N} для {ppp_path}...")
     try:
         from stable_baselines3.common.save_util import load_from_zip_file, save_to_zip_file
         from gymnasium.spaces import Box, Dict
@@ -153,16 +183,18 @@ def _migrate_ppo_713_to_715(ppp_path: str):
         padded = 0
         for key in list(policy_state.keys()):
             tensor = policy_state[key]
-            if isinstance(tensor, torch.Tensor) and tensor.dim() == 2 and tensor.shape[1] == OLD_N and tensor.shape[0] == 512:
-                if "features_extractor" in key and "weight" in key:
-                    new_tensor = torch.zeros((tensor.shape[0], NEW_N), dtype=tensor.dtype, device=tensor.device)
-                    new_tensor[:, :OLD_N] = tensor
-                    # последние 2 колонки — нули (is_tera флаги)
-                    policy_state[key] = new_tensor
-                    padded += 1
-                    print(f"    паддинг {key} {list(tensor.shape)} -> {list(new_tensor.shape)}")
+            if (isinstance(tensor, torch.Tensor) and tensor.dim() == 2 and tensor.shape[0] == 512
+                    and "features_extractor" in key and "weight" in key and tensor.shape[1] != NEW_N):
+                old_cols = int(tensor.shape[1])
+                new_tensor = torch.zeros((tensor.shape[0], NEW_N), dtype=tensor.dtype, device=tensor.device)
+                new_tensor[:, :old_cols] = tensor
+                # новые колонки — нули: новые признаки на старте не влияют на политику
+                policy_state[key] = new_tensor
+                padded += 1
+                print(f"    паддинг {key} {list(tensor.shape)} -> {list(new_tensor.shape)} "
+                      f"(новые {NEW_N - old_cols} признаков с нулевыми весами)")
         if padded == 0:
-            print("    WARN: не нашёл весов [512,713] для паддинга — возможно уже 715 или другая архитектура")
+            print(f"    WARN: не нашёл весов [512, {OLD_N}] для паддинга — возможно другая архитектура")
 
         # обновляем observation_space в data если есть
         try:
@@ -170,7 +202,7 @@ def _migrate_ppo_713_to_715(ppp_path: str):
                 obs_space = data["observation_space"]
                 if hasattr(obs_space, "spaces") and "observation" in obs_space.spaces:
                     old_shape = obs_space.spaces["observation"].shape
-                    if old_shape == (OLD_N,):
+                    if old_shape != (NEW_N,):
                         am_space = obs_space.spaces.get("action_mask", Box(0, 1, shape=(9,), dtype=bool))
                         new_obs_space = Dict({"observation": Box(-1, 4, shape=(NEW_N,), dtype="float32"), "action_mask": am_space})
                         data["observation_space"] = new_obs_space
@@ -180,7 +212,7 @@ def _migrate_ppo_713_to_715(ppp_path: str):
 
         # сбрасываем optimizer state чтобы не тянуть 713 моменты
         if pytorch_variables is not None:
-            print("    сбрасываю optimizer state (713->715) — будет новый оптимизатор")
+            print(f"    сбрасываю optimizer state ({OLD_N}->{NEW_N}) — будет новый оптимизатор")
             pytorch_variables = None
 
         # сохраняем пропатченный чекпоинт во временный файл и грузим как обычный PPO
@@ -191,11 +223,11 @@ def _migrate_ppo_713_to_715(ppp_path: str):
             print(f"  Сохраняю пропатченный чекпоинт во временный файл {tmp_path}")
             ppo_new = PPO.load(tmp_path, device="cpu")
             print(f"  Успешно загрузил мигрированный PPO")
-            # критично: сбрасываем Adam моменты (713) — иначе exp_avg 713 vs grad 715 -> RuntimeError
+            # критично: сбрасываем Adam моменты старой размерности — иначе exp_avg old vs grad new -> RuntimeError
             try:
                 if hasattr(ppo_new, "policy") and hasattr(ppo_new.policy, "optimizer") and ppo_new.policy.optimizer is not None:
                     ppo_new.policy.optimizer.state.clear()
-                    print("    сбросил optimizer.state (713->715)")
+                    print(f"    сбросил optimizer.state ({OLD_N}->{NEW_N})")
             except Exception as _e:
                 print(f"    не удалось сбросить optimizer.state: {_e}")
             try:
@@ -337,21 +369,28 @@ def run(
     icm_module = None
 
     if resume_from:
-        try:
-            ppo = PPO.load(resume_from, device="cpu")
-        except RuntimeError as e:
-            if "713" in str(e) and "715" in str(e):
-                print(f"Старый снапшот {resume_from} с 713 признаками — мигрирую на 715...")
-                ppo = _migrate_ppo_713_to_715(resume_from)
-            else:
-                raise
-        except Exception as e:
-            # SB3 иногда оборачивает RuntimeError
-            if "713" in str(e) and "715" in str(e):
-                print(f"Старый снапшот {resume_from} с 713 признаками — мигрирую на 715...")
-                ppo = _migrate_ppo_713_to_715(resume_from)
-            else:
-                raise
+        # размерность чекпоинта против текущего N_FEATURES: если разошлась — паддинг весов
+        _resume_dim = _checkpoint_obs_dim(resume_from)
+        if _resume_dim is not None and _resume_dim != N_FEATURES:
+            print(f"Снапшот {resume_from}: {_resume_dim} признаков, сейчас {N_FEATURES} — "
+                  f"мигрирую (паддинг весов нулями + сброс optimizer state)...")
+            ppo = _migrate_checkpoint_dim(resume_from, target_dim=N_FEATURES)
+        else:
+            try:
+                ppo = PPO.load(resume_from, device="cpu")
+            except RuntimeError as e:
+                if "size mismatch" in str(e):
+                    print(f"Несовпадение размеров при загрузке {resume_from} — мигрирую...")
+                    ppo = _migrate_checkpoint_dim(resume_from, target_dim=N_FEATURES)
+                else:
+                    raise
+            except Exception as e:
+                # SB3 иногда оборачивает RuntimeError
+                if "size mismatch" in str(e):
+                    print(f"Несовпадение размеров при загрузке {resume_from} — мигрирую...")
+                    ppo = _migrate_checkpoint_dim(resume_from, target_dim=N_FEATURES)
+                else:
+                    raise
         if reset_schedules:
             print(f"Сбрасываю счетчики lr/ent: было {ppo.num_timesteps} шагов -> 0 (модель {resume_from})")
             steps_done_holder = {"value": 0}

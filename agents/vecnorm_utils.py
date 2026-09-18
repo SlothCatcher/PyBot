@@ -135,21 +135,69 @@ def load_vecnorm_stats(path: str, target_dim: int) -> Optional[VecNormStats]:
     return VecNormStats(st["mean"], st["var"], st["clip_obs"], st["epsilon"], target_dim=target_dim)
 
 
+def _load_vecnormalize_tolerant(vec_path: str, base_env, target_dim: int):
+    """VecNormalize из pkl с подгонкой obs_rms под target_dim.
+
+    Возвращает None, если штатный путь сработал или если что-то не получилось (тогда вызвать
+    обычный VecNormalize.load). Нужен из-за проверки shape внутри SB3.
+    """
+    import pickle
+
+    from stable_baselines3.common.vec_env import VecNormalize
+
+    with open(vec_path, "rb") as fh:
+        vec = pickle.load(fh)
+    if not isinstance(vec, VecNormalize):
+        return None
+    rms = vec.obs_rms["observation"] if isinstance(vec.obs_rms, dict) else vec.obs_rms
+    if rms is None:
+        return None
+    old_dim = int(np.asarray(rms.mean).shape[0])
+    if old_dim == target_dim:
+        return None  # размерности совпадают — можно штатным путём
+    new_mean, new_var, _ = pad_stats(rms.mean, rms.var, target_dim)
+    rms.mean = new_mean.astype(np.asarray(rms.mean).dtype)
+    rms.var = new_var.astype(np.asarray(rms.var).dtype)
+    print(f"  VecNormalize: obs_rms {old_dim} -> {target_dim} "
+          f"(новые признаки mean=0, var=1, count={getattr(rms, 'count', '?')})")
+    # venv из старого pickle мог сохраниться — set_venv требует пустой
+    try:
+        vec.venv = None
+    except Exception:
+        pass
+    # SB3 сверяет shape своего observation_space с env, поэтому приводим его заранее
+    try:
+        vec.observation_space = base_env.observation_space
+        vec.set_venv(base_env)
+    except Exception as e:
+        print(f"  VecNormalize: не удалось привязать env после паддинга статистики ({e})")
+        return None
+    return vec
+
+
 def load_vecnormalize_for_dim(vec_path: str, base_env, target_dim: int | None = None):
     """SB3 VecNormalize с подгонкой obs_rms под целевую размерность (для обучения/resume).
 
     Заменяет частную миграцию 713->715: работает с любой старой размерностью (418, 713, ...).
+
+    Тонкость: `VecNormalize.load(path, env)` падает, если размерность статистики в pkl не
+    совпадает с env (SB3 сверяет shape и бросает AssertionError), поэтому при расхождении
+    читаем pickle сами, правим статистику и только потом привязываем env.
     """
     from stable_baselines3.common.vec_env import VecNormalize
 
-    vec = VecNormalize.load(vec_path, base_env)
+    if target_dim is None:
+        try:
+            target_dim = int(base_env.observation_space["observation"].shape[0])
+        except Exception:
+            target_dim = None
+
+    vec = None
+    if target_dim is not None:
+        vec = _load_vecnormalize_tolerant(vec_path, base_env, int(target_dim))
+    if vec is None:
+        vec = VecNormalize.load(vec_path, base_env)
     try:
-        if target_dim is None:
-            space = getattr(base_env, "observation_space", None)
-            try:
-                target_dim = space["observation"].shape[0]  # type: ignore[index]
-            except Exception:
-                target_dim = None
         rms = vec.obs_rms["observation"] if isinstance(vec.obs_rms, dict) else vec.obs_rms
         old_mean = np.asarray(rms.mean)
         if target_dim is not None and old_mean.shape[0] != int(target_dim):

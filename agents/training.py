@@ -1096,6 +1096,43 @@ def evaluate_win_rates(ppo, n_battles: int = 180) -> dict[str, float]:
             rates[key] = round(100 * opp.n_lost_battles / opp.n_finished_battles, 1)
     return rates
 
+def _pad_obs_to_features(obs_arr, target_dim: int, *, label: str = "датасет",
+                         memmap_threshold: int = 200_000):
+    """Добивает obs старого датасета нулями до target_dim (новые признаки = «нет информации»).
+
+    Датасеты на 3.6GB пересобирать часами, а новые признаки урона в старых записях просто
+    отсутствуют; нули для них — корректная семантика «неизвестно», и модель их игнорирует,
+    пока не обучится на свежих данных.
+    """
+    import numpy as _np
+
+    old_dim = int(obs_arr.shape[1])
+    if old_dim == int(target_dim):
+        return obs_arr
+    if old_dim > int(target_dim):
+        print(f"BC: {label} шире текущих признаков ({old_dim} > {target_dim}) — обрезаю хвост")
+        return _np.ascontiguousarray(obs_arr[:, :int(target_dim)])
+    n = int(obs_arr.shape[0])
+    print(f"BC: {label} старой размерности ({old_dim} < {target_dim}) — добиваю нулями "
+          f"({int(target_dim) - old_dim} новых признаков)")
+    if n > int(memmap_threshold):
+        import tempfile as _tempfile
+        tmp = _tempfile.NamedTemporaryFile(suffix=".npy", delete=False)
+        tmp.close()
+        out = _np.lib.format.open_memmap(tmp.name, mode="w+", dtype=_np.float32,
+                                         shape=(n, int(target_dim)))
+        chunk = 50_000
+        for s in range(0, n, chunk):
+            e = min(s + chunk, n)
+            out[s:e] = 0.0
+            out[s:e, :old_dim] = _np.asarray(obs_arr[s:e], dtype=_np.float32)
+        out.flush()
+        return out
+    out = _np.zeros((n, int(target_dim)), dtype=_np.float32)
+    out[:, :old_dim] = _np.asarray(obs_arr, dtype=_np.float32)
+    return out
+
+
 def pretrain_policy_bc(
     ppo: PPO, dataset, epochs: int = 50, batch_size: int = 256,
     normalize: bool = False, value_coef: float = 0.0, val_frac: float = 0.1,
@@ -1118,8 +1155,7 @@ def pretrain_policy_bc(
         dataset_len = int(obs_arr.shape[0])
         # проверим dim
         from .config import N_FEATURES
-        if obs_arr.shape[1] != N_FEATURES:
-            raise ValueError(f"BC obs dim {obs_arr.shape[1]} != N_FEATURES {N_FEATURES}. Пересоберите датасет или обновите config.")
+        obs_arr = _pad_obs_to_features(obs_arr, N_FEATURES)
         # normalize
         n = dataset_len
         # делаем пермутацию без копирования всего массива в RAM? используем индексы
@@ -1140,8 +1176,7 @@ def pretrain_policy_bc(
             dataset_len = len(dataset)
             is_mmap = True
             from .config import N_FEATURES
-            if obs_arr.shape[1] != N_FEATURES:
-                raise ValueError(f"BC obs dim {obs_arr.shape[1]} != N_FEATURES {N_FEATURES}. Пересоберите датасет или обновите config.")
+            obs_arr = _pad_obs_to_features(obs_arr, N_FEATURES)
             n = dataset_len
         else:
             # обычный list
@@ -1155,8 +1190,7 @@ def pretrain_policy_bc(
             action_arr = np.array([d[2] for d in dataset], dtype=np.int64)
             return_arr = np.array([d[3] for d in dataset], dtype=np.float32)
             from .config import N_FEATURES
-            if obs_arr.shape[1] != N_FEATURES:
-                raise ValueError(f"BC obs dim {obs_arr.shape[1]} != N_FEATURES {N_FEATURES}. Пересоберите датасет или обновите config.")
+            obs_arr = _pad_obs_to_features(obs_arr, N_FEATURES)
             n = len(dataset)
             is_mmap = False
             dataset_len = n

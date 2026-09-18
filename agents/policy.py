@@ -20,7 +20,7 @@ from .config import N_FEATURES
 
 
 class FeaturesExtractor(BaseFeaturesExtractor):
-    """Нормализует 715 признаков перед pi/vf головами. features_dim=512."""
+    """Нормализует N_FEATURES признаков (сейчас 802) перед pi/vf головами. features_dim=512."""
     def __init__(self, observation_space, features_dim: int = 512, dropout: float = 0.1):
         super().__init__(observation_space, features_dim=features_dim)
         self.net = nn.Sequential(
