@@ -12,7 +12,7 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.monitor import Monitor
 
 from .config import BATTLE_FORMAT, N_FEATURES, QUALIFIED_PREFIX
-from .features import embed_battle_with_fusion
+from .features import _move_wasted_flag, embed_battle_with_fusion
 from .fusion_parser import _attach_fusion_parser
 from .players import PolicyPlayer
 
@@ -52,6 +52,10 @@ HEAL_BONUS = 0.08
 HEAL_WASTED_PENALTY = 0.06
 SHAPING_EPISODE_CAP = 12.0         # макс суммарный shaping за бой (меньше victory 30)
 SHAPING_STEP_CLIP = 0.50           # клип на ход (было 2.0) — ещё сильнее жмём одиночный всплеск
+WASTED_MOVE_PENALTY = 0.06       # универсальный штраф за любой wasted приём (если ещё не наказан спецификой)
+WASTED_MOVE_IDS_SKIP = {"sunnyday","raindance","sandstorm","snowscape","chillyreception","electricterrain","grassyterrain","mistyterrain","psychicterrain","substitute","leechseed"}  # уже есть специфика
+WEATHER_MOVE_IDS = {"sunnyday","raindance","sandstorm","snowscape","chillyreception"}
+TERRAIN_MOVE_IDS = {"electricterrain","grassyterrain","mistyterrain","psychicterrain"}
 STATUS_IMMUNE_TYPES = {
     "par": ["electric", "ground"],
     "brn": ["fire"],
@@ -122,6 +126,10 @@ class ExampleEnv(SinglesEnv):
         _attach_fusion_parser(self.agent2)
         # для dense награды: храним предыдущее состояние по battle_tag
         self._reward_state: dict[str, dict] = {}
+        # для generic wasted — помним последний ход (move id) чтобы штрафовать любой wasted (если нет специфики)
+        self._last_move_id: dict[str, str] = {}
+        self._last_wasted: dict[str, bool] = {}
+        self._last_was_switch: dict[str, bool] = {}
 
     @classmethod
     def create_env(cls, opponent_weights: dict[str, float] | None = None) -> Monitor:
@@ -514,6 +522,10 @@ class ExampleEnv(SinglesEnv):
                     "has_sub": curr_has_sub,
                     "opp_has_leech": curr_opp_has_leech,
                     "has_leech": curr_has_leech,
+                    "_last_switch_delta_dmg": None,
+                    "_last_switch_new_mult": None,
+                    "_last_switch_prev_mult": None,
+                    "_last_switch_prev_dmg": None,
                     "extra_accum": 0.0,  # для per-episode бюджета
                 }
                 return base - 0.02
@@ -675,7 +687,18 @@ class ExampleEnv(SinglesEnv):
                             extra += SWITCH_BONUS
                     # также небольшой бонус если вообще сменили на более толстый резист (с учётом DEF/SPD)
                     elif delta_dmg > 0.4:
-                        extra += 0.2
+                        extra += 0.05  # было 0.2 -> сжали до 0.05 чтобы не ломать бюджет 12
+                    # сохраняем дельту свитча в локальные переменные для последующего tera-блока (избегаем locals() хак)
+                    try:
+                        _last_switch_delta_dmg = float(delta_dmg)
+                        _last_switch_new_mult = float(new_mult)
+                        _last_switch_prev_mult = float(prev_mult)
+                        _last_switch_prev_dmg = float(prev_dmg)
+                    except Exception:
+                        _last_switch_delta_dmg = None
+                        _last_switch_new_mult = None
+                        _last_switch_prev_mult = None
+                        _last_switch_prev_dmg = None
 
             # штраф за урон от хазардов при свитче (дополнительно к dmg_taken, который уже учтён)
             if was_switch and own_haz > 0.01:
@@ -703,45 +726,92 @@ class ExampleEnv(SinglesEnv):
             except Exception:
                 pass
 
-            # удачный тера (смена типа дала резист или добила)
+            # удачный тера (смена типа дала резист или добила) — без locals() хака
             try:
                 prev_is_tera = bool(prev.get("is_tera", False))
                 if not prev_is_tera and curr_is_tera:
                     opp_fainted_now = curr_opp_hp == 0 and prev.get("opp_hp", 0) > 0.2
+                    # достаём сохранённые значения свитча если были, иначе считаем заново для теры
+                    # проверяем дельту текущего свитча (если свитч+тера в один ход) иначе берём из prev
+                    cur_delta = locals().get("_last_switch_delta_dmg", None)
+                    if isinstance(cur_delta, (int,float)):
+                        stored_delta = cur_delta
+                        stored_new_mult = locals().get("_last_switch_new_mult", None)
+                        stored_prev_mult = locals().get("_last_switch_prev_mult", None)
+                        stored_prev_dmg = locals().get("_last_switch_prev_dmg", None)
+                    else:
+                        stored_delta = prev.get("_last_switch_delta_dmg") if isinstance(prev.get("_last_switch_delta_dmg"), (int,float)) else None
+                        stored_new_mult = prev.get("_last_switch_new_mult")
+                        stored_prev_mult = prev.get("_last_switch_prev_mult")
+                        stored_prev_dmg = prev.get("_last_switch_prev_dmg")
+                    # если свитча не было — считаем оценку урона теры отдельно (без свитча: до теры vs после)
+                    # упрощённо: если после теры мы получили меньше урона чем до — бонус, но без сложной оценки просто проверяем смену имуна
                     if opp_fainted_now:
-                        dmg_before = prev_dmg if 'prev_dmg' in locals() else 1.0
-                        # если до теры урон был бы не гарантированно летальным (<1.5) — полный бонус, иначе малый
+                        # пытаемся оценить был ли килл возможен без теры — если prev_dmg <1.5, то тера критична
+                        try:
+                            # оцениваем урон оппа по нам до/после — если нет stored, считаем по текущему оппу
+                            if stored_delta is None:
+                                dmg_before = 1.0
+                            else:
+                                dmg_before = float(stored_prev_dmg or 1.0) if stored_prev_dmg is not None else 1.0
+                        except Exception:
+                            dmg_before = 1.0
                         if dmg_before < 1.5:
                             extra += TERA_BONUS
                         else:
                             extra += 0.15
                     else:
-                        # без убийства — проверяем снижение входящего урона от теры
-                        # delta_dmg уже есть если был свитч+тера, иначе считаем заново
-                        has_delta = 'delta_dmg' in locals() and delta_dmg > 0.6
-                        has_immune = 'new_mult' in locals() and new_mult == 0 and prev_mult != 0
+                        # без убийства — проверяем снижение входящего урона от теры (иммун/резист)
+                        has_delta = stored_delta is not None and stored_delta > 0.6
+                        has_immune = stored_new_mult == 0 and stored_prev_mult not in (None, 0)
                         if has_delta or has_immune:
                             extra += TERA_BONUS
             except Exception:
                 pass
 
-            # погода — только если в команде есть синергия (как просил)
+            # погода — только если в команде есть синергия + только если погоду ставили МЫ (last move == weather), иначе игнор (может поставил опп)
             try:
                 prev_weather = prev.get("weather", None)
                 if prev_weather is None and curr_weather is not None:
-                    if self._team_has_weather_synergy(battle.team, curr_weather):
-                        extra += WEATHER_BONUS
+                    last_id = self._last_move_id.get(tag, "")
+                    is_our_weather = last_id in WEATHER_MOVE_IDS
+                    # также считаем погоду от абилки при свитче (Drought/Drizzle и т.п.) — если свитч и синергия есть, тоже наградим
+                    if not is_our_weather and self._last_was_switch.get(tag, False):
+                        try:
+                            new_active = battle.active_pokemon
+                            ab = str(getattr(new_active, "ability", "") or "").lower().replace(" ","").replace("-","")
+                            if ab in ("drought","drizzle","sandstream","snowwarning","orichalcumpulse","hadronengine"):
+                                is_our_weather = True
+                        except Exception:
+                            pass
+                    if is_our_weather:
+                        if self._team_has_weather_synergy(battle.team, curr_weather):
+                            extra += WEATHER_BONUS
+                        else:
+                            extra -= 0.04
                     else:
-                        extra -= 0.04
+                        # погоду поставил опп — не трогаем (не наша заслуга/вина)
+                        pass
             except Exception:
                 pass
             try:
                 prev_field = prev.get("field", None)
                 if prev_field is None and curr_field is not None:
-                    if self._team_has_terrain_synergy(battle.team, curr_field):
-                        extra += TERRAIN_BONUS
-                    else:
-                        extra -= 0.03
+                    last_id = self._last_move_id.get(tag, "")
+                    is_our_terrain = last_id in TERRAIN_MOVE_IDS
+                    if not is_our_terrain and self._last_was_switch.get(tag, False):
+                        try:
+                            new_active = battle.active_pokemon
+                            ab = str(getattr(new_active, "ability", "") or "").lower().replace(" ","").replace("-","")
+                            if ab in ("electricsurge","grassysurge","psychicsurge","mistysurge","hadronengine"):
+                                is_our_terrain = True
+                        except Exception:
+                            pass
+                    if is_our_terrain:
+                        if self._team_has_terrain_synergy(battle.team, curr_field):
+                            extra += TERRAIN_BONUS
+                        else:
+                            extra -= 0.03
             except Exception:
                 pass
             try:
@@ -764,11 +834,56 @@ class ExampleEnv(SinglesEnv):
             except Exception:
                 pass
             try:
+                # heal только если последний ход был хилом — иначе это пассивы (Leftovers/Grassy) и не даём бонуса/штрафа
+                last_id = self._last_move_id.get(tag, "")
+                # считаем хил-приёмами те что дают heal>0 или drain>0 (покрываем Recover, Roost, Slack Off, Synthesis и т.д.)
+                is_heal_move = False
+                try:
+                    # быстрый чек по id
+                    if last_id in ("recover","roost","softboiled","morningsun","moonlight","synthesis","healorder","slackoff","milkdrink","swallow","rest","shoreup","strengthsap","wish","healingwish","lunardance","purify","lifedew","junglehealing"):
+                        is_heal_move = True
+                    else:
+                        # fallback через _move_heal_pct если вдруг другой хил (например Drain)
+                        # Draining moves (Giga Drain) тоже хилят но наносимый урон уже наградили, дополнительно не бафаем
+                        pass
+                except Exception:
+                    pass
                 heal_amount = curr_own_hp - prev.get("own_hp", curr_own_hp)
-                if heal_amount > 0.12 and prev.get("own_hp", 1.0) < 0.90:
-                    extra += HEAL_BONUS
-                elif heal_amount > 0.05 and prev.get("own_hp", 1.0) >= 0.95:
-                    extra -= HEAL_WASTED_PENALTY
+                if is_heal_move:
+                    if heal_amount > 0.12 and prev.get("own_hp", 1.0) < 0.90:
+                        extra += HEAL_BONUS
+                    elif heal_amount <= 0.02 and prev.get("own_hp", 1.0) < 0.95:
+                        # хил-приём не схилял (heal_amount ~0) — wasted (например заблокирован Heal Block)
+                        extra -= HEAL_WASTED_PENALTY
+                    elif heal_amount > 0.05 and prev.get("own_hp", 1.0) >= 0.95:
+                        extra -= HEAL_WASTED_PENALTY
+                else:
+                    # не хил-приём — игнор пассивного хила
+                    pass
+            except Exception:
+                pass
+
+            # универсальный штраф за любой wasted приём, если ещё не наказан спецификой (просьба: "штраф за wasted для любого приёма в принципе, если его нет")
+            try:
+                was_wasted = bool(self._last_wasted.get(tag, False))
+                last_id = self._last_move_id.get(tag, "")
+                # если уже есть специфика для этого id — не дублируем (иначе double penalty)
+                is_specific = last_id in WASTED_MOVE_IDS_SKIP
+                # heal тоже специфика, но мы её уже через is_heal_move отделили — если хил, то is_specific считаем True чтобы не дублить
+                try:
+                    if last_id in ("recover","roost","softboiled","morningsun","moonlight","synthesis","healorder","slackoff","milkdrink","swallow","rest","shoreup","strengthsap","wish"):
+                        is_specific = True
+                except Exception:
+                    pass
+                # также статус/скрин/хазард wasted уже ловятся _move_wasted_flag, но для них специфика внутри flag, а отдельной награды нет -> generic должен сработать
+                # поэтому для хазардов/скринов/статуса is_specific=False и generic применится — это и нужно
+                if was_wasted and not is_specific and not self._last_was_switch.get(tag, False):
+                    extra -= WASTED_MOVE_PENALTY
+                # чистим флаг чтобы не наказывать повторно за тот же ход (если calc_reward вызовется дважды без action_to_order)
+                # не чистим сразу, а оставим до следующего action_to_order — но чтобы не двойной штраф при повторном calc без нового хода, сбрасываем после применения
+                if was_wasted:
+                    # Одноразовый штраф: после применения сбрасываем, чтобы следующий calc без нового хода не штрафовал снова
+                    self._last_wasted[tag] = False
             except Exception:
                 pass
 
@@ -814,6 +929,10 @@ class ExampleEnv(SinglesEnv):
                 "has_sub": curr_has_sub,
                 "opp_has_leech": curr_opp_has_leech,
                 "has_leech": curr_has_leech,
+                "_last_switch_delta_dmg": locals().get("_last_switch_delta_dmg", None),
+                "_last_switch_new_mult": locals().get("_last_switch_new_mult", None),
+                "_last_switch_prev_mult": locals().get("_last_switch_prev_mult", None),
+                "_last_switch_prev_dmg": locals().get("_last_switch_prev_dmg", None),
                 "extra_accum": float(new_accum),
             }
 
@@ -821,10 +940,13 @@ class ExampleEnv(SinglesEnv):
             # не роняем шаг из-за награды
             pass
         finally:
-            # чистим завершённые бои даже если выше был exception (фикс утечки)
+            # чистим завершённые бои даже если выше был exception (фикс утечки) — также чистим wasted-кэш
             try:
                 if getattr(battle, "finished", False):
                     self._reward_state.pop(tag, None)
+                    self._last_wasted.pop(tag, None)
+                    self._last_move_id.pop(tag, None)
+                    self._last_was_switch.pop(tag, None)
             except Exception:
                 pass
 
@@ -835,6 +957,65 @@ class ExampleEnv(SinglesEnv):
         if sum(mask) == 0:
             from poke_env.player import DefaultBattleOrder
             return DefaultBattleOrder()
+        # запоминаем wasted-флаг для универсального штрафа (если приёма нет в специфике — накажем generic)
+        try:
+            tag = getattr(battle, "battle_tag", "") or "unknown"
+            moves = list(getattr(battle, "available_moves", []) or [])
+            # poke_env: action < len(moves) -> move, иначе switch
+            if isinstance(action, (int,)) or hasattr(action, "item"):
+                try:
+                    act_int = int(action.item()) if hasattr(action, "item") else int(action)
+                except Exception:
+                    act_int = int(action)
+            else:
+                act_int = int(action)
+            if act_int < len(moves):
+                move = moves[act_int]
+                mid = str(getattr(move, "id", "") or "").lower()
+                self._last_move_id[tag] = mid
+                self._last_was_switch[tag] = False
+                try:
+                    flag = bool(_move_wasted_flag(move, battle))
+                    # дополнительно: типовая иммуннасть (0 урона) тоже wasted — _move_wasted_flag её не ловит (только абилки)
+                    if not flag and battle.opponent_active_pokemon is not None and getattr(move, "type", None) is not None:
+                        try:
+                            # статус-приёмы не считаем (base_power 0)
+                            bp = getattr(move, "base_power", 0) or 0
+                            if bp == 0:
+                                entry = getattr(move, "entry", {}) or {}
+                                bp = entry.get("basePower", 0) or entry.get("base_power", 0) or 0
+                            if bp and bp >= 10:
+                                mtype = getattr(move, "type", None)
+                                opp = battle.opponent_active_pokemon
+                                try:
+                                    mult = mtype.damage_multiplier(opp.type_1, opp.type_2)
+                                except Exception:
+                                    try:
+                                        from poke_env.data import GenData as GD
+                                        chart = GD.from_gen(9).type_chart
+                                        mult = mtype.damage_multiplier(opp.type_1, opp.type_2, type_chart=chart)
+                                    except Exception:
+                                        mult = 1.0
+                                if mult == 0:
+                                    flag = True
+                        except Exception:
+                            pass
+                except Exception:
+                    flag = False
+                self._last_wasted[tag] = flag
+            else:
+                # switch
+                try:
+                    # для свитча храним id вида switch:xxx
+                    switches = list(getattr(battle, "available_switches", []) or [])
+                    # action - len(moves) индекс свитча, но нам достаточно факта свитча
+                    self._last_move_id[tag] = "switch"
+                except Exception:
+                    self._last_move_id[tag] = "switch"
+                self._last_was_switch[tag] = True
+                self._last_wasted[tag] = False
+        except Exception:
+            pass
         return super().action_to_order(action, battle, fake=fake, strict=strict)
 
     def embed_battle(self, battle: AbstractBattle):

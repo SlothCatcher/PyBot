@@ -913,6 +913,27 @@ def _move_wasted_flag(move, battle) -> float:
     if opp is not None and opp.item == "airballoon" and move.type is not None:
         if move.type.name.lower() == "ground":
             return 1.0
+    # типовая иммуннасть (0 урона) — тоже wasted для дамажных приёмов (Earthquake vs Flying и т.д.)
+    try:
+        if opp is not None and move.type is not None:
+            bp = getattr(move, "base_power", 0) or 0
+            if bp == 0:
+                entry = getattr(move, "entry", {}) or {}
+                bp = entry.get("basePower", 0) or entry.get("base_power", 0) or 0
+            if bp and bp >= 10:
+                try:
+                    mult = move.type.damage_multiplier(opp.type_1, opp.type_2)
+                except Exception:
+                    try:
+                        from poke_env.data import GenData as GD
+                        chart = GD.from_gen(9).type_chart
+                        mult = move.type.damage_multiplier(opp.type_1, opp.type_2, type_chart=chart)
+                    except Exception:
+                        mult = 1.0
+                if mult == 0:
+                    return 1.0
+    except Exception:
+        pass
     return 0.0
 
 
