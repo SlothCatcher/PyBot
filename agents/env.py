@@ -791,16 +791,18 @@ class ExampleEnv(SinglesEnv):
                         for mon in battle.team.values():
                             if str(getattr(mon, "species","")).lower() == prev_mon_species.lower():
                                 ab = str(getattr(mon, "ability","") or "").lower().replace(" ","").replace("-","")
-                                if ab in ("naturalcure","shedskin","hydration"):
+                                if ab in ("naturalcure",):
                                     _is_natural_cure = True
                                     break
                         # Hydration только если дождь — но упростим: засчитаем
                     except Exception:
                         pass
-                if prev_status is not None and curr_status is None and curr_own_hp > 0.05:
-                    if not _was_switch_for_cure and prev.get("active_species","") == curr_active_species:
+                if prev_status is not None and curr_own_hp > 0.05:
+                    if not _was_switch_for_cure and curr_status is None and prev.get("active_species","") == curr_active_species:
+                        # Heal Bell / Aromatherapy на том же покемоне — вылечили
                         extra += STATUS_CURE_BONUS
                     elif _was_switch_for_cure and _is_natural_cure:
+                        # Natural Cure: не важно на кого меняемся, статус снимается при уходе (даже если новый тоже статуснутый — бонус всё равно)
                         extra += STATUS_CURE_BONUS
             except Exception:
                 pass
