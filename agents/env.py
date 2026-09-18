@@ -201,12 +201,13 @@ class ExampleEnv(SinglesEnv):
         else:
             return 2 / (2 - stage)
 
-    def _estimate_max_damage(self, attacker, defender, use_mult_only: bool = False) -> float:
+    def _estimate_max_damage(self, attacker, defender, use_mult_only: bool = False, attacker_fusion: dict | None = None, defender_fusion: dict | None = None) -> float:
         """
         Оценка макс урона атакующего по защитнику 0..~4 (нормирована).
         Если use_mult_only=True — только по типам (старый путь, для совместимости).
         Иначе: base_power * mult / defense_stat * attack_stat с учётом категории и бустов.
         Для статуса (base_power 0) — не считаем.
+        Статы берутся из таблицы в чате (fusion) если найдена, иначе стандартные — как просил.
         """
         if attacker is None or defender is None:
             return 1.0
@@ -284,22 +285,27 @@ class ExampleEnv(SinglesEnv):
                         continue
 
                     # статы + бусты
-                    # base_stats может быть None для незаконченных покемонов — fallback 80
-                    def _get_base(mon, stat):
+                    # base_stats берём из таблицы в чате (fusion) если найдена, иначе стандартные — как просил
+                    def _get_base(mon, stat, fusion):
                         try:
+                            if fusion and "base_stats" in fusion:
+                                bs = fusion["base_stats"]
+                                v = bs.get(stat, bs.get(stat.upper(), None))
+                                if v is not None:
+                                    return float(v)
                             bs = getattr(mon, "base_stats", {}) or {}
                             v = bs.get(stat, bs.get(stat.upper(), 80)) or 80
                             return float(v)
                         except Exception:
                             return 80.0
                     if is_physical:
-                        atk_stat = _get_base(attacker, "atk")
-                        def_stat = _get_base(defender, "def")
+                        atk_stat = _get_base(attacker, "atk", attacker_fusion)
+                        def_stat = _get_base(defender, "def", defender_fusion)
                         atk_boost = getattr(attacker, "boosts", {}).get("atk", 0) if getattr(attacker, "boosts", None) else 0
                         def_boost = getattr(defender, "boosts", {}).get("def", 0) if getattr(defender, "boosts", None) else 0
                     else:
-                        atk_stat = _get_base(attacker, "spa")
-                        def_stat = _get_base(defender, "spd")
+                        atk_stat = _get_base(attacker, "spa", attacker_fusion)
+                        def_stat = _get_base(defender, "spd", defender_fusion)
                         atk_boost = getattr(attacker, "boosts", {}).get("spa", 0) if getattr(attacker, "boosts", None) else 0
                         def_boost = getattr(defender, "boosts", {}).get("spd", 0) if getattr(defender, "boosts", None) else 0
 
@@ -425,9 +431,44 @@ class ExampleEnv(SinglesEnv):
                 new_mon = battle.active_pokemon
                 opp_mon = battle.opponent_active_pokemon
                 if prev_mon is not None and new_mon is not None and opp_mon is not None:
+                    # берём таблицы статов из чата (fusion) если есть, иначе стандартные — как просил
+                    try:
+                        if self.battle1 is not None and getattr(battle, "battle_tag", None) == getattr(self.battle1, "battle_tag", None):
+                            src = self.agent1
+                        elif self.battle2 is not None and getattr(battle, "battle_tag", None) == getattr(self.battle2, "battle_tag", None):
+                            src = self.agent2
+                        else:
+                            src = self.agent1 if getattr(battle, "player_role", "p1") == "p1" else self.agent2
+                        tag_fs = getattr(battle, "battle_tag", "")
+                        our_side_fs = getattr(battle, "player_role", "p1")
+                        opp_side_fs = "p2" if our_side_fs == "p1" else "p1"
+                        our_by_species = src._fusion_stats.get(tag_fs, {}).get(f"{our_side_fs}_by_species", {}) if hasattr(src, "_fusion_stats") else {}
+                        opp_by_species = src._fusion_stats.get(tag_fs, {}).get(f"{opp_side_fs}_by_species", {}) if hasattr(src, "_fusion_stats") else {}
+                        our_active_fusion = src._fusion_stats.get(tag_fs, {}).get(our_side_fs) if hasattr(src, "_fusion_stats") else None
+                        opp_active_fusion = src._fusion_stats.get(tag_fs, {}).get(opp_side_fs) if hasattr(src, "_fusion_stats") else None
+                        def _fusion_for(mon, is_opp):
+                            try:
+                                from poke_env.data.normalize import to_id_str
+                                sid = to_id_str(getattr(mon, "species", "") or getattr(mon, "base_species", ""))
+                                m = opp_by_species if is_opp else our_by_species
+                                f = m.get(sid) if m else None
+                                if f:
+                                    return f
+                                if mon is opp_mon and opp_active_fusion:
+                                    return opp_active_fusion
+                                if (mon is new_mon or mon is prev_mon) and mon is not None and getattr(mon, "active", False) and our_active_fusion:
+                                    return our_active_fusion
+                                return f
+                            except Exception:
+                                return None
+                        prev_fusion = _fusion_for(prev_mon, False)
+                        new_fusion = _fusion_for(new_mon, False)
+                        opp_fusion = _fusion_for(opp_mon, True)
+                    except Exception:
+                        prev_fusion = new_fusion = opp_fusion = None
                     # считаем урон с учётом DEF/SPD и категории приёма (а не только типы)
-                    prev_dmg = self._estimate_max_damage(opp_mon, prev_mon)
-                    new_dmg = self._estimate_max_damage(opp_mon, new_mon)
+                    prev_dmg = self._estimate_max_damage(opp_mon, prev_mon, attacker_fusion=opp_fusion, defender_fusion=prev_fusion)
+                    new_dmg = self._estimate_max_damage(opp_mon, new_mon, attacker_fusion=opp_fusion, defender_fusion=new_fusion)
                     # для логов/порогов оставим и чистый mult (для иммун проверки)
                     prev_mult = self._estimate_max_damage(opp_mon, prev_mon, use_mult_only=True)
                     new_mult = self._estimate_max_damage(opp_mon, new_mon, use_mult_only=True)
