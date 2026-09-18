@@ -58,10 +58,20 @@ _DEBUG = os.environ.get("PYBOT_DEBUG_TYPES", "").strip().lower() not in ("", "0"
 _chart_cache: dict[int, dict] = {}
 
 _counts: dict[str, Counter] = {
-    "unknown_def_type": Counter(),   # у защиты реально неизвестный тип
-    "masked_immunity": Counter(),    # старый патч вернул бы 1.0 вместо иммунитета 0.0
-    "keyerror": Counter(),           # сырой KeyError из оригинального poke-env
-    "typechange_raw": Counter(),     # сырые -start|typechange от сервера (только debug)
+    "unknown_def_type": Counter(),        # у защиты реально неизвестный тип
+    "masked_immunity": Counter(),         # старый патч вернул бы 1.0 вместо иммунитета 0.0
+    "keyerror": Counter(),                # сырой KeyError из оригинального poke-env
+    "typechange_raw": Counter(),          # сырые -start|typechange от сервера (только debug)
+    "typechange_after_request": Counter(),# typechange пришёл ПОСЛЕ |request| в батче (гонка)
+    "typechange_reordered": Counter(),    # батч переставлен: typechange перед |request|
+}
+# сколько уникальных строк печатать на вид события (чтобы не залить лог)
+_PRINT_LIMIT = {
+    "unknown_def_type": 8,
+    "masked_immunity": 8,
+    "keyerror": 3,
+    "typechange_after_request": 3,
+    "typechange_reordered": 3,
 }
 
 
@@ -89,11 +99,14 @@ def get_type_chart(gen: int = 9) -> dict:
     return _chart_cache[gen]
 
 
-def _note(kind: str, key: str, limit_unique: int = 8) -> None:
-    """Считает событие; первое уникальное событие печатает (кроме сырых сообщений — они под debug)."""
+def _note(kind: str, key: str, limit_unique: int | None = None) -> None:
+    """Считает событие; печатает первое уникальное (с ограничением на число строк)."""
     c = _counts.setdefault(kind, Counter())
     c[key] += 1
     if c[key] != 1:
+        return
+    limit = _PRINT_LIMIT.get(kind, limit_unique if limit_unique is not None else 8)
+    if sum(c.values()) > limit:
         return
     if kind == "typechange_raw" and not _DEBUG:
         return
@@ -103,6 +116,8 @@ def _note(kind: str, key: str, limit_unique: int = 8) -> None:
         print(f"[type-fix] KeyError в damage_multiplier (пойман фабрикой): {key}")
     elif kind == "unknown_def_type":
         print(f"[type-fix] неизвестный тип у защиты: {key}")
+    elif kind == "typechange_reordered":
+        print(f"[type-fix] typechange перенесён перед |request| ({key}) — иначе решение ушло бы со старым типом")
     elif kind == "typechange_raw":
         print(f"[type-debug] typechange от сервера: {key}")
 
@@ -176,9 +191,16 @@ def note_keyerror(self_type: Any, type_1: Any, type_2: Any, err: BaseException) 
     _note("keyerror", f"{_type_name(self_type)} vs {_type_name(type_1)}/{_type_name(type_2)}: {err}")
 
 
-def note_typechange_raw(message: str) -> None:
+def note_typechange_raw(message: str, after_request: bool = False) -> None:
     """Сырое `-start|typechange` сообщение (для выяснения, что присылает сервер)."""
     _note("typechange_raw", message)
+    if after_request:
+        # в батче |request| идёт раньше typechange → poke-env применил бы его только ПОСЛЕ решения
+        _note("typechange_after_request", message)
+
+
+def note_typechange_reordered(signature: str) -> None:
+    _note("typechange_reordered", signature)
 
 
 def summary() -> str:
