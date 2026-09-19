@@ -123,8 +123,10 @@ class VecNormStats:
         self.source_dim = int(source_dim if source_dim is not None else np.asarray(mean).size)
         self.target_dim = int(target_dim) if target_dim is not None else self.source_dim
         m, v, self.migrated = pad_stats(mean, var, self.target_dim)
-        self.mean = m.astype(np.float32)
-        self.var = v.astype(np.float32)
+        # float64 как в SB3 RunningMeanStd: float32 в mean/var усиливал ошибку на столбцах
+        # с малой дисперсией (÷sqrt(var)) и инференс расходился с обучением на ~1e-5
+        self.mean = np.asarray(m, dtype=np.float64)
+        self.var = np.asarray(v, dtype=np.float64)
 
     @property
     def ready(self) -> bool:
