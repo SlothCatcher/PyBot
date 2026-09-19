@@ -44,6 +44,10 @@ class StepCounterCallback:
                      "gimmick": 0, "other": 0, "single": 0, "choice": 0}
         self._mix_next = self.mix_every
         self._mask_shape_warned = False
+        # Curiosity (--icm): wrapper кладёт r_int/beta/r_int_episode в infos. Собираем здесь,
+        # чтобы видеть в логе/TB, не перевешивает ли intrinsic плотный shaping
+        # (SHAPING_EPISODE_CAP=12 вводился именно против такого перевеса).
+        self._curiosity = {"n": 0, "r_int_sum": 0.0, "beta": None, "ep_max": 0.0, "episodes": 0}
 
     @staticmethod
     def classify_action(action: int) -> str:
@@ -125,6 +129,22 @@ class StepCounterCallback:
                               f"[mix] не сможет отделить вынужденные свитчи")
                     rows = None
                 single, no_moves = rows if rows is not None else (None, None)
+                # curiosity-метрики из infos (есть только при --icm)
+                infos = _locals.get("infos") if isinstance(_locals, dict) else None
+                if isinstance(infos, (list, tuple)) and infos:
+                    cur = self._curiosity
+                    for info in infos:
+                        if not isinstance(info, dict):
+                            continue
+                        if "r_int" in info:
+                            cur["n"] += 1
+                            cur["r_int_sum"] += float(info["r_int"])
+                            if "beta" in info:
+                                cur["beta"] = float(info["beta"])
+                        if "r_int_episode" in info:
+                            cur["episodes"] += 1
+                            cur["ep_max"] = max(cur["ep_max"], float(info["r_int_episode"]))
+
                 for i, a in enumerate(acts):
                     kind = self.classify_action(int(a))
                     if kind == "switch" and no_moves is not None:
@@ -162,6 +182,12 @@ class StepCounterCallback:
         msg += (f"; шагов без выбора {mix['single']} ({mix.get('_single_share', 0.0) * 100:.1f}%), "
                 f"своих решений (был выбор) {mix.get('_decided', 0)} "
                 f"({mix.get('_choice_share', 0.0) * 100:.1f}%)")
+        cur = self._curiosity
+        if cur["n"]:
+            r_mean = cur["r_int_sum"] / cur["n"]
+            beta = cur["beta"] if cur["beta"] is not None else 0.0
+            msg += (f" | curiosity: r_int(сред) {r_mean:.4f}, beta {beta:.4f}, "
+                    f"вклад за эпизод (макс) {cur['ep_max']:.2f} из {max(cur['episodes'], 1)} эпизодов")
         print(msg)
         try:
             logger = getattr(self.ppo_ref, "logger", None)
@@ -173,6 +199,12 @@ class StepCounterCallback:
                 logger.record("mix/tera_share", float(mix.get("_tera_share", 0.0)))
                 logger.record("mix/single_share", float(mix.get("_single_share", 0.0)))
                 logger.record("mix/choice_share", float(mix.get("_choice_share", 0.0)))
+                cur = self._curiosity
+                if cur["n"]:
+                    logger.record("mix/r_int_mean", float(cur["r_int_sum"] / cur["n"]))
+                    logger.record("mix/r_int_episode_max", float(cur["ep_max"]))
+                    if cur["beta"] is not None:
+                        logger.record("mix/beta", float(cur["beta"]))
         except Exception:
             pass
 

@@ -268,6 +268,21 @@ def test_mix_ignores_no_choice_steps():
     check("mix: доля вынужденных свитчей", mix["_switch_forced_share"], round(2 / 4, 4))
     check("mix: доля шагов без выбора", mix["_single_share"], round(1 / 4, 4))
 
+    # curiosity: r_int/beta/r_int_episode из infos попадают в [mix] и в TB-метрики
+    cb_cur = StepCounterCallback({"value": 0}, 2, mix_every=10_000)
+    infos = [
+        {"r_int": 0.4, "beta": 0.05, "r_int_episode": 1.5},
+        {"r_int": 0.2, "beta": 0.05},   # эпизод ещё идёт
+    ]
+    cb_cur({"actions": np.array([6, 7]), "obs_tensor": {"action_mask": torch.as_tensor(mask[:2])},
+            "infos": infos}, {})
+    cur = cb_cur._curiosity
+    check("curiosity: посчитано два r_int", cur["n"], 2)
+    check("curiosity: средний r_int", round(cur["r_int_sum"] / cur["n"], 4), 0.3)
+    check("curiosity: beta записан", cur["beta"], 0.05)
+    check("curiosity: вклад за эпизод (макс) учтён", cur["ep_max"], 1.5)
+    check("curiosity: эпизодов учтено", cur["episodes"], 1)
+
     # маска numpy без obs_tensor (fallback на политику) и вовсе без маски — как раньше
     cb2 = StepCounterCallback({"value": 0}, 2, mix_every=10_000)
     cb2({"actions": np.array([0, 6])}, {})
