@@ -1096,6 +1096,112 @@ mask_dim (26). Пересоберите датасет из сырого кэш�
 сайдкара): датасет собирается, записывается с obs 870, устаревшие чанки не читаются, повторного
 пересчёта нет. Всего 11 файлов, 428 проверок.
 
+## 20. «За 2 800 000 шагов модель научилась только спамить атаками»
+
+### 20.1 Симптом
+
+После ~2.8M шагов политика почти всегда выбирала атакующий приём: свитчи и статусные/погодные
+ходы исчезли, хотя награда за них предусмотрена (SWITCH_BONUS 0.12 / SWITCH_IMMUNE_BONUS 0.25,
+WEATHER_BONUS 0.08, TERRAIN_BONUS 0.06, HEAL_BONUS 0.08, STATUS_CURE_BONUS 0.10 и т.д.).
+
+### 20.2 Причина: инвертированная конвенция индексов действий
+
+`ExampleEnv.action_to_order` вёл «книжку» последнего хода (`_last_move_id`, `_last_was_switch`,
+`_last_wasted`) по конвенции DoublesEnv (`action < len(available_moves)` → приём, иначе свитч).
+В poke-env **SinglesEnv** раскладка обратная:
+
+| action | что это |
+|---|---|
+| 0..5 | свитч (индекс в `battle.team`) |
+| 6..9 | приём, индекс `(action - 6) % 4` |
+| 10..13 / 14..17 / 18..21 | мега / z / динамакс (в gen9-фьюжне недоступны) |
+| 22..25 | тера (тот же приём `(action - 6) % 4`) |
+
+Сам ордер всегда строился правильно (`super().action_to_order`), ломалась только бухгалтерия
+награды. Проверено эмпирически на живом `Battle` (`swampert` с surf/earthquake против `skarmory`):
+
+```
+до фикса:
+  action=1 (свитч):   ордер /choose switch Bench,  _last_move_id='earthquake', was_switch=False, wasted=True
+  action=6 (surf):    ордер /choose move surf,     _last_move_id='switch',     was_switch=True,  wasted=False
+  action=7 (earthq.): ордер /choose move earthquake,_last_move_id='switch',     was_switch=True,  wasted=False
+после фикса:
+  action=1: switch,  _last_move_id='switch', was_switch=True,  wasted=False
+  action=6: surf,    _last_move_id='surf',   was_switch=False, wasted=False
+  action=7: earthq., _last_move_id='earthquake', was_switch=False, wasted=True
+  action=23: тера-версия earthquake, kind='tera', wasted=True
+```
+
+Что это давало награде:
+
+* **Приёмы (6..9) записывались как свитч**: `_last_wasted=False` → generic `WASTED_MOVE_PENALTY`
+  (0.06) для приёмов не срабатывал **никогда**. Прожать бесполезную атаку (иммунитет/застатусленный
+  оппонент/хил на полном HP/хазард уже стоит) стоило 0 — прямой стимул «спамить».
+* **Ветки награды по `_last_move_id` были мертвы**: id был `"switch"`, поэтому не срабатывали
+  хилы (`HEAL_BONUS`/`HEAL_WASTED_PENALTY`), «наша» погода/террейн (`WEATHER_MOVE_IDS`,
+  `TERRAIN_MOVE_IDS`), а также проверки wasted по погоде/террейну/сабу/бустам.
+* **Свитчи (0..3 при четырёх приёмах) записывались как приём** с чужим id из своего же мувсета и
+  получали `WASTED_MOVE_PENALTY`, если этот приём был wasted → штраф за свитч (в тесте: свитч на
+  скамейку → `_last_move_id='earthquake'`, `wasted=True`).
+* Плюс `_last_was_switch=True` на ходах-приёмах включал ветку «погоду поставила абилка при свитче»
+  (Drought/Drizzle/…) — лишний положительный сигнал на атакующих ходах.
+
+Итог: градиент систематически «награждал атаку и наказывал свитч» — ровно наблюдаемое поведение.
+
+### 20.3 Что изменено
+
+`agents/env.py`:
+* классификация действий по конвенции SinglesEnv: `action < 0` → default/forfeit,
+  `0..5` → свитч (`_last_move_id="switch"`, `_last_was_switch=True`, `wasted=False`),
+  `>=6` → приём `moves[(action-6) % 4]` (для 22..25 ещё и `kind="tera"`), wasted-флаг считается
+  **для реально выбранного приёма** (тот же расчёт «иммунитет = wasted», что и раньше);
+* `ExampleEnv._moves_for_action(battle)` повторяет ровно ту выборку приёмов, что использует
+  `SinglesEnv.action_to_order` (`known_moves` активного, а если доступен ровно один незнакомый
+  приём — именно он), чтобы индексы не разъезжались;
+* счётчики `_last_action_kind` + `action_mix()`/`reset_action_mix()` (switch/move/tera/unknown)
+  — диагностика «спам атаками» на стороне env.
+
+`agents/training.py`:
+* `StepCounterCallback` теперь считает состав действий по `_locals["actions"]` (SB3 отдаёт массив
+  выбранных действий на каждом шаге роллаута) и раз в `mix_every=20 000` решений печатает
+  `[mix] решений N: свитч X%, приём Y%, тера Z%` + пишет `mix/switch_share`, `mix/move_share`,
+  `mix/tera_share` в TensorBoard. Это прямая проверка, что фикс работает, без разбора реплеев.
+
+`agents/policy_player.py` (латентный баг того же семейства, найден при разборе):
+* `_DimProbeEnv`/`_probe_ppo` собирали политику под `action_dim=9` (как у DoublesEnv), хотя в
+  gen9-фьюжне действий 26. Через probe идёт fallback-миграция чекпоинта: там
+  `load_state_dict(strict=False)` падает на `size mismatch for action_net` (torch ругается на
+  форму даже при `strict=False`), то есть fallback не выживал → `load_policy_compat` возвращал
+  `None`, и self-play оппонент отваливался с `Failed to load qualified snapshot`
+  (приёмка пункта про self-play после смены размерности). Теперь probe берёт размер головы из
+  чекпоинта (`_checkpoint_arch` читает `action_net.weight`, дефолт 26), а `action_mask` в его
+  observation_space тоже 26.
+* fallback печатает незагруженные/лишние ключи и отдельно выделяет критичные
+  (`action_net`, `features_extractor.net.0`, `mlp_extractor`) — молчаливая потеря весов больше
+  не проходит незамеченной.
+
+### 20.4 Тесты
+
+* `test_action_kind.py` (новый, 54 проверки): книга действий для свитча/приёма/теры/default,
+  сверка `_moves_for_action` с логикой poke-env (включая ветку «единственный незнакомый приём»),
+  и главное — цена свитча: разница награды между корректным и прежним (багованным) состоянием
+  ровно `WASTED_MOVE_PENALTY`.
+* `test_dim_migration.py` (+12 проверок, всего 55 вместо 43): probe-политика на 26 действий, `_checkpoint_arch`
+  сообщает `action_dim`, fallback-миграция не теряет голову (веса помечены константой и сверяются),
+  первый слой экстрактора расширяется с нулями в новых колонках, mask/action_space = 26.
+  `FakeEnv` в тесте переведён на реальные 26 действий.
+
+### 20.5 Что делать пользователю
+
+1. `--resume` с текущего чекпоинта: веса валидны, градиент теперь корректен, политика доучится.
+2. Смотреть в логе строку `[mix]`: доля свитчей должна вырасти с ~0% до заметной (эвристика
+   свитчит в заметной доле ходов). В TensorBoard — `mix/*`.
+3. Если после ~300–500k шагов доля свитчей всё ещё ~0, тогда уже есть смысл тюнить веса награды
+   (например `SWITCH_BONUS`), но менять награду до того, как отработает исправленный градиент,
+   нельзя: иначе симптом будет лечить не причина.
+
+---
+
 ---
 
 *Автор аудита: Agent Arena — полный проход по `policy_player.py` + всем его зависимостям.*

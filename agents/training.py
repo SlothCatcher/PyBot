@@ -17,12 +17,46 @@ class ENTSchedule:
     def __call__(self, progress): return 0.03
 
 class StepCounterCallback:
-    """Считает timesteps и одновременно обновляет ent_coef по расписанию (если передано)."""
-    def __init__(self, steps_holder: dict, num_envs: int, ent_schedule=None, ppo_ref=None):
+    """Считает timesteps, обновляет ent_coef по расписанию и печатает состав действий.
+
+    Состав действий — прямая проверка жалобы «модель только спамит атаками»: SB3 передаёт
+    в callback локальные переменные шага, там есть массив выбранных действий (по одному
+    на env). Раскладка poke-env SinglesEnv: 0..5 свитч, 6..9 приём, 10..21 мега/z/динамакс
+    (в этом формате не используются), 22..25 тера.
+    """
+    def __init__(self, steps_holder: dict, num_envs: int, ent_schedule=None, ppo_ref=None,
+                 mix_every: int = 20_000):
         self.steps_holder = steps_holder
         self.num_envs = num_envs
         self.ent_schedule = ent_schedule
         self.ppo_ref = ppo_ref  # ссылка на PPO чтобы менять ent_coef на лету
+        self.mix_every = max(int(mix_every), 1)
+        self._mix = {"switch": 0, "move": 0, "tera": 0, "gimmick": 0, "other": 0}
+        self._mix_next = self.mix_every
+
+    @staticmethod
+    def classify_action(action: int) -> str:
+        """Класс действия по конвенции poke-env SinglesEnv (см. ExampleEnv.action_to_order)."""
+        a = int(action)
+        if 0 <= a < 6:
+            return "switch"
+        if 22 <= a <= 25:
+            return "tera"
+        if 10 <= a <= 21:
+            return "gimmick"  # мега/z/динамакс: в gen9-фьюжне недоступны
+        if 6 <= a <= 9:
+            return "move"
+        return "other"
+
+    def action_mix(self) -> dict:
+        total = sum(self._mix.values())
+        out = dict(self._mix)
+        out["_total"] = total
+        if total:
+            out["_switch_share"] = round(self._mix["switch"] / total, 4)
+            out["_move_share"] = round(self._mix["move"] / total, 4)
+            out["_tera_share"] = round(self._mix["tera"] / total, 4)
+        return out
 
     def __call__(self, _locals, _globals) -> bool:
         self.steps_holder["value"] += self.num_envs
@@ -32,7 +66,34 @@ class StepCounterCallback:
                 self.ppo_ref.ent_coef = new_ent
             except Exception:
                 pass
+        # диагностика: какие действия выбирает политика (свитч/приём/тера)
+        try:
+            actions = _locals.get("actions") if isinstance(_locals, dict) else None
+            if actions is not None:
+                for a in np.asarray(actions).reshape(-1):
+                    self._mix[self.classify_action(int(a))] += 1
+                total = sum(self._mix.values())
+                if total >= self._mix_next:
+                    self._mix_next = total + self.mix_every
+                    self._log_mix(total)
+        except Exception:
+            pass
         return True
+
+    def _log_mix(self, total: int) -> None:
+        mix = self.action_mix()
+        msg = (f"[mix] решений {total}: свитч {mix.get('_switch_share', 0.0) * 100:.1f}%, "
+               f"приём {mix.get('_move_share', 0.0) * 100:.1f}%, тера {mix.get('_tera_share', 0.0) * 100:.1f}% "
+               f"(свитчей {mix['switch']}, приёмов {mix['move']}, тер {mix['tera']})")
+        print(msg)
+        try:
+            logger = getattr(self.ppo_ref, "logger", None)
+            if logger is not None:
+                logger.record("mix/switch_share", float(mix.get("_switch_share", 0.0)))
+                logger.record("mix/move_share", float(mix.get("_move_share", 0.0)))
+                logger.record("mix/tera_share", float(mix.get("_tera_share", 0.0)))
+        except Exception:
+            pass
 
 
 def make_lr_schedule(initial_lr: float, total_timesteps: int, steps_holder: dict):

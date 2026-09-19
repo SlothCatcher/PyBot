@@ -176,6 +176,9 @@ class ExampleEnv(SinglesEnv):
         self._last_move_id: dict[str, str] = {}
         self._last_wasted: dict[str, bool] = {}
         self._last_was_switch: dict[str, bool] = {}
+        self._last_action_kind: dict[str, str] = {}
+        # диагностика: сколько свитчей/приёмов/тер выбрал агент (видно, есть ли «спам атаками»)
+        self._action_counts: dict[str, int] = {"switch": 0, "move": 0, "tera": 0, "unknown": 0}
 
     @classmethod
     def create_env(cls, opponent_weights: dict[str, float] | None = None) -> Monitor:
@@ -1042,6 +1045,7 @@ class ExampleEnv(SinglesEnv):
                     self._last_wasted.pop(tag, None)
                     self._last_move_id.pop(tag, None)
                     self._last_was_switch.pop(tag, None)
+                    self._last_action_kind.pop(tag, None)
             except Exception:
                 pass
 
@@ -1052,58 +1056,118 @@ class ExampleEnv(SinglesEnv):
         if sum(mask) == 0:
             from poke_env.player import DefaultBattleOrder
             return DefaultBattleOrder()
-        # запоминаем wasted-флаг для универсального штрафа (если приёма нет в специфике — накажем generic)
+        # Книжка действий: помним, приём это был или свитч, и wasted ли приём.
+        #
+        # ВАЖНО (исправлено): раньше здесь применялась конвенция DoublesEnv
+        # (`action < len(available_moves)` -> приём, иначе свитч). В poke-env SinglesEnv
+        # раскладка другая: 0..5 — свитч (индекс в battle.team), 6..9 — приём ((action-6) % 4),
+        # 10..13 мега, 14..17 z, 18..21 динамакс, 22..25 тера. Что из-за этого ломалось:
+        #   * настоящий приём (6..9) записывался как «switch»: _last_wasted всегда False ->
+        #     generic WASTED_MOVE_PENALTY (0.06) для приёмов НИКОГДА не применялся
+        #     (бесполезная атака/хил/погода не стоили ничего), а ветки награды по
+        #     _last_move_id (хил, погода, террейн, статус) были мертвы, потому что id = "switch";
+        #   * свитч (0..3 при четырёх приёмах) записывался как «приём» с чужим id из своего же
+        #     мувсета и получал WASTED_MOVE_PENALTY, если тот приём был wasted -> штраф за свитч.
+        # Суммарно градиент систематически толкал политику в «спам атаками».
+        # Сам ордер всегда строился корректно (super().action_to_order), ломалась только
+        # бухгалтерия награды.
         try:
             tag = getattr(battle, "battle_tag", "") or "unknown"
-            moves = list(getattr(battle, "available_moves", []) or [])
-            # poke_env: action < len(moves) -> move, иначе switch
-            if isinstance(action, (int,)) or hasattr(action, "item"):
-                try:
-                    act_int = int(action.item()) if hasattr(action, "item") else int(action)
-                except Exception:
-                    act_int = int(action)
-            else:
-                act_int = int(action)
-            if act_int < len(moves):
-                move = moves[act_int]
-                mid = str(getattr(move, "id", "") or "").lower()
-                self._last_move_id[tag] = mid
+            act_int = int(action.item()) if hasattr(action, "item") else int(action)
+            # счётчики «состава действий» — только по НАШЕЙ стороне: PokeEnv зовёт action_to_order
+            # и для боя оппонента (его ордер -> индекс), иначе метрика считала бы чужие ходы
+            # (книжку по тегу ведём для любого боя, но счётчики пополняем только по нашей стороне)
+            is_learner = battle is getattr(self, "battle1", None)
+            if act_int < 0:
+                # default (-2) / forfeit (-1): это не наш «ход» по приёму и не свитч
+                self._last_move_id[tag] = "default"
                 self._last_was_switch[tag] = False
-                try:
-                    flag = bool(_move_wasted_flag(move, battle))
-                    # дополнительно: типовая иммуннасть (0 урона) тоже wasted — _move_wasted_flag её не ловит (только абилки)
-                    if not flag and battle.opponent_active_pokemon is not None and getattr(move, "type", None) is not None:
-                        try:
-                            # статус-приёмы не считаем (base_power 0)
-                            bp = getattr(move, "base_power", 0) or 0
-                            if bp == 0:
-                                entry = getattr(move, "entry", {}) or {}
-                                bp = entry.get("basePower", 0) or entry.get("base_power", 0) or 0
-                            if bp and bp >= 10:
-                                mtype = getattr(move, "type", None)
-                                opp = battle.opponent_active_pokemon
-                                # безопасный расчёт (раньше каскад с fallback 1.0 прятал иммунитет)
-                                if damage_multiplier_safe(mtype, opp.type_1, opp.type_2) == 0:
-                                    flag = True
-                        except Exception:
-                            pass
-                except Exception:
-                    flag = False
-                self._last_wasted[tag] = flag
-            else:
-                # switch
-                try:
-                    # для свитча храним id вида switch:xxx
-                    switches = list(getattr(battle, "available_switches", []) or [])
-                    # action - len(moves) индекс свитча, но нам достаточно факта свитча
-                    self._last_move_id[tag] = "switch"
-                except Exception:
-                    self._last_move_id[tag] = "switch"
+                self._last_wasted[tag] = False
+                self._last_action_kind[tag] = "default"
+                if is_learner:
+                    self._action_counts["unknown"] += 1
+            elif act_int < 6:
+                # свитч: индекс в battle.team (как в SinglesEnv.action_to_order)
+                self._last_move_id[tag] = "switch"
                 self._last_was_switch[tag] = True
                 self._last_wasted[tag] = False
+                self._last_action_kind[tag] = "switch"
+                if is_learner:
+                    self._action_counts["switch"] += 1
+            else:
+                idx = (act_int - 6) % 4
+                mvs = self._moves_for_action(battle)
+                move = mvs[idx] if idx < len(mvs) else None
+                if move is None:
+                    self._last_move_id[tag] = "unknown"
+                    self._last_was_switch[tag] = False
+                    self._last_wasted[tag] = False
+                    self._last_action_kind[tag] = "unknown"
+                    if is_learner:
+                        self._action_counts["unknown"] += 1
+                else:
+                    mid = str(getattr(move, "id", "") or "").lower()
+                    self._last_move_id[tag] = mid
+                    self._last_was_switch[tag] = False
+                    self._last_action_kind[tag] = "tera" if act_int >= 22 else "move"
+                    if is_learner:
+                        self._action_counts[self._last_action_kind[tag]] += 1
+                    try:
+                        flag = bool(_move_wasted_flag(move, battle))
+                        # дополнительно: типовая иммунность (0 урона) тоже wasted — _move_wasted_flag её не ловит (только абилки)
+                        if not flag and battle.opponent_active_pokemon is not None and getattr(move, "type", None) is not None:
+                            try:
+                                # статус-приёмы не считаем (base_power 0)
+                                bp = getattr(move, "base_power", 0) or 0
+                                if bp == 0:
+                                    entry = getattr(move, "entry", {}) or {}
+                                    bp = entry.get("basePower", 0) or entry.get("base_power", 0) or 0
+                                if bp and bp >= 10:
+                                    mtype = getattr(move, "type", None)
+                                    opp = battle.opponent_active_pokemon
+                                    # безопасный расчёт (раньше каскад с fallback 1.0 прятал иммунитет)
+                                    if damage_multiplier_safe(mtype, opp.type_1, opp.type_2) == 0:
+                                        flag = True
+                            except Exception:
+                                pass
+                    except Exception:
+                        flag = False
+                    self._last_wasted[tag] = flag
         except Exception:
             pass
         return super().action_to_order(action, battle, fake=fake, strict=strict)
+
+    @staticmethod
+    def _moves_for_action(battle) -> list:
+        """Приёмы в том же порядке, что использует SinglesEnv.action_to_order.
+
+        poke-env берёт known_moves активного (первые 4), а если доступен ровно один приём,
+        которого нет среди известных — именно его. Повторяем ровно эту логику, иначе
+        бухгалтерия wasted-штрафа разъедется с реально выбранным приёмом.
+        """
+        known_moves = list(getattr(getattr(battle, "active_pokemon", None), "moves", {}).values())[:4]
+        avail = list(getattr(battle, "available_moves", []) or [])
+        if len(avail) == 1 and avail[0].id not in [m.id for m in known_moves]:
+            return avail
+        return known_moves
+
+    def action_mix(self) -> dict:
+        """Счётчик типов действий НАШЕЙ стороны: switch/move/tera/unknown (диагностика «только атаки»).
+
+        В обучении метрика считается в родительском процессе (`[mix]` из StepCounterCallback) —
+        она точнее, потому что видит ровно те действия, что выбрала политика.
+        """
+        total = sum(self._action_counts.values())
+        if not total:
+            return dict(self._action_counts)
+        out = {k: v for k, v in self._action_counts.items()}
+        out["_total"] = total
+        out["_switch_share"] = round(self._action_counts["switch"] / total, 3)
+        return out
+
+    def reset_action_mix(self) -> None:
+        for k in list(self._action_counts):
+            self._action_counts[k] = 0
 
     def embed_battle(self, battle: AbstractBattle):
         # Надёжный выбор источника по battle_tag (а не по is и не по player_role).

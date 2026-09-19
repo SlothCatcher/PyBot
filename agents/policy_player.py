@@ -128,17 +128,23 @@ class _DimProbeEnv(_GymBaseEnv):
 
     metadata = {"render_modes": []}
 
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, action_dim: int = 26):
         import numpy as _np
 
         from gymnasium import spaces
 
         self._np = _np
+        # ВАЖНО: action_dim должен совпадать с реальным env (gen9 = 6 свитчей + 5 блоков по 4
+        # приёма = 26). Раньше тут жёстко стояло 9 (как у DoublesEnv): политика собиралась с
+        # головой на 9 действий, и в fallback-пути миграции загрузка весов падала на
+        # `size mismatch for action_net` (torch ругается на shape даже при strict=False),
+        # то есть миграция не выживала вовсе — снапшот оставался без политики.
+        self._action_dim = int(action_dim)
         self.observation_space = spaces.Dict({
             "observation": spaces.Box(-1.0, 4.0, shape=(int(dim),), dtype=_np.float32),
-            "action_mask": spaces.Box(0, 1, shape=(9,), dtype=bool),
+            "action_mask": spaces.Box(0, 1, shape=(self._action_dim,), dtype=bool),
         })
-        self.action_space = spaces.Discrete(9)
+        self.action_space = spaces.Discrete(self._action_dim)
 
     def reset(self, *, seed=None, options=None):
         return self.observation_space.sample(), {}
@@ -150,13 +156,13 @@ class _DimProbeEnv(_GymBaseEnv):
         return None
 
 
-def _probe_ppo(target_dim: int, features_dim: int = 512):
+def _probe_ppo(target_dim: int, features_dim: int = 512, action_dim: int = 26):
     """PPO со случайной политикой на target_dim признаков (для fallback-миграции)."""
     from stable_baselines3.common.vec_env import DummyVecEnv
 
     from agents.policy import MaskedActorCriticPolicy
 
-    env = DummyVecEnv([lambda: _DimProbeEnv(int(target_dim))])
+    env = DummyVecEnv([lambda: _DimProbeEnv(int(target_dim), action_dim=int(action_dim))])
     return PPO(MaskedActorCriticPolicy, env, device="cpu", verbose=0, n_steps=8, batch_size=8,
                policy_kwargs=dict(features_extractor_kwargs=dict(features_dim=int(features_dim)))), env
 
@@ -289,6 +295,10 @@ def _checkpoint_arch(path: str) -> dict:
         if k.endswith("features_extractor.net.0.weight") and tensor.dim() == 2:
             info["features_dim"] = int(tensor.shape[0])
             info["obs_dim"] = int(tensor.shape[1])
+        elif k.endswith("action_net.weight") and tensor.dim() == 2:
+            # сколько действий у чекпоинта (gen9 = 26); нужно, чтобы fallback-миграция
+            # не собрала политику с чужой головой
+            info["action_dim"] = int(tensor.shape[0])
         elif "mlp_extractor.policy_net." in k and k.endswith(".weight") and tensor.dim() == 2:
             try:
                 layer_idx = int(k.split("policy_net.")[1].split(".")[0])
@@ -477,7 +487,18 @@ def _migrate_checkpoint_dim(ppp_path: str, target_dim: int | None = None, force_
         traceback.print_exc()
         # fallback: собираем политику нужной размерности (без сервера) и копируем веса вручную
         try:
-            ppo_new, dummy_env = _probe_ppo(NEW_N, NEW_F)
+            # размер головы берём из самого чекпоинта (или из его action_space), по умолчанию gen9 = 26
+            try:
+                # локальный импорт: при force_fallback Primary-ветка до импортов не доходит
+                from stable_baselines3.common.save_util import load_from_zip_file as _lf_dim
+                _ck_data, _, _ = _lf_dim(ppp_path, device=torch.device("cpu"))
+                act_dim = int(arch.get("action_dim") or getattr(_ck_data.get("action_space"), "n", 0) or 0)
+            except Exception:
+                act_dim = 0
+            if act_dim <= 0:
+                act_dim = 26
+            _say(f"  Fallback: probe-политика строится под action_dim={act_dim}")
+            ppo_new, dummy_env = _probe_ppo(NEW_N, NEW_F, action_dim=act_dim)
             # грузим старый state dict через load_from_zip_file снова но теперь паддим и грузим напрямую
             try:
                 from stable_baselines3.common.save_util import load_from_zip_file as _lf
@@ -521,8 +542,22 @@ def _migrate_checkpoint_dim(ppp_path: str, target_dim: int | None = None, force_
                         _say(f"  Fallback: паддинг {kk} {list(tt.shape)} -> {list(nt.shape)}")
                 # загружаем в ppo_new
                 try:
-                    ppo_new.policy.load_state_dict(policy_state2, strict=False)
+                    _load_res = ppo_new.policy.load_state_dict(policy_state2, strict=False)
                     _say("  Fallback: загрузил падденный state_dict напрямую в новый PPO (strict=False)")
+                    # strict=False молча пропускает веса с несовпавшим shape -> голова/экстрактор
+                    # остались бы случайными. Такое молчание уже один раз стоило обученной
+                    # политики, поэтому печатаем громко и явно.
+                    _missing = list(getattr(_load_res, "missing_keys", []) or [])
+                    _unexpected = list(getattr(_load_res, "unexpected_keys", []) or [])
+                    _critical = [k for k in _missing
+                                 if ("action_net" in k or "features_extractor.net.0" in k or "mlp_extractor" in k)]
+                    if _critical:
+                        print(f"  ВНИМАНИЕ: {len(_critical)} критичных весов НЕ загружены (остались случайными): "
+                              f"{_critical[:4]}{' ...' if len(_critical) > 4 else ''}")
+                    if _missing:
+                        print(f"  Fallback: не загружено ключей: {len(_missing)} (первые: {_missing[:3]})")
+                    if _unexpected:
+                        print(f"  Fallback: лишних ключей в чекпоинте: {len(_unexpected)} (первые: {_unexpected[:3]})")
                     # правим observation_space
                     from gymnasium.spaces import Box, Dict
                     try:

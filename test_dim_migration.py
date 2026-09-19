@@ -38,9 +38,10 @@ class FakeEnv(gym.Env):
     def __init__(self, dim: int):
         self.observation_space = spaces.Dict({
             "observation": spaces.Box(-1.0, 4.0, shape=(dim,), dtype=np.float32),
-            "action_mask": spaces.Box(0, 1, shape=(9,), dtype=bool),
+            "action_mask": spaces.Box(0, 1, shape=(26,), dtype=bool),
         })
-        self.action_space = spaces.Discrete(9)
+        # 26 = реальный размер действия gen9-фьюжна (6 свитчей + 5 блоков по 4 приёма)
+        self.action_space = spaces.Discrete(26)
 
     def reset(self, *, seed=None, options=None):
         return self.observation_space.sample(), {}
@@ -143,7 +144,7 @@ def main():
         # 3) мигрированная модель реально считает forward на новой размерности
         obs = {
             "observation": torch.zeros((2, N_FEATURES), dtype=torch.float32),
-            "action_mask": torch.ones((2, 9), dtype=torch.bool),
+            "action_mask": torch.ones((2, 26), dtype=torch.bool),
         }
         with torch.no_grad():
             actions, values, log_prob = ppo.policy(obs)
@@ -249,7 +250,7 @@ def main():
             check("fallback-миграция: политика делает forward",
                   tuple(ppo_fb.policy({
                       "observation": torch.zeros((1, N_FEATURES), dtype=torch.float32),
-                      "action_mask": torch.ones((1, 9), dtype=torch.bool),
+                      "action_mask": torch.ones((1, 26), dtype=torch.bool),
                   })[0].shape) == (1,))
         except Exception as e:
             import traceback
@@ -302,7 +303,7 @@ def main():
         with torch.no_grad():
             actions, values, _ = ppo_big.policy({
                 "observation": torch.zeros((2, N_FEATURES), dtype=torch.float32),
-                "action_mask": torch.ones((2, 9), dtype=torch.bool),
+                "action_mask": torch.ones((2, 26), dtype=torch.bool),
             })
         check("features_dim 512->640: расширенная политика делает forward",
               tuple(actions.shape) == (2,) and tuple(values.shape) == (2, 1))
@@ -342,6 +343,67 @@ def main():
         check("метрика: у warm-start модели новые признаки не используются (ratio == 0)",
               float(m_warm.get("arch/new_cols_rms_ratio", 1.0)) == 0.0,
               f"ratio={m_warm.get('arch/new_cols_rms_ratio')}")
+
+
+    # 11) probe-среда миграции и fallback: голова политики должна выживать
+    from agents.policy_player import _checkpoint_arch, _probe_ppo
+
+    ppo_probe, env_probe = _probe_ppo(715)
+    check("probe-политика миграции: голова на 26 действий (gen9), а не 9",
+          tuple(ppo_probe.policy.action_net.weight.shape)[0] == 26,
+          str(tuple(ppo_probe.policy.action_net.weight.shape)))
+    check("probe-политика миграции: маска в observation_space = 26",
+          tuple(env_probe.observation_space["action_mask"].shape) == (26,),
+          str(tuple(env_probe.observation_space["action_mask"].shape)))
+    check("probe-политика миграции: action_space = Discrete(26)",
+          int(env_probe.action_space.n) == 26, str(env_probe.action_space))
+    env_probe.close()
+
+    with tempfile.TemporaryDirectory() as td:
+        # настоящий «старый» чекпоинт: FeaturesExtractor всегда строится на текущем
+        # N_FEATURES, поэтому сначала метим веса на полном чекпоинте, потом урезаем
+        # экстрактор до 715 столбцов через shrink_checkpoint (как у пользователя на диске)
+        from stable_baselines3 import PPO as _PPO
+        full26 = make_checkpoint(N_FEATURES, os.path.join(td, "full26.zip"))
+        marker = _PPO.load(full26, device="cpu")
+        with torch.no_grad():
+            marker.policy.action_net.weight.fill_(3.25)
+            marker.policy.action_net.bias.fill_(-1.5)
+            marker.policy.mlp_extractor.policy_net[0].weight.fill_(2.5)
+        marked = os.path.join(td, "marked.zip")
+        marker.save(marked)
+        ck = shrink_checkpoint(marked, os.path.join(td, "old715_head.zip"), 715)
+        check("_checkpoint_arch сообщает action_dim",
+              int(_checkpoint_arch(ck).get("action_dim", 0)) == 26,
+              str(_checkpoint_arch(ck).get("action_dim")))
+        src_fw = None
+        for _k, _v in load_from_zip_file(ck, device=torch.device("cpu"))[1].items():
+            if isinstance(_v, dict) and "features_extractor.net.0.weight" in _v:
+                src_fw = _v["features_extractor.net.0.weight"]
+        check("старый чекпоинт: экстрактор урезан до 715 столбцов",
+              src_fw is not None and tuple(src_fw.shape) == (512, 715), str(tuple(src_fw.shape)))
+        mig = _migrate_checkpoint_dim(ck, target_dim=N_FEATURES, force_fallback=True)
+        aw = mig.policy.action_net.weight
+        ab = mig.policy.action_net.bias
+        pw = mig.policy.mlp_extractor.policy_net[0].weight
+        fw = mig.policy.features_extractor.net[0].weight
+        check("fallback-миграция: голова осталась 26x256", tuple(aw.shape) == (26, 256), str(tuple(aw.shape)))
+        check("fallback-миграция: веса головы сохранены (26 действий из чекпоинта)",
+              bool(torch.allclose(aw, torch.full_like(aw, 3.25))) and bool(torch.allclose(ab, torch.full_like(ab, -1.5))),
+              f"unique={torch.unique(aw).tolist()[:3]} bias={torch.unique(ab).tolist()[:3]}")
+        check("fallback-миграция: вход policy_net сохранён (features_dim не менялся)",
+              bool(torch.allclose(pw, torch.full_like(pw, 2.5))) and tuple(pw.shape) == (512, 512),
+              str(tuple(pw.shape)))
+        check("fallback-миграция: первый слой экстрактора расширен до N_FEATURES",
+              tuple(fw.shape) == (512, N_FEATURES), str(tuple(fw.shape)))
+        check("fallback-миграция: старые 715 колонок — из чекпоинта, новые — нули",
+              bool(torch.equal(fw[:, :715], src_fw)) and int(torch.count_nonzero(fw[:, 715:])) == 0,
+              f"ненулевых в новых={int(torch.count_nonzero(fw[:, 715:]))}")
+        check("fallback-миграция: маска в observation_space = 26",
+              tuple(mig.observation_space["action_mask"].shape) == (26,),
+              str(tuple(mig.observation_space["action_mask"].shape)))
+        check("fallback-миграция: action_space = Discrete(26)",
+              int(mig.action_space.n) == 26, str(mig.action_space))
 
     print("-" * 74)
     if FAIL:
