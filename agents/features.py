@@ -9,9 +9,9 @@ except ImportError:  # запуск модуля вне пакета
     from type_utils import damage_multiplier_safe
 
 try:
-    from .fusion_types import effective_types
+    from .fusion_types import effective_types, is_fusion_format
 except ImportError:  # запуск модуля вне пакета
-    from fusion_types import effective_types
+    from fusion_types import effective_types, is_fusion_format
 
 
 def _eff_types(mon):
@@ -182,6 +182,27 @@ def _is_semi_invuln_or_charging(pokemon) -> float:
     except Exception:
         pass
     return 0.0
+
+# --- блок «типы противника против нашей команды» (см. _type_matchup_block) -------------
+TYPE_MATCHUP_TEAM_SLOTS = 6      # слот 0 — активный, 1..5 — резервы в каноническом порядке
+TYPE_MATCHUP_TYPE_SLOTS = 2      # у покемона максимум два типа
+TYPE_MATCHUP_ROW_SIZE = 2 + TYPE_MATCHUP_TEAM_SLOTS     # [флаг типа, скаляр типа, 6 множителей]
+TYPE_MATCHUP_BLOCK_SIZE = (
+    len(_TYPE_LIST)                                          # типы нашего активного
+    + TYPE_MATCHUP_TYPE_SLOTS * TYPE_MATCHUP_ROW_SIZE * TYPE_MATCHUP_TEAM_SLOTS
+    + TYPE_MATCHUP_TEAM_SLOTS                                # флаги «тип подтверждён сервером»
+)
+# абсолютное смещение блока: он идёт в хвост obs, сразу за блоком урона. 715 — это
+# MIN_PREFIX_OBS_DIM из training.py (импортировать нельзя: training импортирует features)
+TYPE_MATCHUP_BASE = 715 + DAMAGE_BLOCK_SIZE
+
+
+def _type_scalar(t) -> float:
+    """Скаляр типа 0..1 (0 — типа нет), та же шкала, что у `_move_type_scalar` для наших приёмов."""
+    if t is None or t not in _TYPE_INDEX:
+        return 0.0
+    return float(_TYPE_INDEX[t]) / max(1, len(_TYPE_LIST) - 1)
+
 
 def _type_multi_hot(pokemon) -> np.ndarray:
     vec = np.zeros(len(_TYPE_LIST), dtype=np.float32)
@@ -900,6 +921,74 @@ def _vulnerability_frac(reserves: list, opponent_active, type_chart) -> float:
             vulnerable += 1
     return vulnerable / len(alive)
 
+def _matchup_team_slots(active, team) -> list:
+    """Слоты команды для матрицы типов: 0 — активный, 1..5 — резервы в каноническом порядке.
+
+    Порядок совпадает с bench-блоком (там резервы без активного), поэтому «наш слот 0» — это
+    ровно тот покемон, чьи признаки лежат в начале obs, а «наш слот k>0» — тот, что стоит
+    на (k-1)-м месте bench-блока.
+    """
+    slots: list = [active]
+    for mon in canonical_reserves(team):
+        if mon is None or mon is active:
+            continue
+        if len(slots) >= TYPE_MATCHUP_TEAM_SLOTS:
+            break
+        slots.append(mon)
+    while len(slots) < TYPE_MATCHUP_TEAM_SLOTS:
+        slots.append(None)
+    return slots[:TYPE_MATCHUP_TEAM_SLOTS]
+
+
+def _type_matchup_block(battle, type_chart=None) -> np.ndarray:
+    """Эффективность КАЖДОГО типа КАЖДОГО покемона соперника против комбинации типов КАЖДОГО
+    нашего покемона — чтобы модель видела угрозу супер-эффективного удара ещё до того, как
+    противник покажет приём.
+
+    Раскладка (TYPE_MATCHUP_BLOCK_SIZE = 121, абсолютно с TYPE_MATCHUP_BASE = 870):
+
+      [0:19)   multi-hot типов нашего активного (фьюжн-осознанно, см. _eff_types)
+      [19:115) 12 строк по 8 (r = opp_slot * 2 + type_slot):
+                 [0]     флаг: у этого покемона соперника есть тип в этом слоте
+                 [1]     скаляр типа (0..1, как _move_type_scalar у наших приёмов)
+                 [2:8]   множитель урона этого типа против наших слотов 0..5
+      [115:121) 6 флагов по слотам соперника: тип подтверждён сервером (typechange/тера или
+                обычный формат, где декс и есть правда), а не выведен формулой фьюжна
+
+    Слоты соперника: 0 — активный, 1..5 — резервы в каноническом порядке, как в bench-блоке.
+    Для ещё не виденных покемонов соперника неизвестного вида строка нулевая (флаг 0).
+    """
+    out = np.zeros(TYPE_MATCHUP_BLOCK_SIZE, dtype=np.float32)
+    n_types = len(_TYPE_LIST)
+    rows_base = n_types
+    conf_base = n_types + TYPE_MATCHUP_TYPE_SLOTS * TYPE_MATCHUP_ROW_SIZE * TYPE_MATCHUP_TEAM_SLOTS
+
+    our_slots = _matchup_team_slots(battle.active_pokemon, battle.team)
+    opp_slots = _matchup_team_slots(battle.opponent_active_pokemon, battle.opponent_team)
+
+    out[:n_types] = _type_multi_hot(battle.active_pokemon)
+    our_types = [_eff_types(mon) if mon is not None else (None, None) for mon in our_slots]
+
+    fusion_fmt = is_fusion_format(battle)
+    for i, mon in enumerate(opp_slots):
+        if mon is None:
+            continue
+        t1, t2, src = effective_types(mon, battle=battle)
+        # сервер прислал тип (typechange/тера) либо формат не фьюжн — тогда декс и есть правда
+        out[conf_base + i] = 1.0 if (str(src).startswith("server") or not fusion_fmt) else 0.0
+        for j, atk in enumerate((t1, t2)):
+            if atk is None:
+                continue
+            row = rows_base + (i * TYPE_MATCHUP_TYPE_SLOTS + j) * TYPE_MATCHUP_ROW_SIZE
+            out[row] = 1.0
+            out[row + 1] = _type_scalar(atk)
+            for k, (mt1, mt2) in enumerate(our_types):
+                if mt1 is None and mt2 is None:
+                    continue
+                out[row + 2 + k] = damage_multiplier_safe(atk, mt1, mt2, type_chart=type_chart)
+    return out
+
+
 def _one_hot(value, options) -> np.ndarray:
     vec = np.zeros(len(options), dtype=np.float32)
     vec[options.index(value) if value in options else 0] = 1.0
@@ -1342,6 +1431,7 @@ def embed_battle_with_fusion(battle, our_fusion, opp_fusion, our_protected_last_
     our_ability = _ability_vec(battle.active_pokemon)
     opp_ability = _ability_vec(battle.opponent_active_pokemon)
     damage_feats = _damage_block(battle, our_fusion, opp_fusion, our_team_fusions, opp_team_fusions)
+    type_matchup_feats = _type_matchup_block(battle, type_chart)
     moves_boost_own_flat = moves_boost_own.flatten()
     moves_drop_opp_flat = moves_drop_opp.flatten()
     moves_hazard_clear_flat = moves_hazard_clear.flatten()
@@ -1370,6 +1460,7 @@ def embed_battle_with_fusion(battle, our_fusion, opp_fusion, our_protected_last_
             our_tera_type,
             [our_protected_last_turn, opp_protected_last_turn],
             damage_feats,
+            type_matchup_feats,
         ],
         dtype=np.float32,
     )
@@ -1383,5 +1474,6 @@ def embed_battle_with_fusion(battle, our_fusion, opp_fusion, our_protected_last_
         raise AssertionError(f"damage-блок {damage_feats.shape[0]} != DAMAGE_BLOCK_SIZE {DAMAGE_BLOCK_SIZE}")
     if obs.shape[0] != N_FEATURES:
         raise AssertionError(f"embed_battle_with_fusion вернула {obs.shape[0]}, а N_FEATURES={N_FEATURES}. "
-                         f"Обнови config.py (715 + {DAMAGE_BLOCK_SIZE} признаков урона = {715 + DAMAGE_BLOCK_SIZE}).")
+                         f"Обнови config.py (715 + {DAMAGE_BLOCK_SIZE} урона + "
+                         f"{TYPE_MATCHUP_BLOCK_SIZE} типов соперника = {TYPE_MATCHUP_BASE + TYPE_MATCHUP_BLOCK_SIZE}).")
     return obs

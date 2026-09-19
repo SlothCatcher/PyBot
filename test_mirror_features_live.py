@@ -24,8 +24,12 @@ from agents.features import embed_battle_with_fusion
 
 FAILED = []
 TAG = "battle-gen9fusionmonsrandombattle-1"
-# блок признаков урона добавляется в конец obs, поэтому его локальные индексы сдвинуты
-OFF = N_FEATURES - DAMAGE_BLOCK_SIZE
+# блок урона начинается сразу после префикса признаков; за ним идёт блок типов соперника,
+# поэтому его локальные индексы считаем от MIN_PREFIX_OBS_DIM, а не от хвоста obs
+from agents.training import MIN_PREFIX_OBS_DIM
+
+OFF = int(MIN_PREFIX_OBS_DIM)
+assert OFF + DAMAGE_BLOCK_SIZE <= N_FEATURES, "блок урона не помещается в obs"
 MIRROR = OFF + MIRROR_BASE
 TEAM = OFF + TEAM_BASE
 FLAGS = OFF + FLAGS_BASE
@@ -126,7 +130,8 @@ def main() -> int:
     check_true("утечки нет: ни у одного монта команды противника нет приёмов",
                all(len(m.moves) == 0 for m in b.opponent_team.values()))
     check_true("без раскрытых приёмов зеркало нулевое", float(obs0[MIRROR:MIRROR + 12].max()) == 0.0)
-    check_true("без раскрытых приёмов флаги нулевые", float(obs0[FLAGS:].max()) == 0.0)
+    check_true("без раскрытых приёмов флаги нулевые",
+               float(obs0[FLAGS:OFF + DAMAGE_BLOCK_SIZE].max()) == 0.0)
 
     # наш собственный приём: виден нам сразу, как в настоящем бою
     feed(b, [

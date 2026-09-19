@@ -500,8 +500,11 @@ def test_fusion_map_is_side_local():
     """Фьюжн-статы берутся только со своей стороны, даже если species совпала."""
     from agents.config import N_FEATURES
     from agents.damage import DAMAGE_BLOCK_SIZE
-    # в полном obs блок признаков урона идёт в конец — индексы срезов сдвинуты
-    off = N_FEATURES - DAMAGE_BLOCK_SIZE
+    from agents.training import MIN_PREFIX_OBS_DIM
+    # блок признаков урона начинается сразу после префикса; за ним идёт блок типов соперника
+    # (см. features.TYPE_MATCHUP_BLOCK_SIZE), поэтому его индексы считаем от префикса, а не от хвоста
+    off = int(MIN_PREFIX_OBS_DIM)
+    assert off + DAMAGE_BLOCK_SIZE < N_FEATURES, "ожидался ещё один блок после блока урона"
     our = mk_mon("shared", (PT.NORMAL,), ["tackle", "protect"])
     bench = mk_mon("bench", (PT.NORMAL,), ["tackle", "protect"])
     opp = mk_mon("foe", (PT.NORMAL,), ["tackle", "protect"])

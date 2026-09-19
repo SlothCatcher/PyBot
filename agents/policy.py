@@ -5,9 +5,10 @@ from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
 from .config import N_FEATURES
 
-# N_FEATURES вырос 594 -> 629 -> 641 -> 653 -> 713 -> 715 -> 802 (+87 урона) -> 870 (+68 зеркало и флаги).
-# При 870 признаках первый слой (870->512) = 445k параметров, это ~40% сети; весь блок урона
-# (155 признаков) стоит +6% параметров сети, сжатие первого слоя 870->512 = 1.70x.
+# N_FEATURES вырос 594 -> 629 -> 641 -> 653 -> 713 -> 715 -> 802 (+87 урона) -> 870 (+68 зеркало и флаги)
+# -> 991 (+121 типы соперника x наша команда, см. features.TYPE_MATCHUP_BLOCK_SIZE).
+# При 991 признаке первый слой (991->512) = 507k параметров, это ~40% сети; блок урона
+# (155 признаков) стоит +6% параметров сети, сжатие первого слоя 991->512 = 1.94x.
 # Размер экстрактора параметризован: `--features-dim` в policy_player (по умолчанию 512).
 # Смена размера не ломает warm start — веса старого чекпоинта паддятся (см.
 # _migrate_checkpoint_dim: новые нейроны входят с нулевыми весами, LayerNorm weight=1/bias=0).
@@ -27,7 +28,7 @@ from .config import N_FEATURES
 
 
 class FeaturesExtractor(BaseFeaturesExtractor):
-    """Нормализует N_FEATURES признаков (сейчас 870) перед pi/vf головами. features_dim=512."""
+    """Нормализует N_FEATURES признаков (сейчас 991) перед pi/vf головами. features_dim=512."""
     def __init__(self, observation_space, features_dim: int = 512, dropout: float = 0.1):
         super().__init__(observation_space, features_dim=features_dim)
         self.net = nn.Sequential(

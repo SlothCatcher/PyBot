@@ -339,9 +339,13 @@ def main():
         check("метрика: свежая сеть использует новые признаки наравне (RMS ratio ~1)",
               0.7 < float(m.get("arch/new_cols_rms_ratio", 0)) < 1.4,
               f"ratio={m.get('arch/new_cols_rms_ratio'):.3f}")
-        check("метрика: размер блока урона совпадает с DAMAGE_BLOCK_SIZE",
-              int(m.get("arch/obs_dim", 0)) - 715 == DAMAGE_BLOCK_SIZE,
-              f"{int(m.get('arch/obs_dim', 0)) - 715} vs {DAMAGE_BLOCK_SIZE}")
+        from agents.features import TYPE_MATCHUP_BLOCK_SIZE
+        new_cols = int(m.get("arch/obs_dim", 0)) - 715
+        check("метрика: новые колонки == блок урона + блок типов соперника",
+              new_cols == DAMAGE_BLOCK_SIZE + TYPE_MATCHUP_BLOCK_SIZE,
+              f"{new_cols} vs {DAMAGE_BLOCK_SIZE} + {TYPE_MATCHUP_BLOCK_SIZE}")
+        check("метрика: размер самого блока урона не поехал",
+              DAMAGE_BLOCK_SIZE == 155, str(DAMAGE_BLOCK_SIZE))
 
     with tempfile.TemporaryDirectory() as td:
         full4 = make_checkpoint(N_FEATURES, os.path.join(td, "full4.zip"))

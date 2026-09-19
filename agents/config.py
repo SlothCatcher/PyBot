@@ -9,13 +9,15 @@ from poke_env.player import DefaultBattleOrder, Player
 import numpy as np
 
 BATTLE_FORMAT = "gen9fusionmonsrandombattle"
-# 715 -> 802 -> 870: признаки урона (см. agents/damage.py DAMAGE_BLOCK_SIZE = 155):
+# 715 -> 802 -> 870: признаки урона (см. agents/damage.py DAMAGE_BLOCK_SIZE = 155);
+# 870 -> 991: блок типов противника против нашей команды
+# (features.TYPE_MATCHUP_BLOCK_SIZE = 121, см. features._type_matchup_block):
 #   +87  наши приёмы / входящий удар / матрицы 6x6
 #   +12  известные приёмы противника по нашему активному (min/max/KO)
 #   +24  те же приёмы противника по нашим 6 слотам (min_frac)
 #   +32  флаги особых эффектов у противника (hazards/статусы/контроль/буст/...):
 #   12 (4 приёма x min/max/ko) + 3 (входящий лучший) + 36 + 36 (матрицы 6x6)
-N_FEATURES = 870  # 713 +2 is_tera (our/opp active terastallized now). Было 713: 120 moves(4*30) +4 faint/hp +14 status +8 hazards +4 switches +14 boosts(7+7) +12 actual +40 ability(20+20) +10 weather/field +9 trick/tail/screens +1 speed +2 revealed +2 semi +2 sub +1 restr +22 volatiles +22 items +400 bench +2 vuln +3 tera +19 tera_type +2 protect . 715 = +2 is_tera
+N_FEATURES = 991  # 713 +2 is_tera (our/opp active terastallized now). Было 713: 120 moves(4*30) +4 faint/hp +14 status +8 hazards +4 switches +14 boosts(7+7) +12 actual +40 ability(20+20) +10 weather/field +9 trick/tail/screens +1 speed +2 revealed +2 semi +2 sub +1 restr +22 volatiles +22 items +400 bench +2 vuln +3 tera +19 tera_type +2 protect . 715 = +2 is_tera  # +121: типы соперника x наша команда (TYPE_MATCHUP_BLOCK_SIZE)
 VECNORM_PATH = "models/vecnormalize.pkl"
 SELF_PLAY_PATH = "models/self_play_snapshot"
 QUALIFIED_PREFIX = "self_play_qualified_"

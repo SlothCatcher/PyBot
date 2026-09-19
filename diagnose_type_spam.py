@@ -173,10 +173,16 @@ class TypeDiagPlayer(PolicyPlayer):
             except Exception as e:
                 print(f"[diag] ошибка obs-сверки: {e}")
 
-        # эффективность всех приёмов
+        # эффективность всех приёмов — по тем же типам, что уходят в obs (у фьюжнов тип на скамейке
+        # poke-env не знает, см. fusion_types.py; для активного мон это серверные типы, как и раньше)
         effs = []
+        try:
+            from agents.fusion_types import effective_types as _effective_types
+            _ot1, _ot2, _ = _effective_types(opp)
+        except Exception:
+            _ot1, _ot2 = getattr(opp, "type_1", None), getattr(opp, "type_2", None)
         for m in moves:
-            mult, unknown = damage_multiplier_safe_ex(getattr(m, "type", None), getattr(opp, "type_1", None), getattr(opp, "type_2", None))
+            mult, unknown = damage_multiplier_safe_ex(getattr(m, "type", None), _ot1, _ot2)
             effs.append((m, float(mult), bool(unknown), _move_bp(m) >= 10))
 
         # выбранный приём

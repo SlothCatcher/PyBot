@@ -40,7 +40,10 @@ from agents import type_utils
 from agents.damage import estimate_damage, prepare_mon
 from agents.damage import DAMAGE_BLOCK_SIZE, FLAGS_BASE, MIRROR_BASE, TEAM_BASE
 from agents.training import MIN_PREFIX_OBS_DIM
-from agents.features import _fusion_entry_for, _vulnerability_frac, _weakness_score, embed_battle_with_fusion
+from agents.features import (
+    TYPE_MATCHUP_BLOCK_SIZE, _fusion_entry_for, _vulnerability_frac, _weakness_score,
+    embed_battle_with_fusion,
+)
 
 OK = 0
 FAIL = []
@@ -311,8 +314,11 @@ def main() -> int:
                  ft.effective_type_names(b1.active_pokemon), ("GRASS", "FLYING"))
 
     check_eq("obs одинаковой размерности", obs_fusion.shape, obs_dex.shape)
-    base = obs_fusion.shape[0] - DAMAGE_BLOCK_SIZE     # блок урона лежит в хвосте obs
-    check_eq("блок урона в хвосте obs", int(base), int(MIN_PREFIX_OBS_DIM))
+    # блок урона начинается сразу после префикса (за ним идёт блок типов соперника)
+    base = int(MIN_PREFIX_OBS_DIM)
+    check_eq("блок урона начинается ровно после префикса", int(base), 715)
+    check_eq("за блоком урона идёт блок типов соперника",
+             int(obs_fusion.shape[0]) - base - int(DAMAGE_BLOCK_SIZE), int(TYPE_MATCHUP_BLOCK_SIZE))
 
     d_best = float(np.abs(obs_fusion[base + 12:base + 15] - obs_dex[base + 12:base + 15]).max())
     check("лучший приём противника по нашему активному считается по фьюжн-типу",

@@ -46,13 +46,22 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from poke_env.battle import Battle, SideCondition, Weather
+from poke_env.battle import Battle, PokemonType, SideCondition, Weather
 from poke_env.player import RandomPlayer, SimpleHeuristicsPlayer
 
 from agents import config as _cfg
 from agents.config import N_FEATURES
+from poke_env.data import GenData
+
+GENDATA_TYPE_CHART = GenData.from_gen(9).type_chart
+from agents.features import _TYPE_INDEX as TYPE_INDEX
 from agents.damage import DAMAGE_BLOCK_SIZE, EFFECT_FLAGS, FLAGS_BASE, MIRROR_BASE, TEAM_BASE
-from agents.features import embed_battle_with_fusion
+from agents.features import (
+    TYPE_MATCHUP_BASE, TYPE_MATCHUP_BLOCK_SIZE, _eff_types, _matchup_team_slots,
+    _type_matchup_block, _type_multi_hot, embed_battle_with_fusion,
+)
+from agents.fusion_types import effective_types
+from agents.type_utils import damage_multiplier_safe
 from agents.players import HeuristicRecorder, PolicyPlayer
 from agents.vecnorm_utils import (
     LiveVecNormalizeAdapter,
@@ -243,7 +252,7 @@ LAYOUT = [
     ("trick/tailwind/screens", 9), ("speed", 1), ("revealed", 2), ("semi_invuln", 2),
     ("sub_damage", 2), ("restricted", 1), ("volatiles", 22), ("items", 22), ("bench", 400),
     ("vulnerability", 2), ("tera_meta", 3), ("is_tera", 2), ("tera_type", 19), ("protect", 2),
-    ("damage", DAMAGE_BLOCK_SIZE),
+    ("damage", DAMAGE_BLOCK_SIZE), ("type_matchup", TYPE_MATCHUP_BLOCK_SIZE),
 ]
 
 
@@ -274,6 +283,14 @@ def part1_layout():
     check_eq("DAMAGE_BLOCK_SIZE - FLAGS_BASE == len(EFFECT_FLAGS)",
              DAMAGE_BLOCK_SIZE - FLAGS_BASE, len(EFFECT_FLAGS))
     check_eq("DAMAGE_BLOCK_SIZE", DAMAGE_BLOCK_SIZE, 155)
+    check_eq("блок урона кончается там, где начинается блок типов соперника",
+             off["type_matchup"][0], TYPE_MATCHUP_BASE)
+    check_eq("TYPE_MATCHUP_BASE = префикс + блок урона",
+             MIN_PREFIX_OBS_DIM + DAMAGE_BLOCK_SIZE, TYPE_MATCHUP_BASE)
+    check_eq("блок типов соперника в хвосте (после него ничего нет)",
+             off["type_matchup"][1], N_FEATURES)
+    check_eq("TYPE_MATCHUP_BLOCK_SIZE = типы активного + 12 строк + 6 флагов",
+             19 + 2 * 8 * 6 + 6, TYPE_MATCHUP_BLOCK_SIZE)
 
     # порядок: сдвиг одного признака должен менять колонки ТОЛЬКО своего сегмента
     b = make_battle()
@@ -301,7 +318,8 @@ def part1_layout():
     # тера честно меняет и STAB-флаги приёмов, и блок урона (типы стали другими) —
     # поэтому окна: приёмы, tera-meta, is_tera, tera_type, damage
     check_windows("тера активного меняет только связанные сегменты", diff4,
-                  [off["our_moves(4x30)"], off["tera_meta"], off["is_tera"], off["tera_type"], off["damage"]])
+                  [off["our_moves(4x30)"], off["tera_meta"], off["is_tera"], off["tera_type"],
+                   off["damage"], off["type_matchup"]])
     check(f"тера: колонка our_is_tera[{off['is_tera'][0]}] изменилась",
           off["is_tera"][0] in diff4, f"diff={list(diff4)}")
 
@@ -315,6 +333,92 @@ def part1_layout():
                   [off["switches"], off["bench"]])
     check(f"HP скамейки: изменилась колонка bench[{off['bench'][0]}..]", 
           any(off["bench"][0] <= i < off["bench"][1] for i in diff5), f"diff={list(diff5)}")
+
+    # (e) типы соперника: сдвигаем тип активного оппонента -> меняются наши мультипликаторы по
+    #     нему (our_moves), блок урона и блок типов; всё остальное трогать не должен
+    b6 = copy.deepcopy(b)
+    if b6.opponent_active_pokemon is not None:
+        b6.opponent_active_pokemon._temporary_types = [PokemonType.WATER, None]
+    diff6 = np.where(core_obs(b6, FUSION, FUSION) != base)[0]
+    check_windows("тип активного оппонента меняет только приёмы/урон/блок типов", diff6,
+                  [off["our_moves(4x30)"], off["damage"], off["type_matchup"]])
+    check("тип оппонента: изменились колонки блока типов",
+          any(off["type_matchup"][0] <= i < off["type_matchup"][1] for i in diff6),
+          f"diff={list(diff6)}")
+
+    # (f) матрица «тип соперника x наш покемон»: ПЕРЕСЧИТЫВАЕМ ВСЕ 12 строк и все 6 слотов
+    from agents.features import _matchup_team_slots, _type_matchup_block
+    block = _type_matchup_block(b)
+    rows_base, conf_base = 19, 19 + 2 * 8 * 6
+    ours = _matchup_team_slots(b.active_pokemon, b.team)
+    theirs = _matchup_team_slots(b.opponent_active_pokemon, b.opponent_team)
+
+    filled, empty, worst_m = 0, 0, 0.0
+    checked: list = []
+    for i, mon in enumerate(theirs):
+        if mon is None:
+            continue
+        t1, t2, src = effective_types(mon, battle=b)
+        for j, atk in enumerate((t1, t2)):
+            row = rows_base + (i * 2 + j) * 8
+            if atk is None:
+                empty += 1
+                check(f"блок типов: пустой слот соперника {i}/{j} — строка нулевая",
+                      float(block[row]) == 0.0 and float(np.abs(block[row + 1:row + 8]).sum()) == 0.0,
+                      f"row={block[row:row + 8].tolist()}")
+                continue
+            filled += 1
+            check(f"блок типов: флаг типа {i}/{j}",
+                  float(block[row]) == 1.0, f"флаг={float(block[row])}")
+            want_scalar = (TYPE_INDEX[atk] if atk in TYPE_INDEX else 0) / 18.0
+            check(f"блок типов: скаляр типа {i}/{j}",
+                  abs(float(block[row + 1]) - want_scalar) < 1e-6,
+                  f"got={float(block[row + 1]):.6f} want={want_scalar:.6f}")
+            for k, mon2 in enumerate(ours):
+                mt1, mt2 = _eff_types(mon2) if mon2 is not None else (None, None)
+                if mt1 is None and mt2 is None:
+                    continue
+                want = damage_multiplier_safe(atk, mt1, mt2, type_chart=GENDATA_TYPE_CHART)
+                got = float(block[row + 2 + k])
+                worst_m = max(worst_m, abs(got - want))
+                checked.append(f"соп{i}/{j}->наш{k}: {got:.2f}/{want:.2f}")
+    check("блок типов: строки с типами есть (проверка не вакуумная)", filled >= 1,
+          f"заполнено {filled}, пусто {empty}")
+    check("блок типов: матрица == ручной пересчёт по типам (все строки x все слоты)",
+          worst_m <= 1e-6, f"max|Δ|={worst_m:.3e}; " + " | ".join(checked[:8]))
+    check("блок типов: есть хотя бы один не-нейтральный множитель (иначе матрица бесполезна)",
+          any(abs(float(block[rows_base + r * 8 + 2 + k]) - 1.0) > 0.01
+              for r in range(12) for k in range(6)),
+          "все множители = 1.0")
+    check("блок типов: multi-hot нашего активного == _type_multi_hot(активный)",
+          bool(np.array_equal(np.asarray(block[:19]), _type_multi_hot(b.active_pokemon))),
+          f"multi-hot={block[:19].tolist()}")
+    check("блок типов: у нашего активного действительно есть типы в multi-hot",
+          float(np.asarray(block[:19]).sum()) >= 1.0, f"сумма={float(np.asarray(block[:19]).sum())}")
+    check("блок типов: флаги «тип подтверждён сервером» — 0/1 по слотам соперника",
+          all(float(v) in (0.0, 1.0) for v in block[conf_base:conf_base + 6]),
+          f"флаги={block[conf_base:conf_base + 6].tolist()}")
+    check("блок типов: без серверного typechange тип считается выведенным (флаг 0)",
+          float(block[conf_base]) == 0.0, f"флаг={float(block[conf_base])}")
+
+    # сервер прислал тип (как при выходе на поле): флаг становится 1, а матрица — по этому типу
+    block6 = _type_matchup_block(b6)          # b6: у активного оппонента _temporary_types = Water
+    check("блок типов: typechange с сервера -> флаг подтверждения = 1",
+          float(block6[conf_base]) == 1.0, f"флаг={float(block6[conf_base])}")
+    want_scalar_w = (TYPE_INDEX[PokemonType.WATER] if PokemonType.WATER in TYPE_INDEX else 0) / 18.0
+    check("блок типов: typechange с сервера -> в блоке именно серверный тип",
+          abs(float(block6[rows_base + 1]) - want_scalar_w) < 1e-6,
+          f"скаляр={float(block6[rows_base + 1]):.6f} хотели={want_scalar_w:.6f}")
+    worst_w, checked_w = 0.0, 0
+    for k, mon2 in enumerate(ours):
+        mt1, mt2 = _eff_types(mon2) if mon2 is not None else (None, None)
+        if mt1 is None and mt2 is None:
+            continue                      # пустой слот команды: в блоке 0.0 (мон отсутствует)
+        want = damage_multiplier_safe(PokemonType.WATER, mt1, mt2, type_chart=GENDATA_TYPE_CHART)
+        worst_w = max(worst_w, abs(float(block6[rows_base + 2 + k]) - want))
+        checked_w += 1
+    check("блок типов: множители по серверному типу == ручной расчёт",
+          worst_w <= 1e-6 and checked_w >= 1, f"слотов сверено {checked_w}, max|Δ|={worst_w:.3e}")
 
     ROWS.append(("раскладка (офлайн)", N_FEATURES, "—", 0.0, h8(base)))
 
