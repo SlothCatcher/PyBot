@@ -8,7 +8,7 @@ import torch
 from poke_env.player import MaxBasePowerPlayer, Player, RandomPlayer, SimpleHeuristicsPlayer
 from stable_baselines3 import PPO
 
-from .config import BATTLE_FORMAT
+from .config import BATTLE_FORMAT, N_FEATURES
 from .players import HeuristicRecorder, PolicyPlayer
 
 class LRSchedule:
@@ -31,9 +31,17 @@ class StepCounterCallback:
         self.ent_schedule = ent_schedule
         self.ppo_ref = ppo_ref  # ссылка на PPO чтобы менять ent_coef на лету
         self.mix_every = max(int(mix_every), 1)
-        # forced — шаги без выбора (маска разрешает ровно одно действие: ожидание соперника
-        # или принудительный свитч после фейнта); их нельзя показывать как «свитч политики»
-        self._mix = {"switch": 0, "move": 0, "tera": 0, "gimmick": 0, "other": 0, "forced": 0}
+        # Разделяем свитчи, иначе метрика врёт (жалоба: «[mix] 60% свитчей, а в боях модель
+        # не свитчила ни разу»):
+        #   switch        — свитч, когда приёмы БЫЛИ доступны: собственный выбор политики;
+        #   switch_forced — свитч, когда приёмов нет вообще (наш покемон упал, маска = только
+        #                   свитчи): в бою это видно как свитч, но выбора «атака или свитч» нет;
+        #   single        — шагов с ровно одним разрешённым действием (подмножество
+        #                   switch_forced: остался один живой покемон). Диагностика wait-шагов.
+        #   choice        — шагов, где у агента был настоящий выбор (>=2 легальных действий и
+        #                   есть приёмы). Всё остальное — сервер заставил (фейнт/ожидание).
+        self._mix = {"switch": 0, "switch_forced": 0, "move": 0, "tera": 0,
+                     "gimmick": 0, "other": 0, "single": 0, "choice": 0}
         self._mix_next = self.mix_every
         self._mask_shape_warned = False
 
@@ -52,25 +60,29 @@ class StepCounterCallback:
         return "other"
 
     def action_mix(self) -> dict:
-        total = sum(self._mix[k] for k in ("switch", "move", "tera", "gimmick", "other"))
+        sw_all = self._mix["switch"] + self._mix["switch_forced"]
+        total = sum(self._mix[k] for k in ("switch", "switch_forced", "move", "tera", "gimmick", "other"))
         out = dict(self._mix)
         out["_total"] = total            # все шаги, что видел SB3 (= столько же действий ушло в бой)
-        out["_decided"] = total - self._mix["forced"]   # из них шагов с реальным выбором
+        out["_decided"] = self._mix["choice"]   # шаги, где был настоящий выбор (>1 варианта и есть приёмы)
         if total:
-            out["_switch_share"] = round(self._mix["switch"] / total, 4)
+            out["_switch_share"] = round(sw_all / total, 4)                # сколько ВСЕХ свитчей
+            out["_switch_own_share"] = round(self._mix["switch"] / total, 4)      # свитч как выбор
+            out["_switch_forced_share"] = round(self._mix["switch_forced"] / total, 4)  # свитч по фейнту
             out["_move_share"] = round(self._mix["move"] / total, 4)
             out["_tera_share"] = round(self._mix["tera"] / total, 4)
-            out["_forced_share"] = round(self._mix["forced"] / total, 4)
+            out["_single_share"] = round(self._mix["single"] / total, 4)
+            out["_choice_share"] = round(self._mix["choice"] / total, 4)
         return out
 
     @staticmethod
-    def _forced_mask_rows(mask) -> "object":
-        """Булева маска строк (env-ов), где выбор отсутствует (разрешено ровно одно действие).
+    def _mask_rows(mask) -> "tuple | None":
+        """(single, no_moves) по строкам env-ов из маски действий.
 
-        Такие строки — не решение политики: маска `[1, 0, 0, ...]` приходит в состоянии
-        ожидания соперника (`battle._wait`), где poke-env вообще не применяет действие,
-        а политика обязана выбрать 0 — это индекс СВИТЧА. Раньше эти шаги попадали в
-        «свитч» и раздували метрику (пользователь видит 60% свитчей, а в бою их нет).
+        single   — разрешено ровно одно действие: состояние ожидания соперника (`battle._wait`
+                   даёт маску `[1, 0, 0, ...]`) или принудительный свитч с одним живым покемоном.
+                   В обоих случаях политика обязана выбрать действие 0, и это индекс СВИТЧА.
+        no_moves — приёмов нет вообще (mask[6:] пусто): наш покемон упал, сервер требует свитч.
         """
         try:
             m = mask
@@ -81,7 +93,7 @@ class StepCounterCallback:
             arr = _np.asarray(arr)
             if arr.ndim == 1:
                 arr = arr.reshape(1, -1)
-            return arr.sum(axis=-1) == 1
+            return (arr.sum(axis=-1) == 1, arr[..., 6:].sum(axis=-1) == 0)
         except Exception:
             return None
 
@@ -94,33 +106,40 @@ class StepCounterCallback:
             except Exception:
                 pass
         # диагностика: какие действия выбирает политика (свитч/приём/тера).
-        # Считаем ТОЛЬКО настоящие решения: шаги, где маска разрешала ровно одно действие
-        # (ожидание соперника / принудительный свитч), идут в отдельный счётчик «forced».
+        # Классифицируем действие ВМЕСТЕ с маской из того же шага, иначе свитчи не отличить от
+        # вынужденных (см. комментарий к self._mix).
         try:
             actions = _locals.get("actions") if isinstance(_locals, dict) else None
             if actions is not None:
                 acts = np.asarray(actions).reshape(-1)
-                forced = None
+                rows = None
                 obs_t = _locals.get("obs_tensor") if isinstance(_locals, dict) else None
                 if isinstance(obs_t, dict) and "action_mask" in obs_t:
-                    forced = self._forced_mask_rows(obs_t["action_mask"])
-                if forced is None and self.ppo_ref is not None:
-                    forced = self._forced_mask_rows(getattr(self.ppo_ref.policy, "_mask", None))
-                if forced is not None and len(forced) != acts.size:
+                    rows = self._mask_rows(obs_t["action_mask"])
+                if rows is None and self.ppo_ref is not None:
+                    rows = self._mask_rows(getattr(self.ppo_ref.policy, "_mask", None))
+                if rows is not None and len(rows[0]) != acts.size:
                     if not getattr(self, "_mask_shape_warned", False):
                         self._mask_shape_warned = True
-                        print(f"WARNING: маска ({len(forced)}) не совпала с числом действий ({acts.size}) — "
-                              f"[mix] считает все шаги как решения")
-                    forced = None
+                        print(f"WARNING: маска ({len(rows[0])}) не совпала с числом действий ({acts.size}) — "
+                              f"[mix] не сможет отделить вынужденные свитчи")
+                    rows = None
+                single, no_moves = rows if rows is not None else (None, None)
                 for i, a in enumerate(acts):
-                    self._mix[self.classify_action(int(a))] += 1
-                    # шаг без выбора (маска разрешала ровно одно действие) — считаем и его
-                    # класс (действие реально уходит в бой), но отдельно помечаем: это не выбор
-                    # политики. Если счётчик вдруг большой при живой метрике свитчей —
-                    # значит в шаги попали состояния ожидания (см. DecisionWrapper в env.py).
-                    if forced is not None and bool(forced[i]):
-                        self._mix["forced"] += 1
-                total = sum(self._mix.values())
+                    kind = self.classify_action(int(a))
+                    if kind == "switch" and no_moves is not None:
+                        # свитч без доступных приёмов = покемон упал; это не выбор «атака/свитч»
+                        key = "switch_forced" if bool(no_moves[i]) else "switch"
+                    else:
+                        key = kind
+                    self._mix[key] += 1
+                    if single is not None and bool(single[i]):
+                        self._mix["single"] += 1
+                    if single is not None and no_moves is not None \
+                            and not bool(single[i]) and not bool(no_moves[i]):
+                        self._mix["choice"] += 1   # был выбор: >=2 действий и доступны приёмы
+                total = sum(self._mix[k] for k in
+                            ("switch", "switch_forced", "move", "tera", "gimmick", "other"))
                 if total >= self._mix_next:
                     self._mix_next = total + self.mix_every
                     self._log_mix(total)
@@ -130,18 +149,30 @@ class StepCounterCallback:
 
     def _log_mix(self, total: int) -> None:
         mix = self.action_mix()
-        msg = (f"[mix] решений {mix.get('_total', total)}: свитч {mix.get('_switch_share', 0.0) * 100:.1f}%, "
-               f"приём {mix.get('_move_share', 0.0) * 100:.1f}%, тера {mix.get('_tera_share', 0.0) * 100:.1f}% "
-               f"(свитчей {mix['switch']}, приёмов {mix['move']}, тер {mix['tera']}), "
-               f"без выбора {mix.get('_forced_share', 0.0) * 100:.1f}% ({mix['forced']} шагов)")
+        n_all = max(mix.get("_total", total), 1)
+        own = mix["switch"]
+        forced = mix["switch_forced"]
+        msg = (f"[mix] решений {mix.get('_total', total)}: "
+               f"приём {mix.get('_move_share', 0.0) * 100:.1f}%, "
+               f"тера {mix.get('_tera_share', 0.0) * 100:.1f}%, "
+               f"свитч {mix.get('_switch_share', 0.0) * 100:.1f}% "
+               f"(своих {own} = {own / n_all * 100:.1f}%, вынужденных после фейнта {forced} = {forced / n_all * 100:.1f}%)")
+        if mix["gimmick"] or mix["other"]:
+            msg += f", прочее {(mix['gimmick'] + mix['other']) / n_all * 100:.1f}%"
+        msg += (f"; шагов без выбора {mix['single']} ({mix.get('_single_share', 0.0) * 100:.1f}%), "
+                f"своих решений (был выбор) {mix.get('_decided', 0)} "
+                f"({mix.get('_choice_share', 0.0) * 100:.1f}%)")
         print(msg)
         try:
             logger = getattr(self.ppo_ref, "logger", None)
             if logger is not None:
                 logger.record("mix/switch_share", float(mix.get("_switch_share", 0.0)))
+                logger.record("mix/switch_own_share", float(mix.get("_switch_own_share", 0.0)))
+                logger.record("mix/switch_forced_share", float(mix.get("_switch_forced_share", 0.0)))
                 logger.record("mix/move_share", float(mix.get("_move_share", 0.0)))
                 logger.record("mix/tera_share", float(mix.get("_tera_share", 0.0)))
-                logger.record("mix/forced_share", float(mix.get("_forced_share", 0.0)))
+                logger.record("mix/single_share", float(mix.get("_single_share", 0.0)))
+                logger.record("mix/choice_share", float(mix.get("_choice_share", 0.0)))
         except Exception:
             pass
 
@@ -1413,35 +1444,66 @@ def _get_opponent_weights(names: list[str]) -> list[float]:
     total2 = sum(weights)
     return [w / total2 for w in weights]
 
-def evaluate_win_rates(ppo, n_battles: int = 180) -> dict[str, float]:
-    # Нормализация obs: используем РОВНО те же статистики, что видит обучение (живой
-    # VecNormalize), через штатный параметр PolicyPlayer. Раньше здесь подменялся
-    # embed_battle, а self-play оппонент для eval создавался отдельно и без нормализации.
+def eval_normalizer_for(ppo):
+    """Нормализатор obs для боёв за винрейт: РОВНО та статистика, что видит обучение.
+
+    Вынесено из evaluate_win_rates отдельной функцией, чтобы это проверялось тестом без
+    сервера. Регрессия: здесь стоял `target_dim=N_FEATURES` без импорта — NameError глотался
+    `except Exception`, нормализация молча выключалась, и модель в боях оценки играла на
+    СЫРЫХ признаках (другие условия, чем обучение): винрейт и поведение (свитчи/тера) не
+    сопоставимы с `[mix]`. Теперь про сбой пишется явно.
+    """
     vec_norm = ppo.get_vec_normalize_env() if hasattr(ppo, "get_vec_normalize_env") else None
-    normalizer = None
     if vec_norm is not None:
         try:
             from .vecnorm_utils import LiveVecNormalizeAdapter
             normalizer = LiveVecNormalizeAdapter(vec_norm, target_dim=N_FEATURES)
         except Exception as e:
-            print(f"Не удалось включить нормализацию для eval: {e}")
-    if normalizer is None and os.environ.get("PYBOT_SELF_PLAY_NORM", "1") != "0":
-        # запасной путь: живой VecNormalize недоступен (например, оценка идёт из другого места) —
-        # берём статистику с диска. НЕ применяем, если обучение идёт без нормализации
-        # (--no-normalize-bc): иначе eval окажется в других условиях, чем обучение.
-        try:
-            from .config import VECNORM_PATH
-            from .vecnorm_utils import load_vecnorm_stats
-            if os.path.isfile(VECNORM_PATH):
-                normalizer = load_vecnorm_stats(VECNORM_PATH, N_FEATURES)
-                if normalizer is not None:
-                    print(f"eval: нормализация obs из {VECNORM_PATH} ({normalizer.describe()})")
-        except Exception:
             normalizer = None
+            print(f"НЕ УДАЛОСЬ включить нормализацию для eval ({type(e).__name__}: {e}) — "
+                  f"пробую статистику с диска")
+        if normalizer is not None:
+            why = ""
+            try:
+                why = f" ({normalizer.describe()})"
+            except Exception:
+                pass
+            print(f"eval: нормализация obs из живого VecNormalize (как в обучении){why}")
+            return normalizer
+
+    if os.environ.get("PYBOT_SELF_PLAY_NORM", "1") == "0":
+        print("eval: нормализация obs отключена (PYBOT_SELF_PLAY_NORM=0)")
+        return None
+    # запасной путь: живой VecNormalize недоступен (например, оценка идёт из другого места) —
+    # берём статистику с диска. НЕ применяем, если обучение идёт без нормализации
+    # (--no-normalize-bc): иначе eval окажется в других условиях, чем обучение.
+    try:
+        from .config import VECNORM_PATH
+        from .vecnorm_utils import load_vecnorm_stats
+        if os.path.isfile(VECNORM_PATH):
+            normalizer = load_vecnorm_stats(VECNORM_PATH, N_FEATURES)
+            if normalizer is not None:
+                try:
+                    why = f" ({normalizer.describe()})"
+                except Exception:
+                    why = ""
+                print(f"eval: нормализация obs из {VECNORM_PATH}{why}")
+                return normalizer
+    except Exception as e:
+        print(f"eval: статистику с диска взять не удалось ({type(e).__name__}: {e})")
+    print("ВНИМАНИЕ: eval играет БЕЗ нормализации obs — если обучение шло с нормализацией, "
+          "винрейт и поведение модели в боях НЕ сопоставимы с [mix]")
+    return None
+
+
+def evaluate_win_rates(ppo, n_battles: int = 180) -> dict[str, float]:
+    # Нормализация obs: ровно те же статистики, что видит обучение (живой VecNormalize),
+    # через штатный параметр PolicyPlayer — см. eval_normalizer_for().
+    normalizer = eval_normalizer_for(ppo)
     base_agent = PolicyPlayer(policy=ppo.policy, battle_format=BATTLE_FORMAT,
                               max_concurrent_battles=30, obs_normalizer=normalizer)
     # считаем реальные решения модели в оценочных боях (без wait-шагов, как в [mix])
-    base_agent.action_counter = {"switch": 0, "move": 0, "tera": 0, "other": 0}
+    base_agent.action_counter = {"switch": 0, "switch_forced": 0, "move": 0, "tera": 0, "other": 0}
 
     opponents: list[Player] = [
         c(battle_format=BATTLE_FORMAT, max_concurrent_battles=30)
@@ -1473,11 +1535,14 @@ def evaluate_win_rates(ppo, n_battles: int = 180) -> dict[str, float]:
         cnt = base_agent.action_counter or {}
         n_dec = sum(int(v) for v in cnt.values())
         if n_dec:
+            own = int(cnt.get("switch", 0))
+            forced = int(cnt.get("switch_forced", 0))
             print(f"eval-микс (решения модели в оценочных боях): "
-                  f"свитч {cnt.get('switch', 0) / n_dec * 100:.1f}%, "
                   f"приём {cnt.get('move', 0) / n_dec * 100:.1f}%, "
-                  f"тера {cnt.get('tera', 0) / n_dec * 100:.1f}% "
-                  f"({cnt.get('switch', 0)}/{cnt.get('move', 0)}/{cnt.get('tera', 0)} из {n_dec})")
+                  f"тера {cnt.get('tera', 0) / n_dec * 100:.1f}%, "
+                  f"свитч {(own + forced) / n_dec * 100:.1f}% "
+                  f"(своих {own} = {own / n_dec * 100:.1f}%, вынужденных после фейнта {forced} = "
+                  f"{forced / n_dec * 100:.1f}%) из {n_dec} решений")
     except Exception:
         pass
     rates: dict[str, float] = {}

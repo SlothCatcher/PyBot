@@ -106,6 +106,55 @@ def main() -> int:
     check(f"repo-статистика ({src_dim}) не считается статистикой текущей раскладки ({N_FEATURES})",
           (src_dim == N_FEATURES) or (keep is False), f"keep={keep}, reason={reason}")
 
+    # ----------------------------- нормализация в боях за винрейт (eval) --------------
+    # Регрессия: в evaluate_win_rates стоял `target_dim=N_FEATURES` без импорта -> NameError
+    # глотался except'ом, и модель в боях оценки играла на СЫРЫХ признаках, хотя обучение
+    # шло с нормализацией (винрейт и свитчи/тера в боях не сопоставимы с [mix]).
+    from agents import training as _training
+    check_eq("training.N_FEATURES импортирован на уровне модуля (иначе нормализация eval падала молча)",
+             getattr(_training, "N_FEATURES", None), N_FEATURES)
+
+    class _FakePPO:
+        def __init__(self, vn):
+            self._vn = vn
+        def get_vec_normalize_env(self):
+            return self._vn
+
+    with tempfile.TemporaryDirectory() as td:
+        os.chdir(td)
+        vn_live = make_vecnormalize(N_FEATURES)
+        norm = _training.eval_normalizer_for(_FakePPO(vn_live))
+        check("eval: нормализация берётся из живого VecNormalize (как в обучении)",
+              norm is not None, type(norm).__name__ if norm is not None else "None")
+        if norm is not None:
+            raw = np.zeros(N_FEATURES, dtype=np.float32)
+            raw[0] = float(np.asarray(vn_live.obs_rms["observation"].mean)[0]) + 3.0
+            got = np.asarray(norm.normalize(raw), dtype=np.float32)
+            check("eval: нормализатор реально меняет сырые признаки",
+                  bool(abs(float(got[0]) - float(raw[0])) > 1e-3), f"{raw[0]:.3f} -> {got[0]:.3f}")
+
+        # PYBOT_SELF_PLAY_NORM относится к self-play ОППОНЕНТАМ, а не к оценке: если живой
+        # VecNormalize есть, eval обязан нормализовать так же, как обучение.
+        os.environ["PYBOT_SELF_PLAY_NORM"] = "0"
+        try:
+            check("eval: живой VecNormalize применяется и при PYBOT_SELF_PLAY_NORM=0",
+                  _training.eval_normalizer_for(_FakePPO(vn_live)) is not None, True)
+            check_eq("eval: без живого VecNormalize и с PYBOT_SELF_PLAY_NORM=0 -> без нормализации",
+                     _training.eval_normalizer_for(_FakePPO(None)), None)
+        finally:
+            os.environ.pop("PYBOT_SELF_PLAY_NORM", None)
+
+        # нет ни живого VecNormalize, ни файла статистики -> None, но с громким предупреждением
+        import io as _io
+        import contextlib as _cl
+        buf = _io.StringIO()
+        with _cl.redirect_stdout(buf):
+            none_norm = _training.eval_normalizer_for(_FakePPO(None))
+        out = buf.getvalue()
+        check_eq("eval: без статистики нормализатора нет", none_norm, None)
+        check("eval: про отключённую нормализацию сказано явно (не молча)",
+              "БЕЗ нормализации" in out, out.strip().splitlines()[-1][:90] if out.strip() else "нет вывода")
+
     with tempfile.TemporaryDirectory() as td:
         dim = 100
         p = os.path.join(td, "vn.pkl")

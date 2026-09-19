@@ -273,6 +273,54 @@ def test_run_bc_only_offline(td):
         os.chdir(orig_cwd)
 
 
+def test_model_env_count_sync():
+    """Resume с другим числом env не должен падать на assert в SB3.set_env.
+
+    Регрессия: SB3 хранит n_envs внутри модели и `set_env` требует равенства
+    (`assert env.num_envs == self.n_envs`). Ломалось в двух случаях:
+      * fallback-миграция legacy-чекпоинта собирает политику на probe-окружении (1 env),
+        а обучение идёт с 2+ env — падало до первого шага;
+      * `--resume` сохранённой модели с другим `--num-envs`.
+    """
+    import numpy as np
+    import torch
+    from stable_baselines3 import PPO
+    from stable_baselines3.common.vec_env import DummyVecEnv
+
+    from agents.policy import MaskedActorCriticPolicy
+    from agents.policy_player import _probe_ppo, _sync_model_n_envs
+
+    # 1) probe-политика под 2 env сразу имеет n_envs=2
+    probe, probe_env = _probe_ppo(N_FEATURES, 512, action_dim=26, n_envs=2)
+    check("probe: n_envs=2 передаётся в модель", int(probe.n_envs), 2)
+    probe_env.close()
+
+    # 2) модель, собранная на 1 env, спокойно переезжает на 2 env без потери весов
+    venv1 = DummyVecEnv([lambda: Env870()])
+    model = PPO(MaskedActorCriticPolicy, venv1, device="cpu", verbose=0, n_steps=8, batch_size=8,
+                policy_kwargs=dict(features_extractor_kwargs=dict(features_dim=512)))
+    before = {k: v.detach().clone() for k, v in model.policy.state_dict().items()}
+
+    venv2 = DummyVecEnv([lambda: Env870(), lambda: Env870()])
+    _sync_model_n_envs(model, venv2)
+    check("sync: n_envs модели стал 2", int(model.n_envs), 2)
+    check("sync: rollout buffer пересобран под 2 env",
+          int(model.rollout_buffer.buffer_size), int(model.n_steps) * 2)
+    after = model.policy.state_dict()
+    check("sync: веса политики не изменились",
+          all(bool(torch.equal(before[k], after[k])) for k in before))
+    try:
+        model.set_env(venv2)
+        ok = True
+        err = ""
+    except Exception as e:  # noqa: BLE001
+        ok = False
+        err = f"{type(e).__name__}: {e}"
+    check("sync: set_env после синхронизации проходит", ok, err)
+    venv1.close()
+    venv2.close()
+
+
 def test_cli_wiring():
     args = pp.parse_args(["--dataset-path", "models/mixed.npz", "--epochs", "15", "--contrastive",
                           "--neg-weight", "0.3", "--total-timesteps", "0", "--ent-coef", "0.05",
@@ -310,6 +358,8 @@ def main() -> int:
         test_skip_eval_gates_both_evals()
         print("-" * 74)
         test_cli_wiring()
+        print("-" * 74)
+        test_model_env_count_sync()
         print("-" * 74)
         test_run_bc_only_offline(td)
     print("-" * 74)

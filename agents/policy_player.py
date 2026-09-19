@@ -141,9 +141,15 @@ class _DimProbeEnv(_GymBaseEnv):
         # `size mismatch for action_net` (torch ругается на shape даже при strict=False),
         # то есть миграция не выживала вовсе — снапшот оставался без политики.
         self._action_dim = int(action_dim)
+        # dtype маски обязан совпадать с реальным env (poke-env: Box(0, 1, (n,), np.int8)).
+        # С bool `ppo.set_env(env)` падал на check_for_correct_spaces:
+        #   "Observation spaces do not match: Dict(... Box(False, True, (26,), bool)) !=
+        #    Dict(... Box(0, 1, (26,), int8))"
+        # — то есть любой resume чекпоинта, которому нужен fallback (старые снапшоты с
+        # lr_schedule от другой версии Python), умирал ещё до первого шага.
         self.observation_space = spaces.Dict({
             "observation": spaces.Box(-1.0, 4.0, shape=(int(dim),), dtype=_np.float32),
-            "action_mask": spaces.Box(0, 1, shape=(self._action_dim,), dtype=bool),
+            "action_mask": spaces.Box(0, 1, shape=(self._action_dim,), dtype=_np.int8),
         })
         self.action_space = spaces.Discrete(self._action_dim)
 
@@ -158,7 +164,7 @@ class _DimProbeEnv(_GymBaseEnv):
 
 
 def _probe_ppo(target_dim: int, features_dim: int = 512, action_dim: int = 26,
-               net_arch=None, legacy_extractor: bool = False):
+               net_arch=None, legacy_extractor: bool = False, n_envs: int = 1):
     """PPO со случайной политикой нужной формы (для fallback-миграции).
 
     net_arch и класс экстрактора берутся из самого чекпоинта: старые снапшоты обучены с
@@ -178,7 +184,11 @@ def _probe_ppo(target_dim: int, features_dim: int = 512, action_dim: int = 26,
         kwargs["features_extractor_kwargs"] = dict(features_dim=int(features_dim))
     if net_arch is not None:
         kwargs["net_arch"] = net_arch
-    env = DummyVecEnv([lambda: _DimProbeEnv(int(target_dim), action_dim=int(action_dim))])
+    # n_envs важен: SB3 запоминает число окружений в модели, и `set_env` с другим числом
+    # падает на assert (n_envs 1 из пробы != реальные env). Для fallback-миграции в run()
+    # передаём реальное число env.
+    env = DummyVecEnv([lambda: _DimProbeEnv(int(target_dim), action_dim=int(action_dim))]
+                      * max(int(n_envs), 1))
     return PPO(MaskedActorCriticPolicy, env, device="cpu", verbose=0, n_steps=8, batch_size=8,
                policy_kwargs=kwargs), env
 
@@ -360,7 +370,8 @@ def _checkpoint_arch(path: str) -> dict:
 
 
 def _migrate_checkpoint_dim(ppp_path: str, target_dim: int | None = None, force_fallback: bool = False,
-                            target_features_dim: int | None = None, verbose: bool = True):
+                            target_features_dim: int | None = None, verbose: bool = True,
+                            n_envs: int = 1):
     """Миграция чекпоинта на актуальный N_FEATURES через паддинг весов в zip.
 
     Обобщено: раньше умела ровно 713->715, теперь определяет старую размерность из самих
@@ -419,6 +430,15 @@ def _migrate_checkpoint_dim(ppp_path: str, target_dim: int | None = None, force_
             raise RuntimeError(f"Не нашёл policy state dict в {list(params.keys())[:5]}")
 
         padded = 0
+        # Вход pi/vf-головы = выход экстрактора признаков:
+        #   * новый Linear-экстрактор: выход = features_dim (NEW_F);
+        #   * legacy identity-экстрактор (в чекпоинте нет features_extractor.* весов):
+        #     выход = само число признаков (NEW_N).
+        # Раньше здесь ВСЕГДА паддилось до features_dim, и legacy-чекпоинт "мигрировал" в
+        # тензоры [512, 512] вместо [512, 870]: штатная загрузка падала на size mismatch,
+        # а при 870 -> 512 веса ещё и ОБРЕЗАЛИСЬ (спасал только fallback, который читал файл заново).
+        _is_legacy_fe = not bool(arch.get("has_feature_net"))
+        _mlp_in_cols = int(NEW_N) if _is_legacy_fe else int(NEW_F)
 
         def _pad_2d(tensor, new_rows=None, new_cols=None):
             """Паддинг 2D-тензора нулями справа/снизу (или обрезка, если цель меньше)."""
@@ -460,11 +480,12 @@ def _migrate_checkpoint_dim(ppp_path: str, target_dim: int | None = None, force_
                     padded += 1
             # вход pi/vf-головы: [hidden, features_dim]
             elif ("mlp_extractor.policy_net." in key or "mlp_extractor.value_net." in key) \
-                    and key.endswith(".0.weight") and tensor.dim() == 2 and tensor.shape[1] != NEW_F:
-                policy_state[key] = _pad_2d(tensor, None, NEW_F)
+                    and key.endswith(".0.weight") and tensor.dim() == 2 and tensor.shape[1] != _mlp_in_cols:
+                policy_state[key] = _pad_2d(tensor, None, _mlp_in_cols)
                 padded += 1
                 _say(f"    паддинг {key} {list(tensor.shape)} -> {list(policy_state[key].shape)} "
-                     f"(новые нейроны экстрактора входят с нулевыми весами)")
+                     f"({'новые признаки' if _is_legacy_fe else 'новые нейроны экстрактора'} "
+                     f"входят с нулевыми весами)")
         if padded == 0:
             _say(f"    WARN: не нашёл весов для паддинга (obs {OLD_N}->{NEW_N}, features {OLD_F}->{NEW_F})")
 
@@ -472,7 +493,15 @@ def _migrate_checkpoint_dim(ppp_path: str, target_dim: int | None = None, force_
         try:
             pk = dict(data.get("policy_kwargs") or {})
             fek = dict(pk.get("features_extractor_kwargs") or {})
-            fek["features_dim"] = int(NEW_F)
+            # legacy identity-экстрактор НЕ принимает features_dim (его выход = число признаков),
+            # и с ним основная ветка миграции падала: TypeError: LegacyFeaturesExtractor.__init__()
+            # got an unexpected keyword argument 'features_dim' (+ traceback в логе на весь экран)
+            _fe_cls = pk.get("features_extractor_class")
+            if _is_legacy_fe or "Legacy" in str(getattr(_fe_cls, "__name__", "")):
+                fek.pop("features_dim", None)
+                _say("    экстрактор legacy identity: features_dim не задаём (выход = число признаков)")
+            else:
+                fek["features_dim"] = int(NEW_F)
             pk["features_extractor_kwargs"] = fek
             pk.setdefault("net_arch", dict(arch.get("net_arch") or {"pi": [512, 256], "vf": [512, 256]}))
             if pk.get("net_arch", {}).get("vf") is None:
@@ -561,7 +590,8 @@ def _migrate_checkpoint_dim(ppp_path: str, target_dim: int | None = None, force_
                  f"net_arch={ck_net_arch}, экстрактор={'legacy identity' if legacy_extractor else 'Linear'} "
                  f"(вход mlp {mlp_in_target})")
             ppo_new, dummy_env = _probe_ppo(NEW_N, NEW_F, action_dim=act_dim,
-                                            net_arch=ck_net_arch, legacy_extractor=legacy_extractor)
+                                            net_arch=ck_net_arch, legacy_extractor=legacy_extractor,
+                                            n_envs=int(n_envs))
             # грузим старый state dict через load_from_zip_file снова но теперь паддим и грузим напрямую
             try:
                 from stable_baselines3.common.save_util import load_from_zip_file as _lf
@@ -624,10 +654,9 @@ def _migrate_checkpoint_dim(ppp_path: str, target_dim: int | None = None, force_
                         print(f"  Fallback: лишних ключей в чекпоинте: {len(_unexpected)} (первые: {_unexpected[:3]})")
                     # правим observation_space
                     from gymnasium.spaces import Box, Dict
-                    try:
-                        am_space = ppo_new.observation_space.spaces["action_mask"]
-                    except Exception:
-                        am_space = Box(0,1,shape=(9,), dtype=bool)
+                    # маска всегда int8 (как в poke-env), а не как получилось у probe-политики:
+                    # иначе set_env(env) в run() ломается на dtype
+                    am_space = Box(0, 1, shape=(int(act_dim),), dtype="int8")
                     new_obs_space = Dict({"observation": Box(-1,4,shape=(NEW_N,), dtype="float32"), "action_mask": am_space})
                     ppo_new.observation_space = new_obs_space
                     ppo_new.policy.observation_space = new_obs_space
@@ -645,6 +674,43 @@ def _migrate_checkpoint_dim(ppp_path: str, target_dim: int | None = None, force_
 # флаги CLI: управляют судьбой статистики нормализации при resume (см. vecnorm_utils.stats_verdict)
 RESET_OBS_STATS = False   # --reset-obs-stats: сбросить статистику даже если размерности совпали
 KEEP_OBS_STATS = False    # --keep-obs-stats: оставить даже несовместимую (старое поведение)
+
+
+def _sync_model_n_envs(ppo, env) -> None:
+    """Приводит модель к числу окружений реального env (иначе SB3.set_env падает).
+
+    SB3 хранит n_envs внутри модели и в `set_env` требует равенства: `assert env.num_envs ==
+    self.n_envs`. Два реальных случая, где это ломалось:
+      * fallback-миграция legacy-чекпоинта собирает политику на probe-окружении (там 1 env),
+        а обучение идёт с 8 — падало ещё до первого шага;
+      * `--resume` сохранённого чекпоинта с другим `--num-envs`, чем в прошлом прогоне.
+
+    Пересобираем ТОЛЬКО rollout buffer (политика не трогается!). `_setup_model()` для этого
+    не годится: он заново создаёт policy и стёр бы загруженные веса.
+    """
+    try:
+        want = int(env.num_envs)
+    except Exception:
+        return
+    want_steps = max(int(getattr(ppo, "n_steps", 0)), 1)
+    buf = getattr(ppo, "rollout_buffer", None)
+    cur_size = int(getattr(buf, "buffer_size", -1))
+    if int(getattr(ppo, "n_envs", want)) == want and cur_size == want_steps * want:
+        return
+    from gymnasium import spaces as _spaces
+    from stable_baselines3.common.buffers import DictRolloutBuffer, RolloutBuffer
+    buf_cls = DictRolloutBuffer if isinstance(env.observation_space, _spaces.Dict) else RolloutBuffer
+    kwargs = dict(getattr(ppo, "rollout_buffer_kwargs", None) or {})
+    try:
+        ppo.rollout_buffer = buf_cls(
+            int(ppo.n_steps), env.observation_space, env.action_space, device=ppo.device,
+            gamma=float(ppo.gamma), gae_lambda=float(ppo.gae_lambda), n_envs=want, **kwargs)
+        old = int(getattr(ppo, "n_envs", -1))
+        ppo.n_envs = want
+        print(f"Модель собрана на {old} env, а сейчас {want}: пересобрал rollout buffer "
+              f"(политика/веса не тронуты)")
+    except Exception as e:
+        print(f"Не удалось пересобрать rollout buffer под {want} env: {type(e).__name__}: {e}")
 
 
 def _final_evals(ppo, eval_battles: int, *, skip_eval: bool = False, skip_raw: bool = False,
@@ -828,21 +894,24 @@ def run(
                   f"мигрирую на obs {N_FEATURES}, features_dim {features_dim} "
                   f"(паддинг весов + сброс optimizer state)...")
             ppo = _migrate_checkpoint_dim(resume_from, target_dim=N_FEATURES,
-                                          target_features_dim=int(features_dim))
+                                          target_features_dim=int(features_dim),
+                                          n_envs=int(num_envs))
         else:
             try:
                 ppo = PPO.load(resume_from, device="cpu")
             except RuntimeError as e:
                 if _looks_like_dim_mismatch(str(e)):
                     print(f"Несовпадение размеров при загрузке {resume_from} — мигрирую...")
-                    ppo = _migrate_checkpoint_dim(resume_from, target_dim=N_FEATURES)
+                    ppo = _migrate_checkpoint_dim(resume_from, target_dim=N_FEATURES,
+                                                  n_envs=int(num_envs))
                 else:
                     raise
             except Exception as e:
                 # SB3 иногда оборачивает RuntimeError
                 if _looks_like_dim_mismatch(str(e)):
                     print(f"Несовпадение размеров при загрузке {resume_from} — мигрирую...")
-                    ppo = _migrate_checkpoint_dim(resume_from, target_dim=N_FEATURES)
+                    ppo = _migrate_checkpoint_dim(resume_from, target_dim=N_FEATURES,
+                                                  n_envs=int(num_envs))
                 else:
                     raise
         # стартовое состояние признаков урона: после миграции новые веса ровно нулевые,
@@ -1026,6 +1095,16 @@ def run(
         env.training = True
     if hasattr(env, "norm_reward"):
         env.norm_reward = norm_reward
+    # Конвенция роллаута: n_steps = 3072 // num_envs. Свежая модель так и создаётся, но загруженная
+    # из чекпоинта приносит СВОЙ n_steps (у legacy это вообще 8 от probe-миграции, у модели после
+    # BC-only шага — 3072). Тогда при смене --num-envs роллаут оказывается совсем другим, чем в
+    # задуманной схеме (фазы считаются от rollout_size = (3072 // num_envs) * num_envs).
+    _want_n_steps = max(3072 // max(int(num_envs), 1), 1)
+    if int(getattr(ppo, "n_steps", 0)) != _want_n_steps:
+        print(f"n_steps модели {getattr(ppo, 'n_steps', None)} -> {_want_n_steps} "
+              f"(конвенция роллаута 3072 на {num_envs} env)")
+        ppo.n_steps = _want_n_steps
+    _sync_model_n_envs(ppo, env)
     ppo.set_env(env)
 
     counter = _next_snapshot_index()
@@ -1265,6 +1344,7 @@ def run(
             except Exception as e:
                 print(f"ICM re-wrap failed: {e}")
                 import traceback; traceback.print_exc()
+        _sync_model_n_envs(ppo, env)
         ppo.set_env(env)
 
     final_path = f"models/{save_as}" if save_as else "models/ppo_policy_final"

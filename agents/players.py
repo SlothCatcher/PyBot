@@ -71,8 +71,18 @@ class PolicyPlayer(FusionInfoParser, Player):
         action = int(action.cpu().numpy()[0])
         cnt = getattr(self, "action_counter", None)
         if cnt is not None:
-            # раскладка poke-env SinglesEnv: 0..5 свитч, 6..9 приём, 22..25 тера
-            key = ("switch" if action < 6 else ("tera" if action >= 22 else ("move" if action <= 9 else "other")))
+            # раскладка poke-env SinglesEnv: 0..5 свитч, 6..9 приём, 22..25 тера.
+            # Свитчи делим по маске: если приёмов нет вообще (mask[6:] пусто) — это свитч
+            # после фейнта, а не выбор политики «атака или свитч» (та же логика, что в [mix]).
+            no_moves = mask[6:].sum() == 0
+            if action < 6:
+                key = "switch_forced" if no_moves else "switch"
+            elif action >= 22:
+                key = "tera"
+            elif action <= 9:
+                key = "move"
+            else:
+                key = "other"
             cnt[key] = cnt.get(key, 0) + 1
         return SinglesEnv.action_to_order(action, battle)
 

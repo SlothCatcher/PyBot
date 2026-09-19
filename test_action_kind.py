@@ -256,19 +256,35 @@ def test_mix_ignores_no_choice_steps():
     cb({"actions": np.array([1, 0, 6, 3]),
         "obs_tensor": {"action_mask": torch.as_tensor(mask)}}, {})
     mix = cb.action_mix()
-    check("mix: свитчи (включая принудительный — он реально уходит в бой)", mix["switch"], 3)
+    # action 1 при живых приёмах — свитч ПО ВЫБОРУ; action 3 без приёмов — вынужденный (фейнт)
+    check("mix: свитч по выбору (были приёмы)", mix["switch"], 1)
+    check("mix: вынужденные свитчи (приёмов нет: фейнт + ожидание)", mix["switch_forced"], 2)
     check("mix: приёмы", mix["move"], 1)
-    check("mix: шаг без выбора помечен отдельно", mix["forced"], 1)
+    check("mix: шаг с одним легальным действием помечен (wait/последний покемон)", mix["single"], 1)
     check("mix: шагов всего", mix["_total"], 4)
-    check("mix: шагов с реальным выбором", mix["_decided"], 3)
-    check("mix: доля свитчей считается по всем шагам (= что было в бою)", mix["_switch_share"], round(3 / 4, 4))
-    check("mix: доля шагов без выбора", mix["_forced_share"], round(1 / 4, 4))
+    check("mix: шагов с настоящим выбором (>=2 варианта и есть приёмы)", mix["_decided"], 2)
+    check("mix: доля ВСЕХ свитчей (что реально ушло в бой)", mix["_switch_share"], round(3 / 4, 4))
+    check("mix: доля свитчей по выбору", mix["_switch_own_share"], round(1 / 4, 4))
+    check("mix: доля вынужденных свитчей", mix["_switch_forced_share"], round(2 / 4, 4))
+    check("mix: доля шагов без выбора", mix["_single_share"], round(1 / 4, 4))
 
     # маска numpy без obs_tensor (fallback на политику) и вовсе без маски — как раньше
     cb2 = StepCounterCallback({"value": 0}, 2, mix_every=10_000)
     cb2({"actions": np.array([0, 6])}, {})
     check("mix без маски: считает всё (обратная совместимость)", cb2.action_mix()["switch"], 1)
-    check("mix без маски: forced=0", cb2.action_mix()["forced"], 0)
+    check("mix без маски: вынужденных свитчей нет (нечем разделить)", cb2.action_mix()["switch_forced"], 0)
+    check("mix без маски: total", cb2.action_mix()["_total"], 2)
+
+    # маска из 26 колонок: приёмы это 6..9 и гимики 10..25; свитчи без приёмов = фейнт
+    cb3 = StepCounterCallback({"value": 0}, 2, mix_every=10_000)
+    mask3 = np.zeros((2, 26), dtype=np.int8)
+    mask3[0, [0, 1, 6, 22]] = 1   # есть приём и тера -> свитч по выбору
+    mask3[1, [0, 1, 2, 3]] = 1    # только свитчи -> вынужденный, НО не single
+    cb3({"actions": np.array([2, 0]), "obs_tensor": {"action_mask": __import__("torch").as_tensor(mask3)}}, {})
+    m3 = cb3.action_mix()
+    check("mix: свитч по выбору при доступной тере", m3["switch"], 1)
+    check("mix: принудительный свитч с несколькими живыми — вынужденный, не single",
+          (m3["switch_forced"], m3["single"]), (1, 0))
 
 
 class _FakePokeEnv:

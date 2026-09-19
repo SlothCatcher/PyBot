@@ -446,6 +446,12 @@ def main():
               int(torch.count_nonzero(w_pi[:, old_dim_legacy:])) == 0, str(tuple(w_pi.shape)))
         check("legacy: новые колонки value_net.0 обнулены",
               int(torch.count_nonzero(w_vf[:, old_dim_legacy:])) == 0, str(tuple(w_vf.shape)))
+        # Ширина входа mlp задаёт, куда паддились веса: у legacy identity-экстрактора это
+        # ЧИСЛО ПРИЗНАКОВ, а не features_dim. Регрессия: основная ветка миграции паддила до
+        # features_dim (512), из-за чего load падал на size mismatch, а при 870 -> 512 веса обрезались.
+        check("legacy: вход mlp = N_FEATURES (identity-экстрактор, а не features_dim)",
+              tuple(w_pi.shape), (512, N_FEATURES))
+        check("legacy: то же для value_net", tuple(w_vf.shape), (512, N_FEATURES))
         # старые колонки побитово из чекпоинта
         src_state = None
         for _k, _v in load_from_zip_file(legacy, device=torch.device("cpu"))[1].items():
@@ -485,6 +491,42 @@ def main():
               ("lr_schedule" in out) or ("legacy" in out) or ("418" in out), out.strip().splitlines()[-1][:90] if out.strip() else "нет вывода")
     else:
         print(f"SKIP legacy-снапшот {legacy} не найден в models/ (файл вне git)")
+
+    # --- 13. probe-политика совместима с реальным env по observation_space (dtype маски)
+    # Регрессия: у _DimProbeEnv маска была dtype=bool, а poke-env отдаёт int8, из-за чего
+    # `ppo.set_env(env)` в run() падал на check_for_correct_spaces после fallback-миграции:
+    #   Dict('action_mask': Box(False, True, (26,), bool)) != Dict('action_mask': Box(0, 1, (26,), int8))
+    # То есть resume любого legacy-чекпоинта (fallback-путь) умирал до первого шага.
+    print("13. probe-политика и реальный env: dtype маски")
+    try:
+        import numpy as _np2
+        from gymnasium import spaces as _spaces
+        from stable_baselines3.common.utils import check_for_correct_spaces
+        from agents.policy_player import _probe_ppo
+
+        probe, probe_env = _probe_ppo(N_FEATURES, 512, action_dim=26)
+        mask_space = probe.observation_space.spaces["action_mask"]
+        check("probe: маска int8 (как poke-env SinglesEnv)", str(mask_space.dtype), "int8")
+        check("probe: низ/верх маски 0..1", (mask_space.low.min(), mask_space.high.max()), (0, 1))
+
+        class _RealLikeEnv:
+            """observation_space как у ExampleEnv/SinglesEnv: obs float32, маска int8."""
+            observation_space = _spaces.Dict({
+                "observation": _spaces.Box(-1.0, 4.0, shape=(N_FEATURES,), dtype=_np2.float32),
+                "action_mask": _spaces.Box(0, 1, shape=(26,), dtype=_np2.int8),
+            })
+            action_space = _spaces.Discrete(26)
+
+        try:
+            check_for_correct_spaces(_RealLikeEnv(), probe.observation_space, probe.action_space)
+            ok_spaces = True
+        except ValueError as e:
+            ok_spaces = False
+            print("   ", e)
+        check("probe: check_for_correct_spaces проходит (set_env не упадёт)", ok_spaces, True)
+        probe_env.close()
+    except Exception as e:
+        check("probe: проверка пространств выполнилась", f"исключение: {e}", "ок")
 
     print("-" * 74)
     if FAIL:
