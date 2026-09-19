@@ -103,6 +103,7 @@ from agents.training import (
     collect_heuristic_dataset,
     evaluate_win_rates,
     pretrain_policy_bc,
+    validate_bc_dataset,
 )
 import asyncio
 import torch
@@ -646,6 +647,47 @@ RESET_OBS_STATS = False   # --reset-obs-stats: сбросить статисти
 KEEP_OBS_STATS = False    # --keep-obs-stats: оставить даже несовместимую (старое поведение)
 
 
+def _final_evals(ppo, eval_battles: int, *, skip_eval: bool = False, skip_raw: bool = False,
+                 normalize: bool = True) -> dict:
+    """Финальные оценки после прогона: (1) с той же нормализацией, что обучение, (2) сырой прогон.
+
+    Важно: `--skip-eval` пропускает ОБЕ оценки. Раньше он убирал только первую, а второй блок
+    (сырой прогон, 100 боёв на каждого из трёх ботов) запускался всегда — из-за этого прогон
+    только с BC (`--total-timesteps 0`) висел без запущенного Showdown-сервера и жёг 300 боёв,
+    хотя оценка претрейну вообще не нужна.
+    """
+    if skip_eval:
+        print("Финальная оценка пропущена (--skip-eval): ни eval, ни сырой прогон vs ботов не запускаются")
+        return {"skipped": 0}
+    print(f"Финальная оценка {eval_battles} боев на каждого бота (нужен запущенный Showdown-сервер)...")
+    try:
+        final_rates = evaluate_win_rates(ppo, n_battles=eval_battles)
+    except Exception as e:
+        print(f"Финальная оценка упала: {e}")
+        final_rates = {}
+    print("--- Final win rates (eval, с нормализацией как в обучении) ---")
+    for k, v in final_rates.items():
+        print(f"{k}: {v}%")
+
+    if skip_raw:
+        print("Сырой прогон vs ботов пропущен (--skip-final-raw-eval)")
+        return final_rates
+
+    # старый способ для совместимости (сырой, без нормализации) — покажем оба
+    agent = PolicyPlayer(policy=ppo.policy, battle_format=BATTLE_FORMAT, max_concurrent_battles=10)
+    opponents = [
+        c(battle_format=BATTLE_FORMAT, max_concurrent_battles=10)
+        for c in [RandomPlayer, MaxBasePowerPlayer, SimpleHeuristicsPlayer]
+    ]
+    asyncio.run(agent.battle_against(*opponents, n_battles=100))
+    print("--- Win rates vs bots (raw, без VecNormalize) ---")
+    for opp in opponents:
+        if opp.n_finished_battles:
+            win_rate = round(100 * opp.n_lost_battles / opp.n_finished_battles)
+            print(f"{opp.username} ({opp.__class__.__name__}): {win_rate}% ({opp.n_finished_battles} battles)")
+    return final_rates
+
+
 def _migrate_vecnormalize_713_to_715(vec_path: str, base_env):
     """Грузит VecNormalize и проверяет, что статистика относится к ТЕКУЩЕЙ раскладке признаков.
 
@@ -686,6 +728,9 @@ def _save_vecnorm(env, path: str = None) -> None:
     try:
         if not save_vecnormalize_with_meta(env, path):
             print(f"Не удалось сохранить VecNormalize в {path}")
+        else:
+            # при --icm env — обёртка; печатаем, чтобы в логе было видно, что статистика легла
+            print(f"VecNormalize сохранён: {path} (+ сайдкар)")
     except Exception as e:
         print(f"Не удалось сохранить VecNormalize: {e}")
 
@@ -727,6 +772,8 @@ def run(
     icm_batch_size: int = 128,
     reset_obs_stats: bool = False,
     keep_obs_stats: bool = False,
+    save_as: str | None = None,
+    skip_final_raw_eval: bool = False,
 ):
     # судьба статистики нормализации при resume (см. vecnorm_utils.stats_verdict)
     global RESET_OBS_STATS, KEEP_OBS_STATS
@@ -743,6 +790,21 @@ def run(
                       "играют на сырых признаках (это разойдётся с обучением)")
         except Exception as e:
             print(f"self-play: не удалось проверить нормализацию obs: {e}")
+
+    # BC-датасет проверяем ДО создания env: без ret обучать нечему, а старая раскладка
+    # признаков раньше молча портила колонки (см. training.dataset_layout_error)
+    if dataset_path and os.path.isfile(dataset_path) and not resume_from:
+        info = validate_bc_dataset(dataset_path, N_FEATURES)
+        extra = ""
+        if info["obs_dim"] != N_FEATURES:
+            extra = f", будет добит нулями до {N_FEATURES} (раскладка совместима по префиксу)"
+        print(f"BC-датасет {dataset_path}: примеров {info['examples']}, obs {info['obs_dim']}{extra}")
+
+    # BC-прогон (--total-timesteps 0) RL не учит: хватает одного env для VecNormalize,
+    # 8 процессов только зря поднимают соединения с сервером
+    if total_timesteps is not None and int(total_timesteps) <= 0 and int(num_envs) != 1:
+        print(f"RL не запускается (total_timesteps={total_timesteps}): создаю 1 env вместо {num_envs}")
+        num_envs = 1
 
     # phase_size должен делиться на фактический размер роллаута n_steps*num_envs (с учётом целочисленного деления)
     rollout_size = (3072 // num_envs) * num_envs
@@ -1205,41 +1267,25 @@ def run(
                 import traceback; traceback.print_exc()
         ppo.set_env(env)
 
-    ppo.save("models/ppo_policy_final")
+    final_path = f"models/{save_as}" if save_as else "models/ppo_policy_final"
+    ppo.save(final_path)
     # сохраняем VecNormalize финальный
     if not no_normalize_bc and hasattr(env, "save"):
         _save_vecnorm(env, VECNORM_PATH)
     env.close()
+    print(f"Финальная модель сохранена: {final_path}.zip")
+    if not skip_eval or skip_final_raw_eval:
+        print(f"Следующий шаг (дообучение этой модели):\n"
+              f"  python -m agents.policy_player --resume {final_path} --total-timesteps 10000000 "
+              f"--reset-schedules ...")
 
-    # финальная оценка — тоже с нормализацией (патчим PolicyPlayer внутри evaluate, но тут просто выводим)
-    # создаём агента с нормализацией вручную
-    from agents.training import evaluate_win_rates as eval2
-    # быстрый прогон без нормализации патча — evaluate уже патчит
-    # для финального вывода используем evaluate
-    if skip_eval:
-        final_rates = {"skipped": 0}
-    else:
-        print(f"Финальная оценка {eval_battles} боев...")
-        final_rates = evaluate_win_rates(ppo, n_battles=eval_battles)
-    print("--- Final win rates (eval) ---")
-    for k, v in final_rates.items():
-        print(f"{k}: {v}%")
-
-    # также старый способ для совместимости (сырой, без нормализации) — покажем оба
-    agent = PolicyPlayer(policy=ppo.policy, battle_format=BATTLE_FORMAT, max_concurrent_battles=10)
-    opponents = [
-        c(battle_format=BATTLE_FORMAT, max_concurrent_battles=10)
-        for c in [RandomPlayer, MaxBasePowerPlayer, SimpleHeuristicsPlayer]
-    ]
-    asyncio.run(agent.battle_against(*opponents, n_battles=100))
-    print("--- Win rates vs bots (raw, без VecNormalize) ---")
-    for opp in opponents:
-        if opp.n_finished_battles:
-            win_rate = round(100 * opp.n_lost_battles / opp.n_finished_battles)
-            print(f"{opp.username} ({opp.__class__.__name__}): {win_rate}% ({opp.n_finished_battles} battles)")
+    _final_evals(ppo, eval_battles, skip_eval=skip_eval,
+                 skip_raw=skip_final_raw_eval, normalize=not no_normalize_bc)
 
 
-if __name__ == "__main__":
+def build_parser() -> "argparse.ArgumentParser":
+    """CLI-парсер (вынесен из __main__, чтобы флаги можно было проверять тестами)."""
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--total-timesteps", type=int, default=2_000_000)
@@ -1248,11 +1294,11 @@ if __name__ == "__main__":
     parser.add_argument("--norm-reward", action="store_true", help="Нормализовать награды VecNormalize (рекомендуется для стабильности)")
     parser.add_argument("--no-normalize-bc", action="store_true")
     parser.add_argument("--reset-obs-stats", action="store_true", dest="reset_obs_stats",
-                        help="сбросить статистику нормализации obs даже если размерность совпала "
-                             "(полезно, если модель обучена на статистике старой раскладки признаков)")
+                    help="сбросить статистику нормализации obs даже если размерность совпала "
+                         "(полезно, если модель обучена на статистике старой раскладки признаков)")
     parser.add_argument("--keep-obs-stats", action="store_true", dest="keep_obs_stats",
-                        help="оставить статистику нормализации даже при несовместимой размерности "
-                             "(прежнее поведение: добить нулями)")
+                    help="оставить статистику нормализации даже при несовместимой размерности "
+                         "(прежнее поведение: добить нулями)")
     parser.add_argument("--ent-coef", type=float, default=None)
     parser.add_argument("--learning-rate", type=float, default=2e-4, dest="learning_rate", help="Начальный learning_rate (линейно аннилится до 0). По умолчанию 2e-4, для дообучения после BC рекомендуется 5e-5..1e-4")
     parser.add_argument("--lr", type=float, default=None, dest="lr_alias", help="Алиас для --learning-rate")
@@ -1269,11 +1315,18 @@ if __name__ == "__main__":
     parser.add_argument("--bc-value-coef", type=float, default=0.0, help="BC value_coef вес value loss при претреине (0.0 только policy, 0.5 учит и value)")
     parser.add_argument("--value-warmup-steps", type=int, default=0, help="Сколько шагов после resume учить только value (заморозить policy) чтобы вылечить просадку -3->-29. Рекомендую 50000")
     parser.add_argument("--min-winrate", type=int, default=25, help="Порог %% vs Heuristics для сохранения qualified снапшота в self-play (было 50 -> 25, + fallback на обычные снапшоты когда нет qualified)")
+    parser.add_argument("--save-as", type=str, default=None, dest="save_as",
+                    help="имя финальной модели: сохранится как models/<имя>.zip "
+                         "(по умолчанию models/ppo_policy_final). Удобно, чтобы потом "
+                         "написать --resume models/<имя>")
+    parser.add_argument("--skip-final-raw-eval", action="store_true", dest="skip_final_raw_eval",
+                    help="не играть финальные 100x3 боёв с ботами (сырой прогон); "
+                         "--skip-eval пропускает и его, и обычную финальную оценку")
     parser.add_argument("--reset-schedules", action="store_true", help="Сбросить счетчик шагов для lr/ent расписаний при resume (lr 3e-5 снова с начала, ent 0.01). Нужно когда берешь фазу 300k и хочешь доучивать как с нуля)")
     parser.add_argument("--eval-battles", type=int, default=20, help="Сколько боев на каждого бота в оценке между фазами (было 60 -> 20, 60*4=240 боев виснет на 5-10 мин)")
     parser.add_argument("--skip-eval", action="store_true", help="Пропустить оценку winrate между фазами (самый быстрый, если виснет на 60 боев)")
     parser.add_argument("--features-dim", type=int, default=512, help="Размер выхода экстрактора признаков (по умолчанию 512). При смене веса старого чекпоинта паддятся, новые нейроны входят с нулевыми весами (warm start); 640 стоит пробовать, если признаки урона не включаются")
-    # --- ICM Variant B ---
+# --- ICM Variant B ---
     parser.add_argument("--icm", action="store_true", help="Включить Intrinsic Curiosity Module (Variant B) r = r_ext + beta*r_int")
     parser.add_argument("--icm-beta", type=float, default=0.05, help="Вес intrinsic награды (0.05 -> 0.01 с anneal)")
     parser.add_argument("--icm-anneal", dest="icm_anneal", action="store_true", help="Аннилить beta 0.05->0.01 (по умолчанию вкл)")
@@ -1283,8 +1336,16 @@ if __name__ == "__main__":
     parser.add_argument("--icm-feat-dim", type=int, default=256, help="Размер фич ICM encoder")
     parser.add_argument("--icm-train-freq", type=int, default=2048, help="Как часто тренировать ICM (шагов)")
     parser.add_argument("--icm-batch-size", type=int, default=128, help="Batch для ICM")
-    args = parser.parse_args()
+    return parser
 
+
+def parse_args(argv=None):
+    """Разбор аргументов (argv=None -> sys.argv)."""
+    return build_parser().parse_args(argv)
+
+
+if __name__ == "__main__":
+    args = parse_args()
     # поддержка алиаса --lr
     if args.lr_alias is not None:
         args.learning_rate = args.lr_alias
@@ -1324,4 +1385,6 @@ if __name__ == "__main__":
         icm_batch_size=args.icm_batch_size,
         reset_obs_stats=args.reset_obs_stats,
         keep_obs_stats=args.keep_obs_stats,
+        save_as=args.save_as,
+        skip_final_raw_eval=args.skip_final_raw_eval,
     )

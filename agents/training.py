@@ -1310,6 +1310,9 @@ def warm_up_vec_normalize(vec_normalize, dataset):
     # поддержка _DatasetView: у него obs уже массив (mmap)
     if isinstance(dataset, _DatasetView):
         obs_arr = np.asarray(dataset.obs, dtype=np.float32)
+    elif isinstance(dataset, np.ndarray) and dataset.ndim == 2:
+        # уже готовый массив obs (например выровненный по размерности признаков)
+        obs_arr = np.asarray(dataset, dtype=np.float32)
     elif isinstance(dataset, str) and os.path.exists(dataset):
         data = np.load(dataset, mmap_mode='r')
         obs_arr = np.asarray(data["obs"], dtype=np.float32)
@@ -1326,7 +1329,19 @@ def warm_up_vec_normalize(vec_normalize, dataset):
             return
         obs_arr = np.stack([d[0] for d in dataset]).astype(np.float32)
     if "observation" in vec_normalize.obs_rms:
-        vec_normalize.obs_rms["observation"].update(obs_arr)
+        rms = vec_normalize.obs_rms["observation"]
+        try:
+            rms_dim = int(np.asarray(rms.mean).size)
+            if obs_arr.shape[1] != rms_dim:
+                # размерности должны совпадать: иначе RunningMeanStd.update падает на broadcast
+                # (obs 418 против статистики 870). Приводим тем же правилом, что и сам BC.
+                obs_arr = _pad_obs_to_features(obs_arr, rms_dim, label="датасет для warm-up статистики")
+        except ValueError:
+            raise
+        except Exception as e:
+            print(f"BC: warm-up статистики пропущен ({e})")
+            return
+        rms.update(np.asarray(obs_arr, dtype=np.float32))
 
 def _update_opponent_weights(win_rates: dict[str, float]):
     for name, rate in win_rates.items():
@@ -1414,13 +1429,64 @@ def evaluate_win_rates(ppo, n_battles: int = 180) -> dict[str, float]:
             rates[key] = round(100 * opp.n_lost_battles / opp.n_finished_battles, 1)
     return rates
 
+# Датасет, собранный на этой или более новой раскладке, добивается нулями корректно: все
+# изменения признаков начиная с 715 добавлялись ТОЛЬКО В ХВОСТ (блок урона DAMAGE_BLOCK_SIZE
+# идёт последним, см. features._damage_block). А вот 713 -> 715 вставил [our_is_tera,
+# opp_is_tera] ПЕРЕД tera_type, то есть в СЕРЕДИНУ: у датасета на 713 и старее колонки после
+# места вставки — уже другие признаки, и добивание нулями молча сдвинуло бы их все.
+MIN_PREFIX_OBS_DIM = 715
+
+
+def dataset_layout_error(obs_dim: int, target_dim: int, *, label: str = "датасет") -> str:
+    """Текст ошибки для датасета, который нельзя добить нулями (раскладка менялась в середине)."""
+    return (
+        f"{label} собран на старой раскладке признаков: obs {obs_dim}, а сейчас {target_dim}.\n"
+        f"Добить его нулями нельзя: раскладка менялась не только в хвост — при переходе 713 -> 715\n"
+        f"два признака террорализации были вставлены в СЕРЕДИНУ (перед tera_type), поэтому\n"
+        f"старые колонки — уже другие признаки, и модель училась бы на чужих значениях.\n"
+        f"Что делать: пересобрать датасет текущим кодом (obs пересчитываются из сырых боёв\n"
+        f"автоматически) — например прогоном сборщика датасета (build_heuristic_dataset.py /\n"
+        f"collect_heuristic.py), либо обучением без --dataset-path (--pretrain-battles N).\n"
+        f"Проверить свой файл: python -c \"import numpy as np; d = np.load('PATH');\n"
+        f"print(d['obs'].shape, 'ret' in d.files)\""
+    )
+
+
+def validate_bc_dataset(path: str, target_dim: int) -> dict:
+    """Быстрая проверка датасета для BC (до создания env): размерность, наличие ret.
+
+    Возвращает {"obs_dim", "has_ret", "examples"} или бросает SystemExit с человеческим текстом.
+    Раньше отсутствие ret и старая раскладка выяснялись уже внутри BC — после того как
+    поднимались 8 env-процессов, а старая раскладка вообще приводила к тихой порче колонок.
+    """
+    import numpy as _np
+
+    try:
+        with _np.load(path, mmap_mode="r") as data:
+            keys = set(data.files)
+            obs_dim = int(data["obs"].shape[1])
+            examples = int(data["obs"].shape[0])
+    except SystemExit:
+        raise
+    except Exception as e:
+        raise SystemExit(f"Не удалось прочитать датасет {path}: {e}")
+    if "ret" not in keys:
+        raise SystemExit(
+            f"В датасете {path} нет 'ret' (возвратов) — BC по нему невозможен.\n"
+            f"Датасет нужно пересобрать сборщиком репозитория: он считает возвраты\n"
+            f"(_compute_bc_returns) и кладёт их в тот же .npz. Найденные ключи: {sorted(keys)}"
+        )
+    if obs_dim != int(target_dim) and obs_dim < MIN_PREFIX_OBS_DIM:
+        raise SystemExit(dataset_layout_error(obs_dim, target_dim, label=f"датасет {path}"))
+    return {"obs_dim": obs_dim, "has_ret": True, "examples": examples}
+
+
 def _pad_obs_to_features(obs_arr, target_dim: int, *, label: str = "датасет",
                          memmap_threshold: int = 200_000):
     """Добивает obs старого датасета нулями до target_dim (новые признаки = «нет информации»).
 
-    Датасеты на 3.6GB пересобирать часами, а новые признаки урона в старых записях просто
-    отсутствуют; нули для них — корректная семантика «неизвестно», и модель их игнорирует,
-    пока не обучится на свежих данных.
+    Допустимо только для раскладок, где все изменения шли в хвост (>= MIN_PREFIX_OBS_DIM):
+    датасеты на 713 и старее добивать нельзя (см. dataset_layout_error).
     """
     import numpy as _np
 
@@ -1430,6 +1496,8 @@ def _pad_obs_to_features(obs_arr, target_dim: int, *, label: str = "датасе
     if old_dim > int(target_dim):
         print(f"BC: {label} шире текущих признаков ({old_dim} > {target_dim}) — обрезаю хвост")
         return _np.ascontiguousarray(obs_arr[:, :int(target_dim)])
+    if old_dim < MIN_PREFIX_OBS_DIM:
+        raise ValueError(dataset_layout_error(old_dim, int(target_dim), label=label))
     n = int(obs_arr.shape[0])
     print(f"BC: {label} старой размерности ({old_dim} < {target_dim}) — добиваю нулями "
           f"({int(target_dim) - old_dim} новых признаков)")
@@ -1528,7 +1596,9 @@ def pretrain_policy_bc(
                     warm_arg = _DatasetView(data)
                 except Exception:
                     warm_arg = dataset
-            warm_up_vec_normalize(vec_normalize, warm_arg)
+            # warm-up должен видеть ровно те obs, на которых пойдёт BC (obs_arr уже
+            # выровнен по размерности признаков), иначе статистика окажется чужой размерности
+            warm_up_vec_normalize(vec_normalize, obs_arr if obs_arr is not None else warm_arg)
             if is_mmap and obs_arr.shape[0] > 200_000:
                 print(f"BC: нормализую большой mmap ({obs_arr.shape[0]}) по частям")
                 normed = np.empty(obs_arr.shape, dtype=np.float32)

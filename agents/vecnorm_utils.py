@@ -306,7 +306,13 @@ def save_vecnormalize_with_meta(env, path: str, fingerprint: Optional[str] = Non
     """
     vec = vecnormalize_of(env)
     try:
-        env.save(path)
+        if vec is not None:
+            # env может быть обёрткой (CuriosityVecWrapper) без своего save — сохраняем именно
+            # VecNormalize, иначе при --icm статистика не обновляется и следующий phase
+            # перезагружает устаревший/отсутствующий файл (молча другой obs rms)
+            vec.save(path)
+        else:
+            env.save(path)
     except Exception:
         return False
     try:

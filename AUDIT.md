@@ -1314,6 +1314,124 @@ WEATHER_BONUS 0.08, TERRAIN_BONUS 0.06, HEAL_BONUS 0.08, STATUS_CURE_BONUS 0.10 
 
 ---
 
+## 22. Проверка пользовательского маршрута «BC-претрейн -> RL» (шаг за шагом)
+
+Маршрут пользователя:
+
+```
+1) python -m agents.policy_player --dataset-path models/mixed.npz --epochs 15 --contrastive \
+     --neg-weight 0.3 --total-timesteps 0 --ent-coef 0.05 --lr 3e-4
+2) python -m agents.policy_player --resume models/pretrained_v2 --total-timesteps 10000000 \
+     --lr 3e-5 --clip-range 0.1 --n-epochs 3 --batch-size 256 --vf-coef 0.5 --min-winrate 25 \
+     --reset-schedules --icm --icm-anneal --eval-battles 60
+```
+
+Ниже — что в нём ломалось. Всё воспроизведено и починено; проверки — в новом
+`test_training_route.py` (37 проверок, работает без Showdown-сервера и без записи в `models/`).
+
+### 22.1 Шаг 2 не находил файл шага 1
+
+Финальная модель всегда сохранялась как `models/ppo_policy_final`, а имя `models/pretrained_v2`
+не создавалось нигде: `--resume models/pretrained_v2` падал на `resolve_checkpoint_path`
+(`.zip` тоже нет) и завершался `SystemExit` с подсказкой про похожие файлы.
+
+Исправлено: флаг `--save-as NAME` (финальная модель -> `models/NAME.zip`), плюс в конце прогона
+печатается готовая команда для resume. `resolve_checkpoint_path` и так достраивает `.zip`.
+
+### 22.2 Шаг 1 не работал без сервера (и «--skip-eval» не помогал)
+
+`--total-timesteps 0` не входит в цикл фаз, но после сохранения модели код безусловно уходил в
+два финальных блока оценки: (1) eval с нормализацией, (2) «сырой» прогон
+`asyncio.run(agent.battle_against(*opponents, n_battles=100))` — 100 боёв на каждого из трёх ботов.
+`--skip-eval` отключал только первый, поэтому BC-претрейн без запущенного Showdown-сервера висел
+навсегда (а с сервером жёг 300 боёв, хотя претрейну оценка не нужна).
+
+Исправлено: финальные оценки вынесены в `_final_evals(...)`; `--skip-eval` пропускает ОБЕ, и
+добавлен отдельный `--skip-final-raw-eval`. Дополнительно BC-прогон (`--total-timesteps 0`) теперь
+поднимает 1 env вместо 8 (RL не учится, 8 процессов только зря дёргают сервер).
+
+### 22.3 Датасет старой раскладки: тихая порча колонок (главное)
+
+`_pad_obs_to_features` добивал obs нулями В ХВОСТ. Это корректно только начиная с 715: все
+последующие изменения (блок урона 155 = 87+68) идут в конец (см. `features._damage_block`,
+`OFF = N_FEATURES - DAMAGE_BLOCK_SIZE`). А переход 713 -> 715 вставил `[our_is_tera, opp_is_tera]`
+ПЕРЕД `tera_type`, то есть В СЕРЕДИНУ, поэтому у датасета на 713 и старее все колонки после места
+вставки — уже другие признаки. В репозитории лежат именно такие файлы: `models/heuristic_dataset.npz`
+— 418 признаков, `models/heuristic_dataset_50k_normalized.npz` — 411 (и без `ret`).
+
+Итог: BC на таком датасете учился бы на чужих значениях, не сказав ни слова. Теперь:
+
+* `MIN_PREFIX_OBS_DIM = 715` + `dataset_layout_error()`: паддинг разрешён только для «префиксных»
+  раскладок (715, 802), иначе — честная ошибка с объяснением и тем, как пересобрать датасет
+  (пересборка сборщиком пересчитывает obs из сырых боёв; `--force-recollect` НЕ советуем — он
+  стирает сырой кэш);
+* `validate_bc_dataset(path, N_FEATURES)` проверяет датасет ДО создания env: есть ли `ret`,
+  какой obs_dim, сколько примеров. Раньше отсутствие `ret` выяснялось внутри BC после подъёма
+  8 процессов, а старая раскладка — вообще не выяснялась.
+
+Проверка своего файла одной строкой:
+`python -c "import numpy as np; d = np.load('models/mixed.npz'); print(d['obs'].shape, 'ret' in d.files)"`
+— для текущего кода ожидается `(N, 870) True`.
+
+### 22.4 Warm-up статистики нормализации падал на broadcast
+
+`pretrain_policy_bc` выравнивал obs (`_pad_obs_to_features`) для обучения, но в
+`warm_up_vec_normalize` уходил НЕпаддированный массив (`_DatasetView`/путь) -> `RunningMeanStd.update`
+падал на `operands could not be broadcast together with shapes (418,) (870,)`. То есть BC с
+нормализацией не работал вообще ни на одном датасете, кроме ровно 870-мерного.
+
+Исправлено: warm-up получает уже выровненный массив (`obs_arr`), а сам `warm_up_vec_normalize`
+умеет и `ndarray`, и `_DatasetView`, и путь; при расхождении размерностей приводит тем же правилом,
+что и BC (и падает с понятным текстом на старой раскладке, а не с broadcast-ошибкой).
+
+### 22.5 `--icm`: сохранение статистики через обёртку
+
+При `--icm` env — это `CuriosityVecWrapper`; сохранение статистики шло через `env.save(...)` и
+держалось на том, что SB3 `VecEnvWrapper` делегирует неизвестные атрибуты внутреннему env.
+Проверено на живом `CuriosityVecWrapper` (сохранение/перезагрузка совпадают: count 200.0001 ->
+200.0001, obs 870). Тем не менее `save_vecnormalize_with_meta` теперь явно сохраняет внутренний
+`VecNormalize` (`vecnormalize_of`), так что обёртка без делегирования больше не потеряет статистику
+молча, и в лог пишется строка «VecNormalize сохранён: ... (+ сайдкар)».
+
+### 22.6 Что в маршруте в порядке (проверено)
+
+* `--lr 3e-4` на шаге 1 РАБОТАЕТ: BC использует `ppo.policy.optimizer`, lr которого задан при
+  создании PPO (`--lr` — алиас `--learning-rate`, в логе «LR зафиксирован: 3.00e-04»).
+* `--ent-coef 0.05` на шаге 1 ни на что не влияет: BC-лосс не содержит энтропии (безвредно).
+* `--total-timesteps 0` действительно пропускает RL: печатает «RL пропущен..., LR зафиксирован».
+* Шаг 2: `--reset-schedules` обязателен для старта lr 3e-5 и ent 0.01 с нуля — у вас есть;
+  `--clip-range 0.1/--n-epochs 3/--batch-size 256/--vf-coef 0.5/--min-winrate 25` валидны;
+  `--icm --icm-anneal` собирается с `obs_dim=870`, `action_dim=26` (проверено на реальном прогоне
+  с `--total-timesteps 0`: «ICM включён (resume): beta=0.05 anneal=True feat=256 action_dim=26»).
+* Статистика нормализации с шага 1 подхватывается шагом 2 по сайдкару (obs 870 + хеш кода признаков),
+  то есть obs на BC и на RL нормализуются одинаково. Если между шагами менять код признаков —
+  статистика сбросится, тогда нужен `--keep-obs-stats`.
+* `--eval-battles 60` = 60 боёв на каждого из 4 соперников (240 за фазу); при `phase_size` 200k и
+  10M шагов это 50 фаз ≈ 12 000 боёв — если долго, `--skip-eval` (пропускает и финальные).
+
+### 22.7 Итоговые команды
+
+```
+# 0) убедиться, что датасет текущей раскладки (ожидается (N, 870) True)
+python -c "import numpy as np; d = np.load('models/mixed.npz'); print(d['obs'].shape, 'ret' in d.files)"
+
+# 1) BC-претрейн (офлайн, без сервера) — ent-coef убран (BC энтропию не использует)
+python -m agents.policy_player --dataset-path models/mixed.npz --epochs 15 --contrastive \
+    --neg-weight 0.3 --total-timesteps 0 --lr 3e-4 --skip-eval --save-as pretrained_v2
+
+# 2) RL-дообучение (без изменений, resume теперь находит файл шага 1)
+python -m agents.policy_player --resume models/pretrained_v2 --total-timesteps 10000000 \
+    --lr 3e-5 --clip-range 0.1 --n-epochs 3 --batch-size 256 --vf-coef 0.5 --min-winrate 25 \
+    --reset-schedules --icm --icm-anneal --eval-battles 60
+```
+
+### 22.8 Мелочь по коду
+
+CLI-парсер вынесен из `if __name__ == "__main__"` в `build_parser()` / `parse_args(argv)` — флаги
+теперь проверяются тестами (раньше единственным «тестом» был ручной запуск).
+
+---
+
 ---
 
 *Автор аудита: Agent Arena — полный проход по `policy_player.py` + всем его зависимостям.*

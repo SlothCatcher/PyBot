@@ -217,6 +217,20 @@ def main() -> int:
 
         check("vecnormalize_of находит VecNormalize внутри обёртки",
               vecnormalize_of(_Wrapper(vec)) is vec)
+
+        # Обёртка БЕЗ своего save (как CuriosityVecWrapper при --icm): раньше сохранение
+        # статистики молча падало, а следующая фаза перезагружала устаревший файл
+        class _WrapperNoSave:
+            def __init__(self, venv):
+                self.venv = venv
+
+        p_icm = os.path.join(td, "saved_icm.pkl")
+        saved_ok = save_vecnormalize_with_meta(_WrapperNoSave(vec), p_icm)
+        check("обёртка без save (--icm): статистика всё равно сохранена", saved_ok and os.path.isfile(p_icm))
+        check("обёртка без save: сайдкар записан", read_stats_meta(p_icm) is not None)
+        q = vecnormalize_of(_WrapperNoSave(vec))
+        check("обёртка без save: сохранён именно VecNormalize",
+              q is vec and int(np.asarray(load_vecnorm_state(p_icm)["mean"]).size) == N_FEATURES)
         check("vecnormalize_of(None) -> None", vecnormalize_of(None) is None)
         vec.venv.close()
 
