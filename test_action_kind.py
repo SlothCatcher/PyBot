@@ -234,6 +234,124 @@ def test_action_mix_classification():
     check("тера-блок внутри 26", all(0 <= a < 26 for a in (22, 23, 24, 25)), True)
 
 
+def test_mix_ignores_no_choice_steps():
+    """Шаги без выбора не считаются свитчами в [mix].
+
+    Регрессия (жалоба «в [mix] 60% свитчей, а модель в бою ни разу не свитчит»):
+    когда сервер присылает |request| с wait:true, poke-env отдаёт obs с маской
+    [1, 0, 0, ...] — единственное разрешённое действие 0 это индекс СВИТЧА, политика
+    с additive-маской обязана его выбрать, а env это действие ВЫБРАСЫВАЕТ
+    (agent1_to_move=False). Такие шаги нельзя показывать как выбор свитча.
+    """
+    import numpy as np
+    import torch
+    from agents.training import StepCounterCallback
+
+    cb = StepCounterCallback({"value": 0}, 4, mix_every=10_000)
+    mask = np.zeros((4, 26), dtype=np.int8)
+    mask[0, [0, 1, 6, 7, 8, 22]] = 1     # настоящее решение (есть и свитчи, и приёмы)
+    mask[1, 0] = 1                        # ожидание соперника: выбор отсутствует
+    mask[2, [6, 7]] = 1                   # настоящее решение: только приёмы
+    mask[3, [0, 1, 2, 3, 4, 5]] = 1       # настоящее решение: только свитчи (принудительный)
+    cb({"actions": np.array([1, 0, 6, 3]),
+        "obs_tensor": {"action_mask": torch.as_tensor(mask)}}, {})
+    mix = cb.action_mix()
+    check("mix: свитчи (включая принудительный — он реально уходит в бой)", mix["switch"], 3)
+    check("mix: приёмы", mix["move"], 1)
+    check("mix: шаг без выбора помечен отдельно", mix["forced"], 1)
+    check("mix: шагов всего", mix["_total"], 4)
+    check("mix: шагов с реальным выбором", mix["_decided"], 3)
+    check("mix: доля свитчей считается по всем шагам (= что было в бою)", mix["_switch_share"], round(3 / 4, 4))
+    check("mix: доля шагов без выбора", mix["_forced_share"], round(1 / 4, 4))
+
+    # маска numpy без obs_tensor (fallback на политику) и вовсе без маски — как раньше
+    cb2 = StepCounterCallback({"value": 0}, 2, mix_every=10_000)
+    cb2({"actions": np.array([0, 6])}, {})
+    check("mix без маски: считает всё (обратная совместимость)", cb2.action_mix()["switch"], 1)
+    check("mix без маски: forced=0", cb2.action_mix()["forced"], 0)
+
+
+class _FakePokeEnv:
+    """Мини-двойник PokeEnv: скриптованный agent1_to_move + счётчик применённых действий."""
+
+    _fake = False
+    _strict = True
+
+    def __init__(self, script):
+        from types import SimpleNamespace
+        from gymnasium.spaces import Box
+        self.script = list(script)
+        self.applied = []                     # действия, которые env реально применил
+        self.n = 0
+        self.agent1_to_move = bool(self.script.pop(0)) if self.script else False
+        self.agent1 = SimpleNamespace(username="p1")
+        self.agent2 = SimpleNamespace(username="p2")
+        self.battle1 = SimpleNamespace(wait=False)
+        self.battle2 = SimpleNamespace(wait=False, teampreview=False)
+        self.observation_spaces = {"p1": Box(-1, 1, (3,)), "p2": Box(-1, 1, (3,))}
+        self.action_spaces = {"p1": Box(-1, 1, (1,)), "p2": Box(-1, 1, (1,))}
+
+    def order_to_action(self, order, battle, fake=False, strict=True):
+        return -2
+
+    def step(self, actions):
+        if self.agent1_to_move:               # как PokeEnv: действие применяется только «в наш ход»
+            self.applied.append(actions["p1"])
+        self.n += 1
+        self.agent1_to_move = bool(self.script.pop(0)) if self.script else False
+        obs = {"p1": [float(self.n)], "p2": [0.0]}
+        rew = {"p1": 1.0 + self.n, "p2": 0.0}
+        term = {"p1": False, "p2": False}
+        trunc = {"p1": False, "p2": False}
+        return obs, rew, term, trunc, {"p1": {"n": self.n}, "p2": {}}
+
+
+class _FakeOpponent:
+    def choose_move(self, battle):
+        return "order"
+
+    def reset_battles(self):
+        pass
+
+
+def test_decision_wrapper_skips_wait_steps():
+    """DecisionWrapper: наружу только настоящие решения, награды суммируются, штраф времени один.
+
+    Сценарий: шаг 1 применяется (был наш ход), затем два состояния ожидания
+    (agent1_to_move=False — env выбрасывает действие), затем снова наш ход.
+    Без обёртки агент получил бы 2 бесполезных шага и «свитч», которого не было.
+    """
+    from agents.env import DecisionWrapper, TIME_PENALTY
+
+    # сценарий: наш ход -> (внутри) состояние ожидания -> наш ход -> наш ход
+    inner = _FakePokeEnv([True, False, True, True])
+    w = DecisionWrapper(inner, _FakeOpponent())
+    # шаг 1: действие применено, но следом пришло состояние ожидания (agent1_to_move=False)
+    # -> наружу уходит только следующий НАСТОЯЩИЙ ход, награды суммируются,
+    #    лишний штраф времени (за ожидание) возвращается
+    obs, rew, term, trunc, info = w.step(5)
+    check("ожидание проглочено: obs настоящего хода", obs, [2.0])
+    check("wait-шаги: награды суммированы (+1 штраф времени)", rew, (1.0 + 1) + (1.0 + 2) + TIME_PENALTY)
+    check("env применил действие", inner.applied, [5])
+    check("сделано 2 внутренних шага", inner.n, 2)
+    # шаг 2: сразу настоящее решение -> отдаётся как есть, штраф времени не трогаем
+    obs, rew, term, trunc, info = w.step(7)
+    check("решение отдано сразу", obs, [3.0])
+    check("награда решения не изменена", rew, 1.0 + 3)
+    check("второе действие применено", inner.applied, [5, 7])
+
+    # бой закончился во время ожидания -> обёртка не должна зацикливаться
+    class _FakePokeEnvDone(_FakePokeEnv):
+        def step(self, actions):
+            obs, rew, term, trunc, info = super().step(actions)
+            return obs, rew, {"p1": True}, trunc, info
+
+    inner2 = _FakePokeEnvDone([True, False, False, False])
+    w2 = DecisionWrapper(inner2, _FakeOpponent())
+    obs, rew, term, trunc, info = w2.step(0)
+    check("терминальное состояние не зацикливается", term, True)
+
+
 def main() -> int:
     test_switch_action_bookkeeping()
     print("-" * 74)
@@ -250,6 +368,10 @@ def main() -> int:
     test_action_mix_counter()
     print("-" * 74)
     test_action_mix_classification()
+    print("-" * 74)
+    test_mix_ignores_no_choice_steps()
+    print("-" * 74)
+    test_decision_wrapper_skips_wait_steps()
     print("-" * 74)
     if FAILED:
         print(f"ПРОВАЛЕНО: {len(FAILED)} -> {FAILED}")

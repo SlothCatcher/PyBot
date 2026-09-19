@@ -31,8 +31,11 @@ class StepCounterCallback:
         self.ent_schedule = ent_schedule
         self.ppo_ref = ppo_ref  # ссылка на PPO чтобы менять ent_coef на лету
         self.mix_every = max(int(mix_every), 1)
-        self._mix = {"switch": 0, "move": 0, "tera": 0, "gimmick": 0, "other": 0}
+        # forced — шаги без выбора (маска разрешает ровно одно действие: ожидание соперника
+        # или принудительный свитч после фейнта); их нельзя показывать как «свитч политики»
+        self._mix = {"switch": 0, "move": 0, "tera": 0, "gimmick": 0, "other": 0, "forced": 0}
         self._mix_next = self.mix_every
+        self._mask_shape_warned = False
 
     @staticmethod
     def classify_action(action: int) -> str:
@@ -49,14 +52,38 @@ class StepCounterCallback:
         return "other"
 
     def action_mix(self) -> dict:
-        total = sum(self._mix.values())
+        total = sum(self._mix[k] for k in ("switch", "move", "tera", "gimmick", "other"))
         out = dict(self._mix)
-        out["_total"] = total
+        out["_total"] = total            # все шаги, что видел SB3 (= столько же действий ушло в бой)
+        out["_decided"] = total - self._mix["forced"]   # из них шагов с реальным выбором
         if total:
             out["_switch_share"] = round(self._mix["switch"] / total, 4)
             out["_move_share"] = round(self._mix["move"] / total, 4)
             out["_tera_share"] = round(self._mix["tera"] / total, 4)
+            out["_forced_share"] = round(self._mix["forced"] / total, 4)
         return out
+
+    @staticmethod
+    def _forced_mask_rows(mask) -> "object":
+        """Булева маска строк (env-ов), где выбор отсутствует (разрешено ровно одно действие).
+
+        Такие строки — не решение политики: маска `[1, 0, 0, ...]` приходит в состоянии
+        ожидания соперника (`battle._wait`), где poke-env вообще не применяет действие,
+        а политика обязана выбрать 0 — это индекс СВИТЧА. Раньше эти шаги попадали в
+        «свитч» и раздували метрику (пользователь видит 60% свитчей, а в бою их нет).
+        """
+        try:
+            m = mask
+            if hasattr(m, "detach"):
+                m = m.detach()
+            import numpy as _np
+            arr = m.cpu().numpy() if hasattr(m, "cpu") else _np.asarray(m)
+            arr = _np.asarray(arr)
+            if arr.ndim == 1:
+                arr = arr.reshape(1, -1)
+            return arr.sum(axis=-1) == 1
+        except Exception:
+            return None
 
     def __call__(self, _locals, _globals) -> bool:
         self.steps_holder["value"] += self.num_envs
@@ -66,12 +93,33 @@ class StepCounterCallback:
                 self.ppo_ref.ent_coef = new_ent
             except Exception:
                 pass
-        # диагностика: какие действия выбирает политика (свитч/приём/тера)
+        # диагностика: какие действия выбирает политика (свитч/приём/тера).
+        # Считаем ТОЛЬКО настоящие решения: шаги, где маска разрешала ровно одно действие
+        # (ожидание соперника / принудительный свитч), идут в отдельный счётчик «forced».
         try:
             actions = _locals.get("actions") if isinstance(_locals, dict) else None
             if actions is not None:
-                for a in np.asarray(actions).reshape(-1):
+                acts = np.asarray(actions).reshape(-1)
+                forced = None
+                obs_t = _locals.get("obs_tensor") if isinstance(_locals, dict) else None
+                if isinstance(obs_t, dict) and "action_mask" in obs_t:
+                    forced = self._forced_mask_rows(obs_t["action_mask"])
+                if forced is None and self.ppo_ref is not None:
+                    forced = self._forced_mask_rows(getattr(self.ppo_ref.policy, "_mask", None))
+                if forced is not None and len(forced) != acts.size:
+                    if not getattr(self, "_mask_shape_warned", False):
+                        self._mask_shape_warned = True
+                        print(f"WARNING: маска ({len(forced)}) не совпала с числом действий ({acts.size}) — "
+                              f"[mix] считает все шаги как решения")
+                    forced = None
+                for i, a in enumerate(acts):
                     self._mix[self.classify_action(int(a))] += 1
+                    # шаг без выбора (маска разрешала ровно одно действие) — считаем и его
+                    # класс (действие реально уходит в бой), но отдельно помечаем: это не выбор
+                    # политики. Если счётчик вдруг большой при живой метрике свитчей —
+                    # значит в шаги попали состояния ожидания (см. DecisionWrapper в env.py).
+                    if forced is not None and bool(forced[i]):
+                        self._mix["forced"] += 1
                 total = sum(self._mix.values())
                 if total >= self._mix_next:
                     self._mix_next = total + self.mix_every
@@ -82,9 +130,10 @@ class StepCounterCallback:
 
     def _log_mix(self, total: int) -> None:
         mix = self.action_mix()
-        msg = (f"[mix] решений {total}: свитч {mix.get('_switch_share', 0.0) * 100:.1f}%, "
+        msg = (f"[mix] решений {mix.get('_total', total)}: свитч {mix.get('_switch_share', 0.0) * 100:.1f}%, "
                f"приём {mix.get('_move_share', 0.0) * 100:.1f}%, тера {mix.get('_tera_share', 0.0) * 100:.1f}% "
-               f"(свитчей {mix['switch']}, приёмов {mix['move']}, тер {mix['tera']})")
+               f"(свитчей {mix['switch']}, приёмов {mix['move']}, тер {mix['tera']}), "
+               f"без выбора {mix.get('_forced_share', 0.0) * 100:.1f}% ({mix['forced']} шагов)")
         print(msg)
         try:
             logger = getattr(self.ppo_ref, "logger", None)
@@ -92,6 +141,7 @@ class StepCounterCallback:
                 logger.record("mix/switch_share", float(mix.get("_switch_share", 0.0)))
                 logger.record("mix/move_share", float(mix.get("_move_share", 0.0)))
                 logger.record("mix/tera_share", float(mix.get("_tera_share", 0.0)))
+                logger.record("mix/forced_share", float(mix.get("_forced_share", 0.0)))
         except Exception:
             pass
 
@@ -1390,6 +1440,8 @@ def evaluate_win_rates(ppo, n_battles: int = 180) -> dict[str, float]:
             normalizer = None
     base_agent = PolicyPlayer(policy=ppo.policy, battle_format=BATTLE_FORMAT,
                               max_concurrent_battles=30, obs_normalizer=normalizer)
+    # считаем реальные решения модели в оценочных боях (без wait-шагов, как в [mix])
+    base_agent.action_counter = {"switch": 0, "move": 0, "tera": 0, "other": 0}
 
     opponents: list[Player] = [
         c(battle_format=BATTLE_FORMAT, max_concurrent_battles=30)
@@ -1417,6 +1469,17 @@ def evaluate_win_rates(ppo, n_battles: int = 180) -> dict[str, float]:
         n_sp_appended = 0
 
     asyncio.run(base_agent.battle_against(*opponents, n_battles=n_battles))
+    try:
+        cnt = base_agent.action_counter or {}
+        n_dec = sum(int(v) for v in cnt.values())
+        if n_dec:
+            print(f"eval-микс (решения модели в оценочных боях): "
+                  f"свитч {cnt.get('switch', 0) / n_dec * 100:.1f}%, "
+                  f"приём {cnt.get('move', 0) / n_dec * 100:.1f}%, "
+                  f"тера {cnt.get('tera', 0) / n_dec * 100:.1f}% "
+                  f"({cnt.get('switch', 0)}/{cnt.get('move', 0)}/{cnt.get('tera', 0)} из {n_dec})")
+    except Exception:
+        pass
     rates: dict[str, float] = {}
     for idx, opp in enumerate(opponents):
         if n_sp_appended and idx >= len(opponents) - n_sp_appended:

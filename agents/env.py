@@ -58,6 +58,7 @@ HEAL_WASTED_PENALTY = 0.06
 SHAPING_EPISODE_CAP = 12.0         # макс суммарный shaping за бой (меньше victory 30)
 SHAPING_STEP_CLIP = 0.50           # клип на ход (было 2.0) — ещё сильнее жмём одиночный всплеск
 WASTED_MOVE_PENALTY = 0.06       # универсальный штраф за любой wasted приём (если ещё не наказан спецификой)
+TIME_PENALTY = 0.02             # штраф за шаг времени (начисляется РОВНО один на решение — см. DecisionWrapper)
 WASTED_MOVE_IDS_SKIP = {"leechseed"}  # только leech уже имеет спец-штраф; погода/терен/саб теперь идут через generic wasted (фикс: раньше не штрафовались когда уже активны)
 WEATHER_MOVE_IDS = {"sunnyday","raindance","sandstorm","snowscape","chillyreception"}
 TERRAIN_MOVE_IDS = {"electricterrain","grassyterrain","mistyterrain","psychicterrain"}
@@ -198,6 +199,52 @@ def _make_self_play_opponents(model_dir: str = "models/", cache_dir: str | None 
     return players
 
 
+class DecisionWrapper(SingleAgentWrapper):
+    """Один шаг наружу = одно НАСТОЯЩЕЕ решение агента.
+
+    Зачем. poke-env отдаёт агенту не только состояния «наш ход»: сервер присылает
+    `|request|` с `wait: true` (мы уже выбрали, ждём соперника), и такой кадр тоже
+    превращается в шаг RL. В этот момент:
+
+      * `PokeEnv.step` вовсе НЕ зовёт `action_to_order` для нашей стороны
+        (`agent1_to_move == False`) — выбранное действие просто выбрасывается;
+      * obs приходит с маской `[1, 0, 0, ...]` (`get_action_mask`: `if battle._wait: actions = [0]`),
+        то есть разрешено ровно одно действие — индекс 0, который в раскладке SinglesEnv
+        означает СВИТЧ. Политика с additive-маской обязана его выбрать.
+
+    Итог без этой обёртки: в роллаут-буфер попадают шаги-пустышки (награда ≈ −штраф времени,
+    действие игнорируется), а диагностика `[mix]` показывает свитчи, которых в бою не было
+    (замер на живом сервере: 10–12% всех «решений» и до половины «свитчей» — ровно такие шаги).
+
+    Обёртка прокручивает состояния ожидания внутри себя и наружу отдаёт только то состояние,
+    на котором действие будет применено. Награды суммируются (учёт внутри `calc_reward`
+    дельта-базированный, поэтому сумма корректна), а лишние штрафы времени возвращаются:
+    сколько раз сервер заставил ждать — не подконтрольно агенту и не должно менять награду.
+    """
+
+    MAX_SPIN = 50   # страховка от зависания (недоступный соперник, замороженный бой)
+
+    def step(self, action):
+        obs, reward, term, trunc, info = super().step(action)
+        total = float(reward)
+        n_calls = 1
+        spins = 0
+        # agent1_to_move == True означает: пришедшее состояние — НАШ настоящий ход,
+        # следующее действие будет применено. Если False — это состояние ожидания,
+        # наружу его отдавать нельзя (иначе SB3 сделает шаг, которого в бою нет).
+        while (not (term or trunc) and not getattr(self.env, "agent1_to_move", False)
+               and spins < self.MAX_SPIN):
+            obs, r, term, trunc, info = super().step(action)
+            total += float(r)
+            n_calls += 1
+            spins += 1
+        if n_calls > 1:
+            # на решение должен приходиться ровно один штраф времени: сколько раз сервер
+            # заставил ждать — не подконтрольно агенту и не должно менять награду
+            total += TIME_PENALTY * (n_calls - 1)
+        return obs, total, term, trunc, info
+
+
 class ExampleEnv(SinglesEnv):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -242,7 +289,7 @@ class ExampleEnv(SinglesEnv):
         if not all_opponents:
             # fallback если пусто
             opponent = SimpleHeuristicsPlayer(start_listening=False)
-            return Monitor(SingleAgentWrapper(env, opponent))
+            return Monitor(DecisionWrapper(env, opponent))
 
         if opponent_weights:
             # opponent_weights приходит из training._get_opponent_weights
@@ -269,7 +316,7 @@ class ExampleEnv(SinglesEnv):
             weights = [1.0 / len(all_opponents)] * len(all_opponents)
 
         opponent = random.choices(all_opponents, weights=weights, k=1)[0]
-        return Monitor(SingleAgentWrapper(env, opponent))
+        return Monitor(DecisionWrapper(env, opponent))
 
     def _hazard_score(self, side_conditions: dict) -> float:
         """Суммарный скор хазардов 0..~2.5"""
@@ -600,7 +647,7 @@ class ExampleEnv(SinglesEnv):
                     "_last_switch_prev_dmg": None,
                     "extra_accum": 0.0,  # для per-episode бюджета
                 }
-                return base - 0.02
+                return base - TIME_PENALTY
 
             # 1) Hazards: размещение/снятие + штраф за урон от них
             d_opp_haz = opp_haz - prev["opp_haz"]
@@ -1085,7 +1132,7 @@ class ExampleEnv(SinglesEnv):
             except Exception:
                 pass
 
-        return base + extra - 0.02
+        return base + extra - TIME_PENALTY
 
     def action_to_order(self, action, battle, fake=False, strict=True):
         mask = SinglesEnv.get_action_mask(battle)

@@ -31,6 +31,10 @@ class PolicyPlayer(FusionInfoParser, Player):
         self.policy = policy
         self.obs_normalizer = obs_normalizer
         self._norm_warned = False
+        # необязательный счётчик {switch, move, tera, other}: сколько раз игрок выбрал каждый
+        # класс действий. Нужен, чтобы в логе оценки винрейта было видно РЕАЛЬНОЕ поведение
+        # модели в оценочных боях (там нет wait-шагов, в отличие от метрики [mix] по роллаутам).
+        self.action_counter: dict[str, int] | None = None
 
     def _apply_obs_norm(self, obs):
         norm = getattr(self, "obs_normalizer", None)
@@ -65,6 +69,11 @@ class PolicyPlayer(FusionInfoParser, Player):
             # можно переопределить вызов с deterministic=True.
             action, _, _ = self.policy.forward(obs_dict, deterministic=False)
         action = int(action.cpu().numpy()[0])
+        cnt = getattr(self, "action_counter", None)
+        if cnt is not None:
+            # раскладка poke-env SinglesEnv: 0..5 свитч, 6..9 приём, 22..25 тера
+            key = ("switch" if action < 6 else ("tera" if action >= 22 else ("move" if action <= 9 else "other")))
+            cnt[key] = cnt.get(key, 0) + 1
         return SinglesEnv.action_to_order(action, battle)
 
     def embed_battle(self, battle: AbstractBattle):
