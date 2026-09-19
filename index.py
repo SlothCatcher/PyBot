@@ -140,6 +140,36 @@ class BotSpec:
     greeting: str = ""
 
 
+def load_obs_normalizer(log=print):
+    """Статистика нормализации obs из models/vecnormalize.pkl — ровно как во время обучения.
+
+    Обучение идёт с `VecNormalize(norm_obs=True)`, то есть политика видит нормализованные
+    признаки. Живой бот раньше получал СЫРЫЕ признаки: сеть работала на сдвинутом по
+    масштабу obs, и решения отличались от обучения (часть колонок уходила в клип ±10).
+    Возвращает объект с `normalize(obs)` или None (тогда играем на сырых признаках —
+    так же, как если модель обучали с `--no-normalize-bc`).
+    """
+    try:
+        from agents.config import N_FEATURES, VECNORM_PATH
+        from agents.vecnorm_utils import load_vecnorm_stats
+        import os as _os
+        if not _os.path.isfile(VECNORM_PATH):
+            log(f"нормализация obs: {VECNORM_PATH} нет — играю на сырых признаках")
+            return None
+        stats = load_vecnorm_stats(VECNORM_PATH, N_FEATURES)
+        if stats is None:
+            log(f"нормализация obs: {VECNORM_PATH} не читается или norm_obs=False — играю на сырых признаках")
+            return None
+        log(f"нормализация obs включена: {stats.describe()}")
+        warn = stats.stale_warning()
+        if warn:
+            log(warn)
+        return stats
+    except Exception as e:
+        log(f"нормализация obs недоступна ({e}) — играю на сырых признаках")
+        return None
+
+
 def make_player(policy, spec: BotSpec, credentials, *, battles: int = BATTLES_PER_BOT, **extra):
     """Создаёт PolicyPlayer с нужным числом параллельных боёв (`extra` — для тестов/тонких настроек)."""
     from poke_env import AccountConfiguration
@@ -344,11 +374,17 @@ async def main(args) -> None:
     chosen = list(specs) if args.bot == "all" else [args.bot]
 
     policy = load_policy(args.model)   # грузим ДО выхода в сеть: битый файл — сразу понятная ошибка
+    normalizer = None
+    if not args.no_normalize_obs:
+        normalizer = load_obs_normalizer(log=logger.info)
+    else:
+        logger.info("нормализация obs отключена флагом --no-normalize-obs")
 
     factories = []
     for key in chosen:
         spec = specs[key]
-        factories.append(make_factory(policy, spec, credentials, battles=args.battles))
+        factories.append(make_factory(policy, spec, credentials, battles=args.battles,
+                                      obs_normalizer=normalizer))
         logger.info("бот '%s': аккаунт %s, формат %s, параллельных боёв %d",
                     spec.name, spec.account, spec.battle_format, args.battles)
 
@@ -372,6 +408,9 @@ def parse_args(argv=None):
                         help=f"лог-файл с ротацией (по умолчанию {DEFAULT_LOG_FILE})")
     parser.add_argument("--login-timeout", type=float, default=LOGIN_TIMEOUT,
                         help="сколько секунд ждать логин до перезапуска")
+    parser.add_argument("--no-normalize-obs", action="store_true", dest="no_normalize_obs",
+                        help="не применять статистику VecNormalize к obs (нужно, если модель "
+                             "обучали с --no-normalize-bc, то есть без нормализации)")
     parser.add_argument("--no-announce", action="store_true",
                         help="не писать приветствие в лобби при каждом перезапуске")
     parser.add_argument("--verbose", action="store_true", help="DEBUG в лог")

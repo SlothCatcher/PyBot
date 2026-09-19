@@ -78,6 +78,40 @@ def _snapshot_number(fname: str) -> int | None:
 _SELF_PLAY_LOAD_ERRORS_REPORTED: set = set()
 
 
+_SELF_PLAY_NORM_CACHE: dict = {}
+
+
+def _self_play_obs_normalizer():
+    """Статистика нормализации obs для self-play оппонентов (None — если нет/выключено).
+
+    Оппоненты — те же обученные снапшоты, а обучение идёт с `norm_obs=True`; без той же
+    нормализации снапшот видит сдвинутый obs и играет заметно хуже, из-за чего self-play
+    награда/винрейт в ratchet измеряются по «сломанному» сопернику.
+    Отключается переменной окружения `PYBOT_SELF_PLAY_NORM=0` (если обучение идёт без
+    VecNormalize — `--no-normalize-bc`).
+    """
+    import os
+    if os.environ.get("PYBOT_SELF_PLAY_NORM", "1") == "0":
+        return None
+    if "value" in _SELF_PLAY_NORM_CACHE:
+        return _SELF_PLAY_NORM_CACHE["value"]
+    stats = None
+    try:
+        from .config import VECNORM_PATH
+        from .vecnorm_utils import load_vecnorm_stats
+        if os.path.isfile(VECNORM_PATH):
+            stats = load_vecnorm_stats(VECNORM_PATH, N_FEATURES)
+            if stats is not None and multiprocessing.current_process().name == "MainProcess":
+                print(f"self-play оппоненты: obs нормализуются ({stats.describe()})")
+                warn = stats.stale_warning()
+                if warn:
+                    print(warn)
+    except Exception:
+        stats = None
+    _SELF_PLAY_NORM_CACHE["value"] = stats
+    return stats
+
+
 def _make_self_play_opponents(model_dir: str = "models/", cache_dir: str | None = None):
     try:
         candidates = [f for f in listdir(model_dir) if isfile(join(model_dir, f)) and QUALIFIED_PREFIX in f]
@@ -154,7 +188,9 @@ def _make_self_play_opponents(model_dir: str = "models/", cache_dir: str | None 
                     _SELF_PLAY_LOAD_ERRORS_REPORTED.add(fname)
                     print(f"Failed to load qualified snapshot {fname}: {info.get('error')}")
                 continue
-            players.append(PolicyPlayer(policy=snap.policy, battle_format=BATTLE_FORMAT, start_listening=False))
+            players.append(PolicyPlayer(policy=snap.policy, battle_format=BATTLE_FORMAT,
+                                        start_listening=False,
+                                        obs_normalizer=_self_play_obs_normalizer()))
         except Exception as e:
             if fname not in _SELF_PLAY_LOAD_ERRORS_REPORTED:
                 _SELF_PLAY_LOAD_ERRORS_REPORTED.add(fname)

@@ -13,11 +13,36 @@ from .fusion_parser import FusionInfoParser
 
 
 class PolicyPlayer(FusionInfoParser, Player):
+    """Player, который ходит выученной политикой.
+
+    `obs_normalizer` — объект с методом `normalize(obs) -> obs` (обычно `VecNormStats` или
+    `LiveVecNormalizeAdapter`). Нужен потому, что во время обучения obs нормализуется
+    `VecNormalize` (norm_obs=True), и политика видит уже нормализованные признаки. Любой
+    инференс без той же нормализации (живые боты в index.py, self-play оппоненты в
+    обучении) скармливает сети сдвинутый по масштабу obs — решения становятся хуже, чем
+    в обучении. Если статистики нет/не подходит, нормализация не применяется и об этом
+    один раз пишется предупреждение.
+    """
     policy: ActorCriticPolicy | None
 
-    def __init__(self, policy: ActorCriticPolicy | None = None, *args: Any, **kwargs: Any):
+    def __init__(self, policy: ActorCriticPolicy | None = None, *args: Any,
+                 obs_normalizer: Any = None, **kwargs: Any):
         super().__init__(*args, **kwargs)
         self.policy = policy
+        self.obs_normalizer = obs_normalizer
+        self._norm_warned = False
+
+    def _apply_obs_norm(self, obs):
+        norm = getattr(self, "obs_normalizer", None)
+        if norm is None:
+            return obs
+        try:
+            return norm.normalize(obs)
+        except Exception as e:
+            if not getattr(self, "_norm_warned", False):
+                self._norm_warned = True
+                print(f"[PolicyPlayer] нормализация obs не применилась ({e}) — играю на сырых признаках")
+            return obs
 
     def choose_move(self, battle: AbstractBattle) -> BattleOrder | Awaitable[BattleOrder]:
         if battle.wait:
@@ -63,13 +88,14 @@ class PolicyPlayer(FusionInfoParser, Player):
         opp_protect = self.get_protected_last_turn(battle, is_ours=False)
         our_team_fusions = self.get_team_fusion_map(battle, is_ours=True) if hasattr(self, "get_team_fusion_map") else None
         opp_team_fusions = self.get_team_fusion_map(battle, is_ours=False) if hasattr(self, "get_team_fusion_map") else None
-        return embed_battle_with_fusion(
+        obs = embed_battle_with_fusion(
             battle, our_fusion, opp_fusion,
             our_protected_last_turn=our_protect,
             opp_protected_last_turn=opp_protect,
             our_team_fusions=our_team_fusions,
             opp_team_fusions=opp_team_fusions,
         )
+        return self._apply_obs_norm(obs)
 
 
 class HeuristicRecorder(FusionInfoParser, SimpleHeuristicsPlayer):

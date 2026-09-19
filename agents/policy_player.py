@@ -156,15 +156,30 @@ class _DimProbeEnv(_GymBaseEnv):
         return None
 
 
-def _probe_ppo(target_dim: int, features_dim: int = 512, action_dim: int = 26):
-    """PPO со случайной политикой на target_dim признаков (для fallback-миграции)."""
+def _probe_ppo(target_dim: int, features_dim: int = 512, action_dim: int = 26,
+               net_arch=None, legacy_extractor: bool = False):
+    """PPO со случайной политикой нужной формы (для fallback-миграции).
+
+    net_arch и класс экстрактора берутся из самого чекпоинта: старые снапшоты обучены с
+    net_arch=[512,256,128] (общие головы) и identity-экстрактором (LegacyFeaturesExtractor,
+    без `features_extractor.net.*` весов). Если собрать пробу с текущими дефолтами
+    ([512,256] + Linear-экстрактор), `load_state_dict` падает на size mismatch и снапшот
+    вообще не загружается ("Failed to load qualified snapshot").
+    """
     from stable_baselines3.common.vec_env import DummyVecEnv
 
-    from agents.policy import MaskedActorCriticPolicy
+    from agents.policy import LegacyFeaturesExtractor, MaskedActorCriticPolicy
 
+    kwargs = {}
+    if legacy_extractor:
+        kwargs["features_extractor_class"] = LegacyFeaturesExtractor
+    else:
+        kwargs["features_extractor_kwargs"] = dict(features_dim=int(features_dim))
+    if net_arch is not None:
+        kwargs["net_arch"] = net_arch
     env = DummyVecEnv([lambda: _DimProbeEnv(int(target_dim), action_dim=int(action_dim))])
     return PPO(MaskedActorCriticPolicy, env, device="cpu", verbose=0, n_steps=8, batch_size=8,
-               policy_kwargs=dict(features_extractor_kwargs=dict(features_dim=int(features_dim)))), env
+               policy_kwargs=kwargs), env
 
 
 def _migrate_ppo_713_to_715(ppp_path: str, target_dim: int | None = None):
@@ -281,20 +296,30 @@ def _checkpoint_arch(path: str) -> dict:
     except Exception:
         return {}
     state = None
+    # ВАЖНО: у старых снапшотов (identity-экстрактор LegacyFeaturesExtractor) в state_dict
+    # вообще нет ключей features_extractor — раньше такой чекпоинт не опознавался (arch={}),
+    # проба собиралась с текущими дефолтами и загрузка падала на size mismatch.
     for _, v in params.items():
-        if isinstance(v, dict) and any("features_extractor" in k for k in v.keys()):
+        if not isinstance(v, dict):
+            continue
+        keys = list(v.keys())
+        if any(("features_extractor" in k or "mlp_extractor" in k or k.endswith("action_net.weight"))
+               for k in keys):
             state = v
             break
     if state is None:
         return {}
     info = {}
-    pi_layers = []   # (индекс слоя, размер выхода) — порядок берём по номеру, а не по dict
+    pi_layers = []       # (индекс слоя, размер выхода) — порядок берём по номеру, а не по dict
+    vf_layers = []
+    shared_layers = []
     for k, tensor in state.items():
         if not hasattr(tensor, "shape"):
             continue
         if k.endswith("features_extractor.net.0.weight") and tensor.dim() == 2:
             info["features_dim"] = int(tensor.shape[0])
             info["obs_dim"] = int(tensor.shape[1])
+            info["has_feature_net"] = True
         elif k.endswith("action_net.weight") and tensor.dim() == 2:
             # сколько действий у чекпоинта (gen9 = 26); нужно, чтобы fallback-миграция
             # не собрала политику с чужой головой
@@ -305,9 +330,31 @@ def _checkpoint_arch(path: str) -> dict:
             except Exception:
                 layer_idx = len(pi_layers)
             pi_layers.append((layer_idx, int(tensor.shape[0])))
-    if pi_layers:
-        pi_layers.sort(key=lambda x: x[0])
-        info["net_arch"] = {"pi": [h for _, h in pi_layers], "vf": None}
+        elif "mlp_extractor.value_net." in k and k.endswith(".weight") and tensor.dim() == 2:
+            try:
+                layer_idx = int(k.split("value_net.")[1].split(".")[0])
+            except Exception:
+                layer_idx = len(vf_layers)
+            vf_layers.append((layer_idx, int(tensor.shape[0])))
+        elif "mlp_extractor.shared_net." in k and k.endswith(".weight") and tensor.dim() == 2:
+            try:
+                layer_idx = int(k.split("shared_net.")[1].split(".")[0])
+            except Exception:
+                layer_idx = len(shared_layers)
+            shared_layers.append((layer_idx, int(tensor.shape[0])))
+    info["has_feature_net"] = bool(info.get("has_feature_net", False))
+    pi = [h for _, h in sorted(pi_layers)]
+    vf = [h for _, h in sorted(vf_layers)]
+    shared = [h for _, h in sorted(shared_layers)]
+    if pi and vf:
+        info["net_arch"] = {"pi": pi, "vf": vf}
+        info["heads"] = "split"
+    elif shared:
+        # старая общая архитектура (net_arch списком): головы identity, последний слой — общий
+        info["net_arch"] = {"pi": shared, "vf": shared}
+        info["heads"] = "shared"
+    elif pi:
+        info["net_arch"] = {"pi": pi, "vf": None}
     return info
 
 
@@ -482,9 +529,17 @@ def _migrate_checkpoint_dim(ppp_path: str, target_dim: int | None = None, force_
             except Exception:
                 pass
     except Exception as e:
-        print(f"  load_from_zip_file миграция не удалась: {e}, пробую fallback через создание нового PPO и копирование весов")
-        import traceback
-        traceback.print_exc()
+        msg = str(e).splitlines()[0] if str(e) else type(e).__name__
+        # старая известная причина: в zip лежит lr_schedule-функция, снятая ДРУГОЙ версией
+        # Python — cloudpickle не может её разобрать при пересохранении ("tuple index out of
+        # range"). Это не повод терять снапшот: идём через сборку политики по весам.
+        if "tuple index out of range" in str(e) or "cloudpickle" in str(e) or isinstance(e, IndexError):
+            print(f"  Штатная миграция невозможна ({msg}: в чекпоинте lr_schedule от другой версии "
+                  f"Python), собираю политику по весам")
+        else:
+            print(f"  load_from_zip_file миграция не удалась: {msg}, пробую fallback через создание нового PPO и копирование весов")
+            import traceback
+            traceback.print_exc()
         # fallback: собираем политику нужной размерности (без сервера) и копируем веса вручную
         try:
             # размер головы берём из самого чекпоинта (или из его action_space), по умолчанию gen9 = 26
@@ -497,8 +552,15 @@ def _migrate_checkpoint_dim(ppp_path: str, target_dim: int | None = None, force_
                 act_dim = 0
             if act_dim <= 0:
                 act_dim = 26
-            _say(f"  Fallback: probe-политика строится под action_dim={act_dim}")
-            ppo_new, dummy_env = _probe_ppo(NEW_N, NEW_F, action_dim=act_dim)
+            legacy_extractor = not bool(arch.get("has_feature_net"))
+            ck_net_arch = arch.get("net_arch") or None
+            # у legacy identity-экстрактора выход = N_FEATURES (а не features_dim)
+            mlp_in_target = int(NEW_N) if legacy_extractor else int(NEW_F)
+            _say(f"  Fallback: probe-политика строится под action_dim={act_dim}, "
+                 f"net_arch={ck_net_arch}, экстрактор={'legacy identity' if legacy_extractor else 'Linear'} "
+                 f"(вход mlp {mlp_in_target})")
+            ppo_new, dummy_env = _probe_ppo(NEW_N, NEW_F, action_dim=act_dim,
+                                            net_arch=ck_net_arch, legacy_extractor=legacy_extractor)
             # грузим старый state dict через load_from_zip_file снова но теперь паддим и грузим напрямую
             try:
                 from stable_baselines3.common.save_util import load_from_zip_file as _lf
@@ -534,9 +596,10 @@ def _migrate_checkpoint_dim(ppp_path: str, target_dim: int | None = None, force_
                         nt[:tt.shape[0]] = tt
                         policy_state2[kk] = nt
                     elif (isinstance(tt, torch.Tensor) and tt.dim() == 2
-                            and ("mlp_extractor.policy_net." in kk or "mlp_extractor.value_net." in kk)
-                            and kk.endswith(".0.weight") and tt.shape[1] != NEW_F):
-                        nt = torch.zeros((tt.shape[0], NEW_F), dtype=tt.dtype, device=tt.device)
+                            and ("mlp_extractor.policy_net." in kk or "mlp_extractor.value_net." in kk
+                                 or "mlp_extractor.shared_net." in kk)
+                            and kk.endswith(".0.weight") and tt.shape[1] != mlp_in_target):
+                        nt = torch.zeros((tt.shape[0], mlp_in_target), dtype=tt.dtype, device=tt.device)
                         nt[:, :tt.shape[1]] = tt
                         policy_state2[kk] = nt
                         _say(f"  Fallback: паддинг {kk} {list(tt.shape)} -> {list(nt.shape)}")
@@ -578,11 +641,19 @@ def _migrate_checkpoint_dim(ppp_path: str, target_dim: int | None = None, force_
             print(f"  Fallback тоже упал: {e2}")
             raise e
 
-def _migrate_vecnormalize_713_to_715(vec_path: str, base_env):
-    """Грузит VecNormalize и подгоняет obs_rms под размерность env (любая старая: 418, 713, ...).
+# флаги CLI: управляют судьбой статистики нормализации при resume (см. vecnorm_utils.stats_verdict)
+RESET_OBS_STATS = False   # --reset-obs-stats: сбросить статистику даже если размерности совпали
+KEEP_OBS_STATS = False    # --keep-obs-stats: оставить даже несовместимую (старое поведение)
 
-    Раньше умела ТОЛЬКО 713 -> 715: файл со статистикой на 418 признаков (как
-    models/vecnormalize.pkl в репо) не мигрировал и падал на normalize_obs.
+
+def _migrate_vecnormalize_713_to_715(vec_path: str, base_env):
+    """Грузит VecNormalize и проверяет, что статистика относится к ТЕКУЩЕЙ раскладке признаков.
+
+    Раньше умела ТОЛЬКО 713 -> 715 и просто добивала статистику нулями до нужной размерности
+    (418, 713 -> 870). Это неверно: раскладка признаков менялась, в т.ч. вставками в середину
+    (713 -> 715), поэтому старые колонки — уже другие признаки, а `count` ~200k не даёт
+    испорченной статистике вымыться. Теперь несовместимая статистика сбрасывается
+    (mean=0, var=1, count=0) и переоценивается по текущим данным (BC warm-up / первые роллауты).
     """
     try:
         target_dim = None
@@ -594,13 +665,29 @@ def _migrate_vecnormalize_713_to_715(vec_path: str, base_env):
             except Exception:
                 target_dim = None
         from .vecnorm_utils import load_vecnormalize_for_dim
-        return load_vecnormalize_for_dim(vec_path, base_env, target_dim)
+        return load_vecnormalize_for_dim(vec_path, base_env, target_dim,
+                                         force_reset=RESET_OBS_STATS, keep_stale=KEEP_OBS_STATS)
     except Exception as e:
         msg = str(e)
         if "713" in msg or "715" in msg or "418" in msg or "shape" in msg.lower():
             print(f"  VecNormalize.load упал ({e}), создаю новый VecNormalize (статистика сброшена)")
             return VecNormalize(base_env, norm_obs=True, norm_reward=False, gamma=0.99, norm_obs_keys=["observation"])
         raise
+
+def _save_vecnorm(env, path: str = None) -> None:
+    """Сохраняет VecNormalize вместе с сайдкаром (размерность + хеш кода признаков).
+
+    Без сайдкара следующий resume не может отличить статистику текущей раскладки от
+    «добитой нулями» старой — и молча уезжает в неверную нормализацию.
+    """
+    from .config import VECNORM_PATH as _VP
+    from .vecnorm_utils import save_vecnormalize_with_meta
+    path = path or _VP
+    try:
+        if not save_vecnormalize_with_meta(env, path):
+            print(f"Не удалось сохранить VecNormalize в {path}")
+    except Exception as e:
+        print(f"Не удалось сохранить VecNormalize: {e}")
 
 
 
@@ -638,7 +725,25 @@ def run(
     icm_feat_dim: int = 256,
     icm_train_freq: int = 2048,
     icm_batch_size: int = 128,
+    reset_obs_stats: bool = False,
+    keep_obs_stats: bool = False,
 ):
+    # судьба статистики нормализации при resume (см. vecnorm_utils.stats_verdict)
+    global RESET_OBS_STATS, KEEP_OBS_STATS
+    RESET_OBS_STATS = bool(reset_obs_stats)
+    KEEP_OBS_STATS = bool(keep_obs_stats)
+    # self-play оппоненты в env-процессах: нормализовать obs тем же способом, что и обучение
+    os.environ["PYBOT_SELF_PLAY_NORM"] = "0" if no_normalize_bc else "1"
+    if not no_normalize_bc:
+        try:
+            # логируем один раз в главном процессе (в воркерах печать подавляется)
+            from agents.env import _self_play_obs_normalizer
+            if _self_play_obs_normalizer() is None:
+                print("self-play оппоненты: статистика нормализации obs не найдена — "
+                      "играют на сырых признаках (это разойдётся с обучением)")
+        except Exception as e:
+            print(f"self-play: не удалось проверить нормализацию obs: {e}")
+
     # phase_size должен делиться на фактический размер роллаута n_steps*num_envs (с учётом целочисленного деления)
     rollout_size = (3072 // num_envs) * num_envs
     if phase_size % rollout_size != 0:
@@ -1018,11 +1123,8 @@ def run(
         # при --no-normalize-bc self-play веса никогда не применялись (плато).
         # Теперь всегда пересоздаём, но ветвимся по нормализации.
         if not no_normalize_bc:
-            # сохраняем статистику нормализации
-            try:
-                env.save(VECNORM_PATH)
-            except Exception as e:
-                print(f"Не удалось сохранить VecNormalize: {e}")
+            # сохраняем статистику нормализации (+ сайдкар с отпечатком признаков)
+            _save_vecnorm(env, VECNORM_PATH)
             env.close()
             raw_env = SubprocVecEnv(
                 [partial(ExampleEnv.create_env, opponent_weights=current_weights) for _ in range(num_envs)]
@@ -1106,10 +1208,7 @@ def run(
     ppo.save("models/ppo_policy_final")
     # сохраняем VecNormalize финальный
     if not no_normalize_bc and hasattr(env, "save"):
-        try:
-            env.save(VECNORM_PATH)
-        except Exception:
-            pass
+        _save_vecnorm(env, VECNORM_PATH)
     env.close()
 
     # финальная оценка — тоже с нормализацией (патчим PolicyPlayer внутри evaluate, но тут просто выводим)
@@ -1148,6 +1247,12 @@ if __name__ == "__main__":
     parser.add_argument("--phase-size", type=int, default=200_000)
     parser.add_argument("--norm-reward", action="store_true", help="Нормализовать награды VecNormalize (рекомендуется для стабильности)")
     parser.add_argument("--no-normalize-bc", action="store_true")
+    parser.add_argument("--reset-obs-stats", action="store_true", dest="reset_obs_stats",
+                        help="сбросить статистику нормализации obs даже если размерность совпала "
+                             "(полезно, если модель обучена на статистике старой раскладки признаков)")
+    parser.add_argument("--keep-obs-stats", action="store_true", dest="keep_obs_stats",
+                        help="оставить статистику нормализации даже при несовместимой размерности "
+                             "(прежнее поведение: добить нулями)")
     parser.add_argument("--ent-coef", type=float, default=None)
     parser.add_argument("--learning-rate", type=float, default=2e-4, dest="learning_rate", help="Начальный learning_rate (линейно аннилится до 0). По умолчанию 2e-4, для дообучения после BC рекомендуется 5e-5..1e-4")
     parser.add_argument("--lr", type=float, default=None, dest="lr_alias", help="Алиас для --learning-rate")
@@ -1217,4 +1322,6 @@ if __name__ == "__main__":
         icm_feat_dim=args.icm_feat_dim,
         icm_train_freq=args.icm_train_freq,
         icm_batch_size=args.icm_batch_size,
+        reset_obs_stats=args.reset_obs_stats,
+        keep_obs_stats=args.keep_obs_stats,
     )

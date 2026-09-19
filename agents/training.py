@@ -1349,18 +1349,32 @@ def _get_opponent_weights(names: list[str]) -> list[float]:
     return [w / total2 for w in weights]
 
 def evaluate_win_rates(ppo, n_battles: int = 180) -> dict[str, float]:
+    # Нормализация obs: используем РОВНО те же статистики, что видит обучение (живой
+    # VecNormalize), через штатный параметр PolicyPlayer. Раньше здесь подменялся
+    # embed_battle, а self-play оппонент для eval создавался отдельно и без нормализации.
     vec_norm = ppo.get_vec_normalize_env() if hasattr(ppo, "get_vec_normalize_env") else None
-    base_agent = PolicyPlayer(policy=ppo.policy, battle_format=BATTLE_FORMAT, max_concurrent_battles=30)
-    orig_embed = base_agent.embed_battle
+    normalizer = None
     if vec_norm is not None:
         try:
-            def norm_embed(battle):
-                raw = orig_embed(battle)
-                normed = vec_norm.normalize_obs({"observation": raw[None, :]})["observation"][0]
-                return normed
-            base_agent.embed_battle = norm_embed  # type: ignore
+            from .vecnorm_utils import LiveVecNormalizeAdapter
+            normalizer = LiveVecNormalizeAdapter(vec_norm, target_dim=N_FEATURES)
         except Exception as e:
-            print(f"Не удалось патчить нормализацию для eval: {e}")
+            print(f"Не удалось включить нормализацию для eval: {e}")
+    if normalizer is None and os.environ.get("PYBOT_SELF_PLAY_NORM", "1") != "0":
+        # запасной путь: живой VecNormalize недоступен (например, оценка идёт из другого места) —
+        # берём статистику с диска. НЕ применяем, если обучение идёт без нормализации
+        # (--no-normalize-bc): иначе eval окажется в других условиях, чем обучение.
+        try:
+            from .config import VECNORM_PATH
+            from .vecnorm_utils import load_vecnorm_stats
+            if os.path.isfile(VECNORM_PATH):
+                normalizer = load_vecnorm_stats(VECNORM_PATH, N_FEATURES)
+                if normalizer is not None:
+                    print(f"eval: нормализация obs из {VECNORM_PATH} ({normalizer.describe()})")
+        except Exception:
+            normalizer = None
+    base_agent = PolicyPlayer(policy=ppo.policy, battle_format=BATTLE_FORMAT,
+                              max_concurrent_battles=30, obs_normalizer=normalizer)
 
     opponents: list[Player] = [
         c(battle_format=BATTLE_FORMAT, max_concurrent_battles=30)
@@ -1377,7 +1391,8 @@ def evaluate_win_rates(ppo, n_battles: int = 180) -> dict[str, float]:
             # иначе battle_against может зависнуть с 0 finished battles
             base_sp = sp_opps[-1]
             try:
-                eval_sp = PolicyPlayer(policy=getattr(base_sp, "policy", None), battle_format=BATTLE_FORMAT, max_concurrent_battles=30)
+                eval_sp = PolicyPlayer(policy=getattr(base_sp, "policy", None), battle_format=BATTLE_FORMAT,
+                                       max_concurrent_battles=30, obs_normalizer=normalizer)
                 opponents.append(eval_sp)
             except Exception:
                 opponents.append(base_sp)

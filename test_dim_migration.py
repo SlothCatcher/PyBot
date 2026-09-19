@@ -189,9 +189,17 @@ def main():
             rms2 = vn2.obs_rms["observation"]
             check("VecNormalize: статистика добита до N_FEATURES без падения",
                   tuple(rms2.mean.shape) == (N_FEATURES,), str(tuple(rms2.mean.shape)))
-            check("VecNormalize: старые stats сохранены, новые mean=0/var=1",
-                  bool(np.allclose(rms2.mean[:old_dim], vn.obs_rms["observation"].mean))
-                  and bool(np.all(rms2.mean[old_dim:] == 0)) and bool(np.all(rms2.var[old_dim:] == 1)))
+            # ВАЖНО (изменено): статистику чужой размерности НЕ добиваем нулями, а сбрасываем.
+            # Раскладка признаков менялась (в т.ч. вставками в середину), поэтому старые колонки
+            # означают уже другие признаки, а count ~200k не даёт испорченной статистике вымыться.
+            check("VecNormalize: статистика чужой размерности сброшена (mean=0, var=1, count=0)",
+                  bool(np.all(rms2.mean == 0)) and bool(np.all(rms2.var == 1)) and float(rms2.count) == 0.0,
+                  f"count={rms2.count}")
+            vn2_stale = load_vecnormalize_for_dim(vn_path, env_new, N_FEATURES, keep_stale=True, quiet=True)
+            rms3 = vn2_stale.obs_rms["observation"]
+            check("VecNormalize: --keep-obs-stats сохраняет прежнее поведение (паддинг нулями)",
+                  bool(np.allclose(rms3.mean[:old_dim], vn.obs_rms["observation"].mean))
+                  and bool(np.all(rms3.mean[old_dim:] == 0)) and bool(np.all(rms3.var[old_dim:] == 1)))
             obs_vec = vn2.reset()
             if isinstance(obs_vec, tuple):  # старый API gym
                 obs_vec = obs_vec[0]
@@ -404,6 +412,79 @@ def main():
               str(tuple(mig.observation_space["action_mask"].shape)))
         check("fallback-миграция: action_space = Discrete(26)",
               int(mig.action_space.n) == 26, str(mig.action_space))
+
+
+    # 12) legacy-снапшоты: identity-экстрактор (нет features_extractor.*), net_arch [512,256,128],
+    #     obs 418. Раньше такие файлы не грузились вообще: `_checkpoint_arch` не находил state_dict
+    #     (искал ключи features_extractor), проба собиралась с текущими дефолтами ([512,256] +
+    #     Linear-экстрактор) и падала на size mismatch -> "Failed to load qualified snapshot".
+    legacy = os.path.join("models", "self_play_snapshot_0.zip")
+    if os.path.isfile(legacy):
+        from agents.policy_player import _migrate_checkpoint_dim as _mig
+        arch_l = _checkpoint_arch(legacy)
+        check("legacy: state_dict найден (arch не пустой)", bool(arch_l), str(arch_l))
+        check("legacy: action_dim = 26", int(arch_l.get("action_dim", 0)) == 26, str(arch_l.get("action_dim")))
+        check("legacy: identity-экстрактор распознан (has_feature_net=False)",
+              arch_l.get("has_feature_net") is False, str(arch_l.get("has_feature_net")))
+        check("legacy: net_arch из весов = [512, 256, 128]",
+              arch_l.get("net_arch", {}).get("pi") == [512, 256, 128]
+              and arch_l.get("net_arch", {}).get("vf") == [512, 256, 128],
+              str(arch_l.get("net_arch")))
+        old_dim_legacy = 418
+        ppo_l = _mig(legacy, target_dim=N_FEATURES, verbose=False)
+        check("legacy: миграция 418 -> N_FEATURES проходит",
+              tuple(ppo_l.policy.action_net.weight.shape) == (26, 128),
+              str(tuple(ppo_l.policy.action_net.weight.shape)))
+        check("legacy: obs_space мигрированной политики = N_FEATURES",
+              tuple(ppo_l.observation_space["observation"].shape) == (N_FEATURES,))
+        check("legacy: маска = 26 действий (тера доступна)",
+              tuple(ppo_l.observation_space["action_mask"].shape) == (26,))
+        # новые признаки входят с нулевыми весами: поведение = старое
+        w_pi = ppo_l.policy.mlp_extractor.policy_net[0].weight.detach()
+        w_vf = ppo_l.policy.mlp_extractor.value_net[0].weight.detach()
+        check("legacy: новые колонки policy_net.0 обнулены",
+              int(torch.count_nonzero(w_pi[:, old_dim_legacy:])) == 0, str(tuple(w_pi.shape)))
+        check("legacy: новые колонки value_net.0 обнулены",
+              int(torch.count_nonzero(w_vf[:, old_dim_legacy:])) == 0, str(tuple(w_vf.shape)))
+        # старые колонки побитово из чекпоинта
+        src_state = None
+        for _k, _v in load_from_zip_file(legacy, device=torch.device("cpu"))[1].items():
+            if isinstance(_v, dict) and "mlp_extractor.policy_net.0.weight" in _v:
+                src_state = _v
+        check("legacy: старые колонки взяты из чекпоинта без изменений",
+              src_state is not None and bool(torch.equal(w_pi[:, :old_dim_legacy],
+                                                         src_state["mlp_extractor.policy_net.0.weight"])))
+        # выход не зависит от новых признаков (warm start: модель ведёт себя как раньше)
+        import numpy as _np
+        obs_a = _np.zeros((1, N_FEATURES), dtype=_np.float32)
+        obs_b = _np.zeros((1, N_FEATURES), dtype=_np.float32)
+        rng = _np.random.default_rng(3)
+        obs_a[0, :old_dim_legacy] = rng.normal(size=old_dim_legacy).astype(_np.float32)
+        obs_b[0, :old_dim_legacy] = obs_a[0, :old_dim_legacy]
+        obs_b[0, old_dim_legacy:] = rng.normal(size=N_FEATURES - old_dim_legacy).astype(_np.float32)
+        import torch as _torch
+        with _torch.no_grad():
+            m_a = {"observation": _torch.as_tensor(obs_a), "action_mask": _torch.ones((1, 26), dtype=_torch.bool)}
+            m_b = {"observation": _torch.as_tensor(obs_b), "action_mask": _torch.ones((1, 26), dtype=_torch.bool)}
+            logits_a = ppo_l.policy.get_distribution(m_a).distribution.logits
+            logits_b = ppo_l.policy.get_distribution(m_b).distribution.logits
+            val_a = ppo_l.policy.predict_values(m_a)
+            val_b = ppo_l.policy.predict_values(m_b)
+        check("legacy: новые признаки не влияют на логиты (warm start)",
+              bool(_torch.allclose(logits_a, logits_b, atol=1e-6)))
+        check("legacy: новые признаки не влияют на value",
+              bool(_torch.allclose(val_a, val_b, atol=1e-5)))
+        # и предупреждение о том, что снапшот из старой раскладки
+        import io as _io
+        import contextlib as _cl
+        buf = _io.StringIO()
+        with _cl.redirect_stdout(buf):
+            _mig(legacy, target_dim=N_FEATURES)
+        out = buf.getvalue()
+        check("legacy: в логе видно, что это старая раскладка/патч lr_schedule",
+              ("lr_schedule" in out) or ("legacy" in out) or ("418" in out), out.strip().splitlines()[-1][:90] if out.strip() else "нет вывода")
+    else:
+        print(f"SKIP legacy-снапшот {legacy} не найден в models/ (файл вне git)")
 
     print("-" * 74)
     if FAIL:

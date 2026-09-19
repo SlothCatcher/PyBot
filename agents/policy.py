@@ -57,6 +57,8 @@ class LegacyFeaturesExtractor(BaseFeaturesExtractor):
 
 class MaskedActorCriticPolicy(ActorCriticPolicy):
     def __init__(self, *args, **kwargs):
+        self._mask = None
+        self._mask_shape_warned = False
         if "net_arch" not in kwargs:
             kwargs["net_arch"] = dict(pi=[512, 256], vf=[512, 256])
         if "activation_fn" not in kwargs:
@@ -77,7 +79,20 @@ class MaskedActorCriticPolicy(ActorCriticPolicy):
 
     def _get_action_dist_from_latent(self, latent_pi):
         action_logits = self.action_net(latent_pi)
-        mask = self._mask
+        mask = getattr(self, "_mask", None)
+        if mask is None:
+            # get_distribution() можно вызвать без forward (внешние инструменты/тесты): маски
+            # нет — считаем допустимыми все действия. Раньше здесь был AttributeError.
+            return self.action_dist.proba_distribution(action_logits)
+
+        # защита от маски чужой длины (например, 9 действий у DoublesEnv против 26 у gen9-фьюжна):
+        # без неё `action_logits + additive_mask` падает на несовместимых формах прямо в обучении
+        if mask.shape[-1] != action_logits.shape[-1]:
+            if not getattr(self, "_mask_shape_warned", False):
+                self._mask_shape_warned = True
+                print(f"WARNING: маска действий длины {mask.shape[-1]} не подходит к голове "
+                      f"({action_logits.shape[-1]} действий) — маскирование пропущено")
+            return self.action_dist.proba_distribution(action_logits)
 
         no_valid_action = mask.sum(dim=-1) == 0
         if no_valid_action.any():
