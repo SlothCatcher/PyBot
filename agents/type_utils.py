@@ -67,6 +67,8 @@ _counts: dict[str, Counter] = {
     "typechange_variant": Counter(),      # со [silent] / без него (влияет на сбор статов)
     "frame_sequence": Counter(),          # порядок сообщений в кадре с |request|
     "stats_missing_at_decision": Counter(),  # фьюжн-статы не успели к решению
+    "fusion_type_used": Counter(),           # тип фьюжна посчитан локально (сервер молчал)
+    "fusion_type_unknown": Counter(),        # фьюжн-партнёр не распознан -> тип из декса
 }
 # сколько уникальных строк печатать на вид события (чтобы не залить лог)
 _PRINT_LIMIT = {
@@ -78,6 +80,8 @@ _PRINT_LIMIT = {
     "typechange_variant": 2,
     "frame_sequence": 5,
     "stats_missing_at_decision": 5,
+    "fusion_type_used": 5,
+    "fusion_type_unknown": 5,
 }
 
 
@@ -132,6 +136,10 @@ def _note(kind: str, key: str, limit_unique: int | None = None) -> None:
         print(f"[type-fix] фьюжн-статы отсутствовали на момент решения ({key}) — ход сыгран по дексовому фолбэку")
     elif kind == "typechange_raw":
         print(f"[type-debug] typechange от сервера: {key}")
+    elif kind == "fusion_type_used":
+        print(f"[type-fix] тип фьюжна посчитан без сервера: {key}")
+    elif kind == "fusion_type_unknown":
+        print(f"[type-fix] фьюжн-тип посчитать не удалось ({key}) — взят дексовый тип")
 
 
 def damage_multiplier_safe_ex(
@@ -224,6 +232,11 @@ def note_frame_sequence(kinds: str, has_typechange: bool, has_html: bool, tc_aft
     _note("frame_sequence", kinds)
     if tc_after_request:
         _note("typechange_after_request", kinds)
+
+
+def note_fusion_event(kind: str, key: str) -> None:
+    """События фьюжн-типов (см. fusion_types.py): посчитан локально / партнёр не распознан."""
+    _note(kind, key)
 
 
 def note_stats_missing(context: str) -> None:

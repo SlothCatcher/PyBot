@@ -27,6 +27,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from .fusion_types import effective_types
 from .type_utils import damage_multiplier_safe
 
 # --- статы ---------------------------------------------------------------------------
@@ -254,8 +255,13 @@ def prepare_mon(mon, fusion_entry: Optional[dict] = None) -> Optional[dict]:
     if not hp_max:
         hp_max = stats["hp"]
     moves = [m for m in (getattr(mon, "moves", None) or {}).values() if m is not None]
+    # типы считаем здесь (один раз на мон): в фьюжн-формате poke-env отдаёт дексовые типы «головы»,
+    # когда мон не на поле — см. fusion_types.py
+    ft1, ft2, types_src = effective_types(mon)
     return {
         "mon": mon,
+        "types": (ft1, ft2),
+        "types_src": types_src,
         "stats": stats,
         "boosts": dict(getattr(mon, "boosts", {}) or {}),
         "ability": ability,
@@ -403,9 +409,11 @@ def estimate_damage(atk: Optional[dict], dfn: Optional[dict], move, ctx: Optiona
         return None
     atk_name = st["type_name"]
 
-    # эффективность по типам защиты (с учётом неизвестных типов — покомпонентно)
-    dmon = dfn["mon"]
-    eff = damage_multiplier_safe(mtype, getattr(dmon, "type_1", None), getattr(dmon, "type_2", None))
+    # эффективность по типам защиты (с учётом неизвестных типов — покомпонентно).
+    # Типы берём из prep: там уже учтён фьюжн-тип (у монов в скамейке poke-env отдаёт дексовые)
+    dt1, dt2 = dfn.get("types") or (getattr(dfn["mon"], "type_1", None),
+                                    getattr(dfn["mon"], "type_2", None))
+    eff = damage_multiplier_safe(mtype, dt1, dt2)
     if eff <= 0:
         return (0.0, 0.0)
 
@@ -441,9 +449,10 @@ def estimate_damage(atk: Optional[dict], dfn: Optional[dict], move, ctx: Optiona
     # teambuilder, — и приём получал лишний STAB 1.5x, которого в бою ещё нет
     # (проверено на живом `Battle`: Camerupt Fire/Ground с объявленным tera:Water получал
     # STAB за Surf).
-    amon = atk["mon"]
-    stab_types = {str(getattr(getattr(amon, "type_1", None), "name", "") or "").upper(),
-                  str(getattr(getattr(amon, "type_2", None), "name", "") or "").upper()}
+    at1, at2 = atk.get("types") or (getattr(atk["mon"], "type_1", None),
+                                    getattr(atk["mon"], "type_2", None))
+    stab_types = {str(getattr(at1, "name", "") or "").upper(),
+                  str(getattr(at2, "name", "") or "").upper()}
     if atk_name in stab_types:
         mult *= 2.0 if atk["ability"] == "adaptability" else 1.5
     # техник
@@ -807,8 +816,10 @@ def _mon_sig(prep: dict, attacker: bool) -> tuple:
     """
     mon = prep["mon"]
     boosts = tuple(sorted((str(k), int(v or 0)) for k, v in (prep["boosts"] or {}).items()))
-    types = (str(getattr(getattr(mon, "type_1", None), "name", "")),
-             str(getattr(getattr(mon, "type_2", None), "name", "")))
+    ptypes = prep.get("types")
+    if ptypes is None:
+        ptypes = (getattr(mon, "type_1", None), getattr(mon, "type_2", None))
+    types = tuple(str(getattr(t, "name", "") or "") for t in ptypes)
     stats = prep.get("stats_sig")
     if stats is None:  # dict не из prepare_mon (тесты/внешние вызовы) — считаем сами
         stats = tuple(sorted((str(k), int(v or 0)) for k, v in (prep.get("stats") or {}).items()))

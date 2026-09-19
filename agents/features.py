@@ -9,6 +9,17 @@ except ImportError:  # запуск модуля вне пакета
     from type_utils import damage_multiplier_safe
 
 try:
+    from .fusion_types import effective_types
+except ImportError:  # запуск модуля вне пакета
+    from fusion_types import effective_types
+
+
+def _eff_types(mon):
+    """Типы мон с учётом фьюжна (см. fusion_types.py) — дексовые только как последний фолбэк."""
+    t1, t2, _ = effective_types(mon)
+    return t1, t2
+
+try:
     from .damage import (
         DAMAGE_BLOCK_SIZE, EFFECT_FLAG_COUNT, FLAGS_BASE, MIRROR_BASE, OPP_MOVE_SLOTS,
         OUR_TEAM_SLOTS, TEAM_BASE, DamageContext, cached_best_move_damage, damage_frac,
@@ -176,7 +187,7 @@ def _type_multi_hot(pokemon) -> np.ndarray:
     vec = np.zeros(len(_TYPE_LIST), dtype=np.float32)
     if pokemon is None:
         return vec
-    for t in (pokemon.type_1, pokemon.type_2):
+    for t in _eff_types(pokemon):
         if t is not None and t in _TYPE_INDEX:
             vec[_TYPE_INDEX[t]] = 1.0
     return vec
@@ -441,7 +452,8 @@ def _move_stab_flag(move, pokemon) -> float:
         if mtype is None:
             return 0.0
         # tera stab not counted here (would need tera_type), just base types
-        if mtype == getattr(pokemon, "type_1", None) or mtype == getattr(pokemon, "type_2", None):
+        pt1, pt2 = _eff_types(pokemon)
+        if mtype == pt1 or mtype == pt2:
             return 1.0
         # also check tera if terastallized
         tera = getattr(pokemon, "tera_type", None) or getattr(pokemon, "_terastallized_type", None)
@@ -665,17 +677,71 @@ def _actual_stats_vec(mon, fusion_entry: dict | None = None) -> np.ndarray:
         pass
     return vec
 
+def _fusion_entry_for(mon, fusion_map: dict | None) -> dict | None:
+    """Запись фьюжна для мон из карты СВОЕЙ стороны (см. fusion_parser.get_team_fusion_map).
+
+    Ключ карты — вид, под которым запись положил парсер: это имя из `|switch|`/`|typechange`,
+    а мод пишет там "+Тело" (то есть ключ = вид-«тело»). У покемона же из `details` виден
+    только вид-«голова» (`Pokemon.species`), поэтому просто `map[mon.species]` не находил
+    запись — статы скамейки молча падали на дексовые. Ищем по очереди: точный ключ по голове,
+    ключ по телу из '+'-имени, составной "голова_тело" (не путает двух мон с одним телом).
+    """
+    if not fusion_map or mon is None:
+        return None
+    try:
+        from poke_env.data.normalize import to_id_str
+    except Exception:
+        return None
+
+    def _sid(v):
+        try:
+            return to_id_str(v) or None
+        except Exception:
+            return None
+
+    head = _sid(getattr(mon, "species", "") or getattr(mon, "base_species", ""))
+    entry = fusion_map.get(head) if head else None
+    if entry is not None:
+        return entry
+    _head, body = fusion_types_pair(mon)   # fusion_pair возвращает (голова, тело)
+    if body:
+        if head:
+            entry = fusion_map.get(f"{head}_{body}")
+            if entry is not None:
+                return entry
+        entry = fusion_map.get(body)
+        if entry is not None:
+            return entry
+    base = _sid(getattr(mon, "base_species", ""))
+    if base and base != head:
+        return fusion_map.get(base)
+    return None
+
+
+def fusion_types_pair(mon):
+    """(голова, тело) фьюжна у мон — тонкая обёртка, чтобы не тянуть импорт в кучу мест."""
+    try:
+        from .fusion_types import fusion_pair
+    except ImportError:
+        from fusion_types import fusion_pair
+    try:
+        return fusion_pair(mon)
+    except Exception:
+        return None, None
+
+
 def _weakness_score(mon, opp_active, type_chart) -> float:
     """0..1: max effectiveness of opp_active vs mon. 1.0 = x1, 2.0->0.5 normalized as (mult-1)/3 capped? We use 1 for弱, 0 for neutral/resist."""
     if mon is None or opp_active is None:
         return 0.0
-    atk_types = [t for t in (opp_active.type_1, opp_active.type_2) if t is not None]
+    atk_types = [t for t in _eff_types(opp_active) if t is not None]
     if not atk_types:
         return 0.0
+    mt1, mt2 = _eff_types(mon)
     max_mult = 1.0
     for atk in atk_types:
         # безопасный расчёт: неизвестный второй тип не маскирует иммунитет
-        mult = damage_multiplier_safe(atk, mon.type_1, mon.type_2, type_chart)
+        mult = damage_multiplier_safe(atk, mt1, mt2, type_chart)
         max_mult = max(max_mult, mult)
     # map 1->0, 2->0.5, 4->1
     if max_mult >= 4:
@@ -707,7 +773,8 @@ def _bench_moves_vec(mon, opp_active, type_chart) -> np.ndarray:
         if opp_active is not None:
             max_eff = 1.0
             for m in moves:
-                eff = damage_multiplier_safe(m.type, opp_active.type_1, opp_active.type_2, type_chart) if getattr(m, "type", None) else 1.0
+                ot1, ot2 = _eff_types(opp_active)
+                eff = damage_multiplier_safe(m.type, ot1, ot2, type_chart) if getattr(m, "type", None) else 1.0
                 max_eff = max(max_eff, eff)
             vec[2] = float(np.clip(max_eff / 4.0, 0, 1))
         # has_heal
@@ -804,20 +871,8 @@ def _bench_vec(team: dict, opp_active=None, type_chart=None, fusion_map: dict | 
     for i in range(MAX_RESERVES):
         if i < len(reserves):
             mon = reserves[i]
-            # fusion entry per mon if available (key by species id)
-            f_entry = None
-            if fusion_map:
-                # try species id
-                try:
-                    from poke_env.data.normalize import to_id_str
-                    sid = to_id_str(getattr(mon, "species", "") or getattr(mon, "base_species", ""))
-                    f_entry = fusion_map.get(sid)
-                    if f_entry is None:
-                        # try base_species
-                        sid2 = to_id_str(getattr(mon, "base_species", ""))
-                        f_entry = fusion_map.get(sid2)
-                except Exception:
-                    pass
+            # запись фьюжна: ключ карты — вид-"тело", у мон виден вид-"голова" (см. _fusion_entry_for)
+            f_entry = _fusion_entry_for(mon, fusion_map)
             slots.append(_reserve_slot_vec(mon, opp_active, type_chart, f_entry))
         else:
             slots.append(np.zeros(_RESERVE_SLOT_SIZE, dtype=np.float32))
@@ -830,7 +885,7 @@ def _vulnerability_frac(reserves: list, opponent_active, type_chart) -> float:
     alive = [m for m in reserves if not m.fainted]
     if not alive:
         return 0.0
-    atk_types = [t for t in (opponent_active.type_1, opponent_active.type_2) if t is not None]
+    atk_types = [t for t in _eff_types(opponent_active) if t is not None]
     if not atk_types:
         return 0.0
     vulnerable = 0
@@ -838,7 +893,8 @@ def _vulnerability_frac(reserves: list, opponent_active, type_chart) -> float:
         max_mult = 1.0
         for atk in atk_types:
             # было `except KeyError: mult = 1.0` — теперь компонентный расчёт
-            mult = damage_multiplier_safe(atk, mon.type_1, mon.type_2, type_chart)
+            mt1, mt2 = _eff_types(mon)
+            mult = damage_multiplier_safe(atk, mt1, mt2, type_chart)
             max_mult = max(max_mult, mult)
         if max_mult >= 2.0:
             vulnerable += 1
@@ -1004,7 +1060,7 @@ def _move_wasted_flag(move, battle) -> float:
             immune_types = {"brn": ["fire"], "par": ["electric","ground"], "psn": ["poison","steel"], "tox": ["poison","steel"], "slp": [], "frz": []}.get(s_key, [])
             if immune_types:
                 # проверяем типы оппа
-                for t in [getattr(opp, "type_1", None), getattr(opp, "type_2", None)]:
+                for t in _eff_types(opp):
                     if t is not None and getattr(t, "name", str(t)).lower() in immune_types:
                         return 1.0
         except Exception:
@@ -1028,7 +1084,8 @@ def _move_wasted_flag(move, battle) -> float:
             if bp and bp >= 10:
                 # FIX: раньше тут был каскад try/except с fallback mult=1.0 — при неизвестном
                 # втором типе (??? / STELLAR) это прятало иммунитет. Теперь считаем покомпонентно.
-                mult = damage_multiplier_safe(getattr(move, "type", None), opp.type_1, opp.type_2)
+                ot1, ot2 = _eff_types(opp)
+                mult = damage_multiplier_safe(getattr(move, "type", None), ot1, ot2)
                 if mult == 0:
                     return 1.0
     except Exception:
@@ -1095,14 +1152,11 @@ def _damage_block(battle, our_fusion, opp_fusion, our_team_fusions=None, opp_tea
             Фьюжн-партнёры у одинаковых species могут быть разными, поэтому чужая карта не
             используется вовсе — нет записи, значит статы берутся из декса (`prepare_mon`
             с None), как и для любого неизвестного случая.
+
+            Ключ карты — вид-"тело" (имя из `|switch|` с "+"), а у мон виден вид-"голова":
+            разбирается в `_fusion_entry_for`.
             """
-            sid = str(getattr(mon, "species", "") or "")
-            try:
-                from poke_env.data.normalize import to_id_str
-                sid = to_id_str(sid) or sid
-            except Exception:
-                pass
-            return own_map.get(sid)
+            return _fusion_entry_for(mon, own_map)
 
         our_prepared = []
         for mon in our_slots:
@@ -1205,10 +1259,11 @@ def embed_battle_with_fusion(battle, our_fusion, opp_fusion, our_protected_last_
         if battle.opponent_active_pokemon is not None:
             # FIX: раньше при KeyError писался нейтрал 1.0, из-за чего модель не видела
             # иммунитет (Electric vs Ground-фьюжн со вторым типом "???"). Теперь 0.0 сохраняется.
+            _oat1, _oat2 = _eff_types(battle.opponent_active_pokemon)
             moves_dmg_multiplier[i] = damage_multiplier_safe(
                 move.type,
-                battle.opponent_active_pokemon.type_1,
-                battle.opponent_active_pokemon.type_2,
+                _oat1,
+                _oat2,
                 type_chart=type_chart,
             )
         moves_boost_own[i] = _move_boost_flags(move, "own")

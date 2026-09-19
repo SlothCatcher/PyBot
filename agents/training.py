@@ -586,7 +586,8 @@ def _merge_dataset_chunks(chunk_files: list, final_path: str):
     gc.collect()
 
 def _features_fingerprint() -> str:
-    """Хеш кода, который считает признаки (features.py + damage.py + config.py).
+    """Хеш кода, который считает признаки (features.py + damage.py + fusion_types.py +
+    type_utils.py + config.py).
 
     Нужен, чтобы кэш пересчёта (`models/heuristic_dataset_tmp_recompute/_merged.npz`) не был
     использован после правок, меняющих ЗНАЧЕНИЯ признаков при той же размерности: obs_dim
@@ -595,7 +596,10 @@ def _features_fingerprint() -> str:
     import hashlib
     h = hashlib.md5()
     base = os.path.dirname(os.path.abspath(__file__))
-    for name in ("features.py", "damage.py", "config.py"):
+    # fusion_types/type_utils тоже считают значения признаков (фьюжн-типы и безопасные
+    # множители типа) — без них кэш датасета и сайдкар статистики остались бы «валидными»
+    # после правки типов при той же размерности obs
+    for name in ("features.py", "damage.py", "fusion_types.py", "type_utils.py", "config.py"):
         try:
             with open(os.path.join(base, name), "rb") as f:
                 h.update(f.read())

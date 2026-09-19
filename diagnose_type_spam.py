@@ -74,6 +74,30 @@ def _move_bp(move) -> int:
     return int(bp or 0)
 
 
+def _ident_matches_mon(mon, ident: str) -> bool:
+    """Относится ли typechange-сообщение с этим ident к этому покемону.
+
+    Обычный случай: ident — имя/вид, и он встречается в species мон. В фьюжн-формате мод
+    пишет ident как "+Тело" (вид-«голова» при этом в `details`/`species`), поэтому дополнительно
+    сверяем тело фьюжна (см. fusion_types) — иначе сообщения про свою же монку считались бы
+    «сообщением про другого покемона».
+    """
+    if mon is None:
+        return False
+    ident_key = str(ident or "").split(": ", 1)[-1].lstrip("+").strip().lower()
+    if not ident_key:
+        return False
+    species = str(getattr(mon, "species", "") or "").lower()
+    if ident_key in species:
+        return True
+    try:
+        from agents.fusion_types import fusion_pair
+        head, body = fusion_pair(mon)
+        return bool(body) and ident_key in {str(head or "").lower(), str(body).lower()}
+    except Exception:
+        return False
+
+
 def _type_pair(mon):
     if mon is None:
         return ("None", "None")
@@ -207,10 +231,9 @@ class TypeDiagPlayer(PolicyPlayer):
             ident, srv_types = srv
             if srv_types is None:
                 continue
-            # сообщение может относиться к другому покемону (свитч уже был, typechange ещё нет)
-            ident_key = ident.split(": ", 1)[-1].lstrip("+").strip().lower()
-            species = str(getattr(mon, "species", "") or "").lower()
-            if ident_key and species and ident_key not in species:
+            # сообщение может относиться к другому покемону (свитч уже был, typechange ещё нет).
+            # Для фьюжнов ident = "+Тело", поэтому сверяем и тело (см. _ident_matches_mon)
+            if not _ident_matches_mon(mon, ident):
                 self.stats["server_msg_other_mon"] += 1
                 continue
             actual = tuple(str(getattr(t, "name", t)) for t in (mon.type_1, mon.type_2) if t is not None)
@@ -228,6 +251,11 @@ class TypeDiagPlayer(PolicyPlayer):
         opp_side = "p2" if getattr(battle, "player_role", "p1") == "p1" else "p1"
         srv = _server_types_for(battle, opp_side)
         if srv is None or srv[1] is None:
+            return
+        opp_mon = getattr(battle, "opponent_active_pokemon", None)
+        if not _ident_matches_mon(opp_mon, srv[0]):
+            # сервер сообщал тип про ДРУГОГО мон -> сравнивать с ним obs нельзя
+            self.stats["server_msg_other_mon"] += 1
             return
         s_types = [_to_pokemon_type(x) for x in srv[1]]
         if not s_types or s_types[0] is None:

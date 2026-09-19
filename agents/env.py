@@ -23,6 +23,29 @@ from .players import PolicyPlayer
 
 import multiprocessing
 
+# Типы мон для награды: на поле сервер уже сообщил тип (тера/typechange), а у скамейки
+# poke-env чистит `_temporary_types` -> там типы дексовые «головы». Считаем фьюжн-тип сами
+# (см. fusion_types), чтобы награда видела ту же картину, что и признаки.
+_EFFECTIVE_TYPES = None
+
+
+def _eff_types(mon):
+    global _EFFECTIVE_TYPES
+    if mon is None:
+        return None, None
+    if _EFFECTIVE_TYPES is None:
+        try:
+            from .fusion_types import effective_types as _et
+        except ImportError:  # запуск модуля вне пакета
+            from fusion_types import effective_types as _et
+        _EFFECTIVE_TYPES = _et
+    try:
+        t1, t2, _ = _EFFECTIVE_TYPES(mon)
+        return t1, t2
+    except Exception:
+        return getattr(mon, "type_1", None), getattr(mon, "type_2", None)
+
+
 # --- веса для новой награды (сбалансированы под базу fainted 2.0 / hp 1.0 / victory 30)
 # ИСПРАВЛЕНИЕ: суммарный shaping за бой раньше мог быть 40-80 > victory 30 → доминировал над победой.
 # Сжали в 4 раза + per-episode бюджет 12, чтобы победа оставалась главным сигналом.
@@ -374,13 +397,14 @@ class ExampleEnv(SinglesEnv):
         try:
             # fallback по типам если нет мувов или просили только мульт
             if use_mult_only or not getattr(attacker, "moves", {}):
-                atk_types = [t for t in (attacker.type_1, attacker.type_2) if t is not None]
+                atk_types = [t for t in _eff_types(attacker) if t is not None]
                 if not atk_types:
                     return 1.0
+                dfn_t1, dfn_t2 = _eff_types(defender)
                 max_mult = 0.0
                 for atk in atk_types:
                     # безопасный расчёт: неизвестный тип защиты не маскирует иммунитет
-                    mult = damage_multiplier_safe(atk, defender.type_1, defender.type_2)
+                    mult = damage_multiplier_safe(atk, dfn_t1, dfn_t2)
                     max_mult = max(max_mult, mult)
                 return float(max_mult) if max_mult else 1.0
 
@@ -426,7 +450,8 @@ class ExampleEnv(SinglesEnv):
                     if mtype is not None:
                         # было: try damage_multiplier -> except -> chart -> except -> 1.0
                         # (маскировало иммунитет при неизвестном втором типе)
-                        mult = damage_multiplier_safe(mtype, defender.type_1, defender.type_2)
+                        dfn_t1, dfn_t2 = _eff_types(defender)
+                        mult = damage_multiplier_safe(mtype, dfn_t1, dfn_t2)
                     if mult == 0:
                         # иммун — урон 0
                         continue
@@ -1208,8 +1233,9 @@ class ExampleEnv(SinglesEnv):
                                 if bp and bp >= 10:
                                     mtype = getattr(move, "type", None)
                                     opp = battle.opponent_active_pokemon
+                                    opp_t1, opp_t2 = _eff_types(opp)
                                     # безопасный расчёт (раньше каскад с fallback 1.0 прятал иммунитет)
-                                    if damage_multiplier_safe(mtype, opp.type_1, opp.type_2) == 0:
+                                    if damage_multiplier_safe(mtype, opp_t1, opp_t2) == 0:
                                         flag = True
                             except Exception:
                                 pass

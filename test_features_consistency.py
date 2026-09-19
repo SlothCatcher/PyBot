@@ -603,6 +603,8 @@ def live_stages(fmt, fast, tmpdir, log, run):
     log(f"live-стадии к запуску: {', '.join(run) if run else '—'}")
     if not run:
         return
+    vec = None      # адресные прогоны (--only S1) не доходят до стадии вектора-нормализатора
+    disk = None
 
     if "S1" in run:
     # ---------------------------------------------------------------- S1: датасет ---
@@ -899,10 +901,11 @@ def live_stages(fmt, fast, tmpdir, log, run):
             ROWS.append(("S1-S5: один бой -> один obs", ref.shape[0], "VecNormStats",
                          max(d1, d2), h8(ref)))
 
-    try:
-        vec.close()
-    except Exception:
-        pass
+    if vec is not None:
+        try:
+            vec.close()
+        except Exception:
+            pass
 
 
 def _offline_env_obs(battle, tag=None, our_f=None, opp_f=None, our_team=None, opp_team=None,

@@ -177,10 +177,16 @@ class PolicyPlayer(FusionInfoParser, Player):
             if battle.opponent_active_pokemon is not None:
                 # безопасный расчёт: при неизвестном втором типе (??? / STELLAR) иммунитет
                 # сохраняется (было: KeyError -> нейтрал 1.0)
+                # типы противника — с учётом фьюжнов (вне fusion-форматов поведение прежнее)
+                try:
+                    from agents.fusion_types import effective_types as _et
+                except ImportError:
+                    from fusion_types import effective_types as _et  # type: ignore
+                opp_t1, opp_t2, _ = _et(battle.opponent_active_pokemon)
                 moves_dmg_multiplier[i] = damage_multiplier_safe(
                     move.type,
-                    battle.opponent_active_pokemon.type_1,
-                    battle.opponent_active_pokemon.type_2,
+                    opp_t1,
+                    opp_t2,
                     type_chart=type_chart,
                 )
 

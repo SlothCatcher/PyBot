@@ -1794,4 +1794,105 @@ PYBOT_SHOWDOWN_DIR=/path/to/pokemon-showdown ...  # сервер поднима�
 
 ---
 
+## 27. Учёт фьюжн-типов: урон по скамейке считался по дексовым типам «головы»
+
+### 27.1 Симптом и причина
+
+Формат `gen9fusionmonsrandombattle` («fusionmon»). Сервер сообщает фактический тип фьюжна
+**только** сообщением `|-start|<мон>|typechange|<A>/<B>|[silent]` — и только когда мон выходит
+на поле (живой лог: `|-start|p1a: +Stonjourner|typechange|Grass/Rock|[silent]`). poke-env кладёт
+это в `Pokemon._temporary_types` и **очищает их при `switch_out`** (`pokemon.py` ~604), а
+`type_1/type_2` предпочитают `_temporary_types`, иначе берут дексовые типы.
+
+Следствие: у любого мон **вне поля** (скамейка, ещё не показанный оппонент) `type_1/type_2` —
+это типы **«головы»** из `details`, а не фьюжна. Всё, что считало урон/эффективность по таким
+типам, врало:
+
+* блок урона в obs по **нашим** покемонам (матрица «их j -> наш i», зеркальный блок «их приёмы
+  x наши слоты», weakness/vulnerability скамейки, множитель типа приёма);
+* множитель типа приёма против активного оппонента — до первого `typechange` в бою;
+* награда в `env.py` (в т.ч. `_estimate_max_damage` для свитч-шейпинга) и флаг `wasted`
+  по типовой иммунности.
+
+Пример (живой бой): наш `Tropius` + `Stonjourner` = Grass/Rock; дексовые типы головы — Grass/Flying.
+Для скамейки Earthquake считался иммунным (Flying), хотя по фьюжну он бьёт — признак «их лучший
+приём по нашему слоту» показывал 0 там, где в бою урон реальный.
+
+### 27.2 Что сделано
+
+Новый модуль **`agents/fusion_types.py`** — расчёт типа по формуле мода (эталон — `fuseTypes`):
+
+```
+fuseTypes(types1, types2) = [types1[0], types2[1] ? types2[1] : types2[0]]   # схлопнуть дубли
+если пусто -> [types1[0] || "Normal"]
+```
+
+* `parseName`: имя-«тело» = `pokemon.name.substring(1, 20)` (префикс `+` — единственный признак
+  фьюжна); вид партнёра ищется в dex по id (точное совпадение, затем первое вхождение подстроки —
+  как `CutDexMap` у мода);
+* `types1` — тип **головы** (вид из `details`), `types2` — тип **партнёра** из имени;
+* спец-случаи мода: `Arceus` (num 493) — тип по плате при `multitype`, `Silvally` (num 773) —
+  по диску при `rkssystem`; для них в dex-виде `arceus<плата>` / `silvally<диск>`;
+* **приоритет источников**: `server:tera` > `server:typechange` > `fusion:голова+тело` > `dex`
+  (сервер всегда прав: тера и присланный typechange не пересчитываются);
+* гейт `is_fusion_format`: тег боя -> env `PYBOT_BATTLE_FORMAT` -> `config.BATTLE_FORMAT`;
+  вне fusion-форматов поведение не меняется **бит-в-бит** (тест это проверяет сравнением obs);
+* нераспознанный партнёр/неизвестный тип -> дексовые типы + счётчики `fusion_type_used` /
+  `fusion_type_unknown` (печатаются как `[type-fix]`, как и остальная диагностика типов);
+* в `effective_types` есть кэш по (gen, вид, имя, предмет, способность, фолбэк-типы) — расчёт
+  в горячем пути стоит ~2 мкс, накладные расходы на шаг признаков **+2.9 %** (0.645 -> 0.676 мс
+  на `gen9fusionmonsrandombattle`), поэтому кэш не отключается.
+
+Подключено:
+
+| Место | Что теперь |
+|---|---|
+| `damage.prepare_mon` | кладёт `"types"` + `"types_src"` (фьюжн-типы считаются один раз на мон) |
+| `damage.estimate_damage` | эффективность по `prep["types"]` защиты и STAB по `prep["types"]` атакующего |
+| `damage._mon_sig` | сигнатура кэша урона — из `prep["types"]` (кэш не смешивает дексовый и фьюжн-тип) |
+| `features` | `_eff_types`, `fusion_types_pair`, `_fusion_entry_for`; фьюжн-типы в мульти-hot, STAB-флаге, `_weakness_score`, `_vulnerability_frac`, `_bench_moves_vec`, `_move_wasted_flag`, `moves_dmg_multiplier` |
+| `env.py` | `_eff_types` в `_estimate_max_damage` (оба пути) и в флаге `wasted` по типовой иммунности |
+| `policy_player_simple.py` | множитель типа приёма по фьюжн-типам (старый/тестовый плеер) |
+| `diagnose_type_spam.py` | сверка `-start\|typechange` с текущим моном теперь понимает ident `+Тело` (иначе свои же сообщения считались «про другого покемона» и `obs_stale` врал) |
+
+Кэши и сайдкары: `training._features_fingerprint()` (он же `vecnorm_utils.features_fingerprint`)
+дополнен `fusion_types.py` и `type_utils.py` -> хеш `80b9bde3c8039c9b1c1a1b2bf155808f` (на момент
+правки; текущий проверяется тестом). Значит, кэш пересчёта датасета и сайдкар статистики от
+старых прогонов будут считаться «чужими» — это ожидаемо: значения признаков изменились.
+
+### 27.3 Что тест нашёл по ходу (исправлено)
+
+1. **`_fusion_entry_for` распаковывал `fusion_types_pair` не в том порядке** (`body, _ = …`),
+   из-за чего статы фьюжна скамейки не находились по ключу-«телу» -> молча падали на дексовые.
+   Теперь `_head, body = fusion_pair(mon)`.
+2. **Кэш `effective_types` путал моков**: в ключе не было фолбэк-типов, поэтому два тестовых
+   мон `SimpleNamespace(species="dfn")` с разными `type_1/type_2` получали типы друг друга.
+   Это поймал `test_damage.py::test_mold_breaker_is_exhaustive` (73 нарушения инварианта
+   Mold Breaker); после добавления типов в ключ — PASS. Тест-регрессия: секция H в
+   `test_fusion_types.py`.
+3. API `effective_types/effective_type_names` получил параметр `fmt=` (в тестах удобнее, чем
+   подменять глобальный `PYBOT_BATTLE_FORMAT`).
+
+### 27.4 Тесты
+
+`test_fusion_types.py` — **70 проверок**, секции:
+
+| Секция | Что проверяет |
+|---|---|
+| A | формула `fuseTypes` (в т.ч. живой случай `Grass/Flying` + `Rock` -> `Grass/Rock`) |
+| B | `parseName` («+Тело», `Mr. Mime`, обрезка имени), Arceus+плата/Multitype, Silvally+диск/RKS System |
+| C | приоритет источников (тера/typechange/фьюжн/декс), гейт по формату (тег/config/env), счётчики |
+| D | фьюжн-тип доезжает до `prepare_mon`/`estimate_damage`/`_weakness_score`/`_vulnerability_frac` |
+| E | статы фьюжна у скамейки: ключ-«тело», составной `голова_тело`, коллизии (нет записи -> декс) |
+| F | сквозной obs: в бою с `+Тело` меняются только блоки урона (матрица, mirror, [12:15]) и 4 type-колонки |
+| G | `diagnose_type_spam._ident_matches_mon` понимает ident `+Тело` |
+| H | кэш расчёта не путает монов одного вида с разными типами |
+| I | `features_fingerprint` == ручной пересчёт по файлам и меняется без `fusion_types.py` |
+
+Батарея (15 офлайн-файлов) — PASS, `test_mirror_features_live.py` — PASS,
+`test_features_consistency.py` — **78/78 PASS** на живом сервере (в т.ч. с включённым гейтом
+`PYBOT_BATTLE_FORMAT=gen9fusionmonsrandombattle` как смоук: на стоковом формате obs не меняются).
+
+---
+
 *Автор аудита: Agent Arena — полный проход по `policy_player.py` + всем его зависимостям.*
