@@ -182,6 +182,15 @@ class StepCounterCallback:
         msg += (f"; шагов без выбора {mix['single']} ({mix.get('_single_share', 0.0) * 100:.1f}%), "
                 f"своих решений (был выбор) {mix.get('_decided', 0)} "
                 f"({mix.get('_choice_share', 0.0) * 100:.1f}%)")
+        try:
+            from .optim import SplitAdam as _SA
+        except ImportError:  # pragma: no cover
+            from optim import SplitAdam as _SA
+        _opt = getattr(getattr(self.ppo_ref, "policy", None), "optimizer", None)
+        if isinstance(_opt, _SA):
+            _lr = _opt.lr_by_group()
+            msg += (f" | lr: " + "/".join(f"{k} {v:.2e}" for k, v in _lr.items())
+                    + f" (adapt {_opt.adapt}, scale {_opt.adapt_scale:.3f})")
         cur = self._curiosity
         if cur["n"]:
             r_mean = cur["r_int_sum"] / cur["n"]
@@ -199,6 +208,31 @@ class StepCounterCallback:
                 logger.record("mix/tera_share", float(mix.get("_tera_share", 0.0)))
                 logger.record("mix/single_share", float(mix.get("_single_share", 0.0)))
                 logger.record("mix/choice_share", float(mix.get("_choice_share", 0.0)))
+                # LR по группам (policy/value/shared), адаптивный множитель и метрика для plateau:
+                # сам SB3 пишет train/learning_rate (одно число), а раздельные значения иначе не видны
+                try:
+                    from .optim import SplitAdam
+                except ImportError:  # pragma: no cover
+                    from optim import SplitAdam
+                opt = getattr(getattr(self.ppo_ref, "policy", None), "optimizer", None)
+                if isinstance(opt, SplitAdam):
+                    for gname, glr in opt.lr_by_group().items():
+                        logger.record(f"train/lr_{gname}", float(glr))
+                    logger.record("train/lr_adapt_scale", float(opt.adapt_scale))
+                    if opt.adapt == "plateau":
+                        # метрика прошлого роллаута (SB3 записывает policy_loss в конце learn)
+                        try:
+                            nv = getattr(logger, "name_to_value", {}) or {}
+                            metric = nv.get("train/policy_loss")
+                        except Exception:
+                            metric = None
+                        if metric is not None:
+                            before = float(opt.adapt_scale)
+                            opt.observe_metric(float(metric), higher_is_better=False)
+                            if float(opt.adapt_scale) != before:
+                                print(f"[lr] plateau: policy_loss={float(metric):.4f} не улучшается — "
+                                      f"множитель lr {before:.3f} -> {float(opt.adapt_scale):.3f} "
+                                      f"({ {k: f'{v:.2e}' for k, v in opt.lr_by_group().items()} })")
                 cur = self._curiosity
                 if cur["n"]:
                     logger.record("mix/r_int_mean", float(cur["r_int_sum"] / cur["n"]))
@@ -209,7 +243,19 @@ class StepCounterCallback:
             pass
 
 
-def make_lr_schedule(initial_lr: float, total_timesteps: int, steps_holder: dict):
+def make_lr_schedule(initial_lr: float, total_timesteps: int, steps_holder: dict,
+                     schedule: str = "linear", final_ratio: float = 0.0,
+                     warmup_frac: float = 0.0):
+    """Расписание lr (функция от SB3-овского progress_remaining). Дефолт прежний: linear -> 0."""
+    try:
+        from .optim import make_lr_schedule as _mk
+    except ImportError:  # запуск модуля вне пакета
+        from optim import make_lr_schedule as _mk
+    return _mk(initial_lr, total_timesteps, steps_holder, schedule=schedule,
+               final_ratio=final_ratio, warmup_frac=warmup_frac)
+
+
+def _legacy_make_lr_schedule(initial_lr: float, total_timesteps: int, steps_holder: dict):
     if total_timesteps is None or total_timesteps <= 0:
         return lambda progress_remaining: initial_lr
     def lr_schedule(progress_remaining: float) -> float:
@@ -1688,6 +1734,18 @@ def pretrain_policy_bc(
     normalize: bool = False, value_coef: float = 0.0, val_frac: float = 0.1,
     patience: int = 5,
     contrastive: bool = False, neg_weight: float = 0.3,
+    # --- Adam для BC (правило: BC живёт на своём оптимизаторе) ---
+    lr: float | None = 1e-3, lr_final: float | None = 1e-4, lr_schedule: str = "cosine",
+    eps: float | None = 1e-8, lr_value: float | None = None, weight_decay: float = 0.0,
+    betas: tuple = (0.9, 0.999), adapt: str = "off", adapt_factor: float = 0.5,
+    adapt_patience: int = 2, adapt_min: float = 0.1,
+    reset_at_start: bool = True,
+    # --- и сразу настройки оптимизатора для последующего RL (правило перехода BC -> PPO) ---
+    reset_optimizer: bool = True, rl_lr: float | None = None, rl_lr_value: float | None = None,
+    rl_lr_shared: float | None = None,
+    rl_eps: float | None = 1e-5, rl_eps_value: float | None = None, rl_eps_shared: float | None = None,
+    rl_adapt: str = "off", rl_adapt_factor: float = 0.5, rl_adapt_patience: int = 2,
+    rl_adapt_min: float = 0.1, verbose: bool = True,
 ):
     # dataset может быть list, _DatasetView (mmap) или путь к .npz
     if isinstance(dataset, str) and os.path.exists(dataset):
@@ -1794,6 +1852,29 @@ def pretrain_policy_bc(
     epochs_without_improvement = 0
     best_state = None
 
+    # --- оптимизатор BC -------------------------------------------------------------------
+    # Рекомендации для BC -> PPO: BC обучается своим Adam(lr=1e-3, eps=1e-8) со спадом lr до
+    # 1e-4 (cosine/linear) к концу датасета, а PPO потом начинает с НОВОГО Adam(lr=1e-4/3e-4,
+    # eps=1e-5) — моменты BC не переносятся. Здесь создаём BC-оптимизатор (по умолчанию заново,
+    # чтобы resume не тянул чужие моменты), ниже ведём по нему расписание, а в конце — сброс.
+    try:
+        from .optim import bc_lr_at, build_policy_optimizer, reset_policy_optimizer
+    except ImportError:  # запуск модуля вне пакета
+        from optim import bc_lr_at, build_policy_optimizer, reset_policy_optimizer
+    bc_lr = float(lr) if lr else float(getattr(ppo, "learning_rate", 1e-4) or 1e-4)
+    bc_lr_final = float(lr_final) if lr_final is not None else bc_lr
+    bc_eps = float(eps) if eps else None
+    opt = getattr(ppo.policy, "optimizer", None)
+    if reset_at_start or opt is None:
+        opt = build_policy_optimizer(
+            ppo.policy, lr=bc_lr, lr_value=lr_value, eps=bc_eps, weight_decay=weight_decay,
+            betas=tuple(betas), adapt=adapt, adapt_factor=adapt_factor,
+            adapt_patience=adapt_patience, adapt_min=adapt_min)
+        if verbose:
+            print(f"BC: оптимизатор создан заново (lr={bc_lr:.2e} -> {bc_lr_final:.2e} "
+                  f"{lr_schedule}, eps={bc_eps if bc_eps else 'как есть'})")
+    n_batches_total = max(1, int(np.ceil(len(train_idx) / batch_size)))
+
     for epoch in range(epochs):
         train_perm = np.random.permutation(train_idx)
         total_policy_loss, total_value_loss, n_batches = 0.0, 0.0, 0
@@ -1827,6 +1908,14 @@ def pretrain_policy_bc(
             value_loss = torch.nn.functional.mse_loss(values, return_batch)
             loss = policy_loss + value_coef * value_loss
 
+            # спад lr внутри эпохи: прогресс = (эпоха + доля батчей) / эпох
+            batch_idx = start // batch_size
+            progress = (epoch + batch_idx / n_batches_total) / max(epochs, 1)
+            cur_lr = bc_lr_at(min(progress, 1.0), bc_lr, bc_lr_final, lr_schedule)
+            try:
+                opt.set_lrs(policy_lr=cur_lr, progress_done=min(progress, 1.0))
+            except Exception:
+                pass
             ppo.policy.optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(ppo.policy.parameters(), 0.5)
@@ -1863,10 +1952,15 @@ def pretrain_policy_bc(
             val_value_loss = torch.nn.functional.mse_loss(values, return_batch).item()
             val_loss = val_policy_loss + value_coef * val_value_loss
 
+        try:
+            lr_now = opt.lr_by_group()
+            lr_msg = " lr=" + "/".join(f"{k}:{v:.2e}" for k, v in lr_now.items())
+        except Exception:
+            lr_msg = f" lr={cur_lr:.2e}"
         print(
             f"[BC epoch {epoch}] train_policy={total_policy_loss/n_batches:.4f} "
             f"train_value={total_value_loss/n_batches:.4f} "
-            f"val_policy={val_policy_loss:.4f} val_value={val_value_loss:.4f}"
+            f"val_policy={val_policy_loss:.4f} val_value={val_value_loss:.4f}" + lr_msg
         )
 
         if val_loss < best_val_loss - 1e-4:
@@ -1878,6 +1972,29 @@ def pretrain_policy_bc(
             if epochs_without_improvement >= patience:
                 print(f"Ранняя остановка на эпохе {epoch} (val loss не улучшается {patience} эпох)")
                 break
+
+    # сброс оптимизатора для RL: правило «BC -> PPO начинает с нового Adam»
+    if reset_optimizer:
+        rl_base = float(rl_lr) if rl_lr else None
+        if rl_base is None:
+            # без явного RL-lr берём то, что просил PPO: может быть числом ИЛИ расписанием
+            cand = getattr(ppo, "learning_rate", 1e-4)
+            try:
+                rl_base = float(cand if not callable(cand) else cand(1.0))
+            except Exception:
+                rl_base = 1e-4
+        # настройки RL-групп: тот же контракт, что у CLI (lr_value/lr_shared — абсолютные lr,
+        # ratio достраивается от базы policy). Адаптацию lr тоже переносим — она задаётся для RL.
+        reset_policy_optimizer(
+            ppo.policy, lr=rl_base, reason="BC -> PPO: моменты BC не переносятся",
+            verbose=verbose, lr_value=rl_lr_value, lr_shared=rl_lr_shared,
+            eps=rl_eps if rl_eps else None, eps_value=rl_eps_value, eps_shared=rl_eps_shared,
+            adapt=rl_adapt, adapt_factor=rl_adapt_factor, adapt_patience=rl_adapt_patience,
+            adapt_min=rl_adapt_min, weight_decay=weight_decay, betas=tuple(betas))
+        try:
+            ppo.learning_rate = rl_base
+        except Exception:
+            pass
 
     if best_state is not None:
         ppo.policy.load_state_dict(best_state)

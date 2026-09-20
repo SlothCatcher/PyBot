@@ -5,6 +5,11 @@ from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
 from .config import N_FEATURES
 
+try:
+    from .optim import SplitAdam
+except ImportError:  # запуск модуля вне пакета
+    from optim import SplitAdam
+
 # N_FEATURES вырос 594 -> 629 -> 641 -> 653 -> 713 -> 715 -> 802 (+87 урона) -> 870 (+68 зеркало и флаги)
 # -> 991 (+121 типы соперника x наша команда, см. features.TYPE_MATCHUP_BLOCK_SIZE).
 # При 991 признаке первый слой (991->512) = 507k параметров, это ~40% сети; блок урона
@@ -57,6 +62,15 @@ class LegacyFeaturesExtractor(BaseFeaturesExtractor):
 
 
 class MaskedActorCriticPolicy(ActorCriticPolicy):
+    """Политика с маскированием действий и раздельным Adam для policy/value/shared.
+
+    SB3 строит оптимизатор как `optimizer_class(self.parameters())`, без имён, поэтому первый
+    (плоский) SplitAdam сразу пересобирается по `named_parameters()` — только так pi-голова,
+    vf-голова и экстрактор попадают в свои группы со своими lr/eps (см. agents/optim.py).
+    Настройки оптимизатора едут в чекпоинте внутри `policy_kwargs`, поэтому загруженная модель
+    восстанавливает ту же схему групп.
+    """
+
     def __init__(self, *args, **kwargs):
         self._mask = None
         self._mask_shape_warned = False
@@ -68,7 +82,37 @@ class MaskedActorCriticPolicy(ActorCriticPolicy):
             kwargs["features_extractor_class"] = FeaturesExtractor
         if "ortho_init" not in kwargs:
             kwargs["ortho_init"] = True
+        if "optimizer_class" not in kwargs:
+            kwargs["optimizer_class"] = SplitAdam
         super().__init__(*args, **kwargs)
+        self._install_split_optimizer()
+
+    def _install_split_optimizer(self) -> None:
+        """Пересобрать оптимизатор по именам параметров (группы pi / vf / shared).
+
+        Моменты на этом шаге пустые (политика только что создана), так что пересборка бесплатна.
+        Если пользователь передал чужой optimizer_class — не трогаем вовсе.
+        """
+        opt = getattr(self, "optimizer", None)
+        if not isinstance(opt, SplitAdam):
+            return
+        try:
+            from .optim import optimizer_settings
+        except ImportError:  # pragma: no cover
+            from optim import optimizer_settings
+        # базовый lr: берём из расписания SB3 (а не из первого param_group — в плоском
+        # оптимизаторе туда попадает единственная группа, и её lr не равен lr policy)
+        try:
+            base_lr = float(self.lr_schedule(1.0))
+        except Exception:
+            base_lr = float(opt.param_groups[0]["lr"]) if opt.param_groups else 2e-4
+        kwargs = optimizer_settings(getattr(self, "optimizer_kwargs", None))
+        kwargs.pop("lr", None)          # базовый lr уже посчитан выше
+        try:
+            self.optimizer = SplitAdam(list(self.named_parameters()), lr=base_lr, **kwargs)
+        except Exception as e:  # noqa: BLE001 — не роняем обучение из-за настроек оптимизатора
+            print(f"WARNING: не удалось собрать SplitAdam по именам параметров ({e}); "
+                  f"остаётся один оптимизатор на всю сеть")
 
     def forward(self, obs, deterministic=False):
         self._mask = obs["action_mask"]

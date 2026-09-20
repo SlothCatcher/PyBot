@@ -5,6 +5,14 @@ from functools import partial
 
 from poke_env.player import MaxBasePowerPlayer, RandomPlayer, SimpleHeuristicsPlayer
 from stable_baselines3 import PPO
+
+from agents.optim import (  # раздельные Adam-группы policy/value/shared
+    SplitAdam,
+    SplitLRPPO,
+    ensure_split_ppo,
+    lr_state,
+    reset_policy_optimizer,
+)
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
 from agents.training import collect_or_load_dataset
 import numpy as np
@@ -826,6 +834,32 @@ def run(
     value_warmup_steps: int = 0,
     min_winrate: int = 25,
     reset_schedules: bool = False,
+    # --- Adam: раздельные lr/eps для policy и value (см. agents/optim.py) ---
+    lr_policy: float | None = None,
+    lr_value: float | None = None,
+    lr_shared: float | None = None,
+    eps_policy: float | None = None,
+    eps_value: float | None = None,
+    eps_shared: float | None = None,
+    beta1: float = 0.9,
+    beta2: float = 0.999,
+    weight_decay: float = 0.0,
+    lr_schedule: str = "linear",
+    lr_final_ratio: float = 0.0,
+    lr_warmup_frac: float = 0.0,
+    lr_adapt: str = "off",
+    lr_adapt_factor: float = 0.5,
+    lr_adapt_patience: int = 2,
+    lr_adapt_min: float = 0.1,
+    reset_optimizer: bool | None = None,
+    # --- Adam для BC (правило: свой оптимизатор, спад 1e-3 -> 1e-4) ---
+    bc_lr: float | None = 1e-3,
+    bc_lr_final: float | None = 1e-4,
+    bc_lr_schedule: str = "cosine",
+    bc_eps: float | None = 1e-8,
+    bc_lr_value: float | None = None,
+    bc_adapt: str = "off",
+    bc_reset_optimizer: bool = True,
     eval_battles: int = 20,
     skip_eval: bool = False,
     # --- ICM Variant B ---
@@ -914,6 +948,16 @@ def run(
                                                   n_envs=int(num_envs))
                 else:
                     raise
+        # `PPO.load` возвращает базовый PPO: без этого шага `_update_learning_rate` берётся
+        # из SB3 и перезаписывает lr всем группам одним числом — раздельные lr теряются.
+        _opt_before = type(getattr(getattr(ppo, "policy", None), "optimizer", None)).__name__
+        ppo = ensure_split_ppo(ppo)
+        _opt_after = type(getattr(getattr(ppo, "policy", None), "optimizer", None)).__name__
+        if _opt_before != _opt_after:
+            print(f"Оптимизатор загруженного чекпоинта: {_opt_before} -> {_opt_after} "
+                  f"(раздельные lr policy/value/shared)")
+        elif _opt_after == "SplitAdam":
+            print("Оптимизатор загруженного чекпоинта: SplitAdam (раздельные lr сохраняются)")
         # стартовое состояние признаков урона: после миграции новые веса ровно нулевые,
         # полезно видеть это до обучения, а не только в конце первой фазы
         try:
@@ -1009,11 +1053,21 @@ def run(
                     print(f"Не удалось включить ICM: {e}")
                     import traceback; traceback.print_exc()
                     icm_wrapper = None
-        ppo = PPO(
+        # Настройки SplitAdam уезжают в чекпоинт внутри policy_kwargs, поэтому загруженная
+        # модель восстанавливает ту же схему групп (pi/vf/shared) с теми же eps/betas.
+        opt_kwargs = {
+            "lr_policy": lr_policy, "lr_value": lr_value, "lr_shared": lr_shared,
+            "eps_policy": eps_policy, "eps_value": eps_value, "eps_shared": eps_shared,
+            "betas": (float(beta1), float(beta2)), "weight_decay": float(weight_decay),
+            "adapt": lr_adapt, "adapt_factor": float(lr_adapt_factor),
+            "adapt_patience": int(lr_adapt_patience), "adapt_min": float(lr_adapt_min),
+        }
+        opt_kwargs = {k: v for k, v in opt_kwargs.items() if v is not None}
+        ppo = SplitLRPPO(
             MaskedActorCriticPolicy,
             env,
             ent_coef=ent_coef if ent_coef is not None else 0.01,
-            learning_rate=learning_rate,
+            learning_rate=float(lr_policy) if lr_policy else learning_rate,
             n_steps=3072 // num_envs,
             batch_size=batch_size,
             n_epochs=n_epochs,
@@ -1028,8 +1082,14 @@ def run(
             policy_kwargs=dict(
                 features_extractor_kwargs=dict(features_dim=int(features_dim)),
                 net_arch=dict(pi=list(PI_LAYERS), vf=list(VF_LAYERS)),
+                optimizer_class=SplitAdam,
+                optimizer_kwargs=opt_kwargs,
             ),
         )
+        try:
+            print(f"Оптимизатор (Adam по группам): {ppo.policy.optimizer.describe()}")
+        except Exception:
+            pass
         # BC: либо собираем с нуля (pretrain_battles>0), либо грузим готовый только если пользователь ЯВНО указал --dataset-path
         # dataset_path по умолчанию None — чтобы наличие models/heuristic_dataset.npz от прошлого прогона не включало BC неожиданно
         need_bc = False
@@ -1052,26 +1112,86 @@ def run(
                 print(f"Не удалось загрузить {dataset_path}: {e}")
         if need_bc and dataset is not None:
             print(f"Претрейн через behavioral cloning (epochs={epochs}, contrastive={contrastive}, neg_weight={neg_weight}, bc_value_coef={bc_value_coef})...")
-            pretrain_policy_bc(ppo, dataset, epochs=epochs, normalize=not no_normalize_bc, contrastive=contrastive, neg_weight=neg_weight, value_coef=bc_value_coef)
+            pretrain_policy_bc(
+                ppo, dataset, epochs=epochs, normalize=not no_normalize_bc,
+                contrastive=contrastive, neg_weight=neg_weight, value_coef=bc_value_coef,
+                lr=bc_lr, lr_final=bc_lr_final, lr_schedule=bc_lr_schedule, eps=bc_eps,
+                lr_value=bc_lr_value, adapt=bc_adapt, adapt_factor=lr_adapt_factor,
+                adapt_patience=lr_adapt_patience, adapt_min=lr_adapt_min,
+                reset_at_start=bool(bc_reset_optimizer),
+                reset_optimizer=True,          # правило BC -> PPO: свежий Adam для RL
+                rl_lr=float(lr_policy) if lr_policy else learning_rate,
+                rl_lr_value=lr_value, rl_lr_shared=lr_shared,
+                rl_eps=eps_policy or 1e-5, rl_eps_value=eps_value, rl_eps_shared=eps_shared,
+                rl_adapt=lr_adapt, rl_adapt_factor=lr_adapt_factor,
+                rl_adapt_patience=lr_adapt_patience, rl_adapt_min=lr_adapt_min,
+                weight_decay=weight_decay, betas=(float(beta1), float(beta2)),
+            )
 
     # FIX: SB3 хранит расписание в ppo.lr_schedule (FloatSchedule), а не в learning_rate.
     # Раньше делали ppo.lr_schedule = schedule без обёртки или ppo.learning_rate = schedule —
     # в обоих случаях _update_learning_rate читал старое значение.
     # При total_timesteps==0 (только BC) расписания нет — оставляем константу, деления на 0 быть не должно.
     from stable_baselines3.common.utils import FloatSchedule
-    lr_schedule_fn = make_lr_schedule(learning_rate, total_timesteps, steps_done_holder)
+    # применить CLI-настройки lr/eps к живому оптимизатору (моменты Adam сохраняются):
+    # чекпоинт везёт свои lr/eps, а явные флаги должны побеждать. ratio value/shared, заданные
+    # в чекпоинте, сохраняются, если в CLI не указаны новые абсолютные значения.
+    if resume_from and isinstance(getattr(ppo.policy, "optimizer", None), SplitAdam):
+        try:
+            applied = ppo.policy.optimizer.apply_settings(
+                lr_policy=float(lr_policy) if lr_policy else float(learning_rate),
+                lr_value=lr_value, lr_shared=lr_shared,
+                eps_policy=eps_policy, eps_value=eps_value, eps_shared=eps_shared,
+                adapt=lr_adapt, adapt_factor=lr_adapt_factor,
+                adapt_patience=lr_adapt_patience, adapt_min=lr_adapt_min,
+                betas=(float(beta1), float(beta2)), weight_decay=weight_decay)
+            print(f"resume: настройки lr применены к оптимизатору чекпоинта, моменты Adam сохранены "
+                  f"-> {applied}")
+        except Exception as e:
+            print(f"resume: не удалось применить настройки lr к оптимизатору: {e}")
+
+    # база расписания = lr policy-группы: --lr-policy важнее --learning-rate
+    sched_lr = float(lr_policy) if lr_policy else float(learning_rate)
+    if lr_policy:
+        print(f"--lr-policy={lr_policy:.2e} задаёт базу расписания (--learning-rate={learning_rate:.2e} "
+              f"используется только как база для пропорций value/shared)")
+    lr_schedule_fn = make_lr_schedule(
+        sched_lr, total_timesteps, steps_done_holder,
+        schedule=lr_schedule, final_ratio=lr_final_ratio, warmup_frac=lr_warmup_frac)
     ppo.lr_schedule = FloatSchedule(lr_schedule_fn)
     ppo.learning_rate = lr_schedule_fn  # для совместимости/логов
     if total_timesteps and total_timesteps > 0:
         try:
-            print(f"LR schedule установлен: {lr_schedule_fn(1.0):.2e} -> {lr_schedule_fn(0.0):.2e} за {total_timesteps} шагов (initial {learning_rate:.2e})")
+            print(f"LR schedule установлен: {lr_schedule_fn(1.0):.2e} -> {lr_schedule_fn(0.0):.2e} "
+                  f"за {total_timesteps} шагов (policy base {sched_lr:.2e}, форма {lr_schedule}, "
+                  f"final_ratio {lr_final_ratio}, warmup {lr_warmup_frac})")
         except ZeroDivisionError:
             print(f"LR schedule установлен: {learning_rate:.2e} (константа, total_timesteps={total_timesteps})")
     else:
-        print(f"RL пропущен (total_timesteps={total_timesteps}), LR зафиксирован: {learning_rate:.2e}")
+        print(f"RL пропущен (total_timesteps={total_timesteps}), LR зафиксирован: policy {sched_lr:.2e}")
     # если resume — сразу применим текущий LR к оптимизатору
     try:
         ppo._update_learning_rate(ppo.policy.optimizer)
+    except Exception:
+        pass
+
+    # --reset-optimizer: явный сброс моментов Adam (для resume он по умолчанию сохраняется)
+    if reset_optimizer is True:
+        reset_policy_optimizer(ppo.policy, lr=float(lr_policy) if lr_policy else learning_rate,
+                               reason="--reset-optimizer", lr_value=lr_value,
+                               eps=eps_policy or 1e-5, weight_decay=weight_decay,
+                               betas=(float(beta1), float(beta2)))
+        try:
+            ppo._update_learning_rate(ppo.policy.optimizer)
+        except Exception:
+            pass
+    elif reset_optimizer is None:
+        note = "моменты Adam сохранены" if resume_from else "новый прогон, моментов ещё нет"
+        print(f"Оптимизатор: {note} (--reset-optimizer чтобы начать с чистого Adam)")
+    try:
+        st = lr_state(ppo)
+        print(f"LR по группам: {st.get('lr')} (adapt={st.get('adapt')}, "
+              f"scale={st.get('adapt_scale')}, eps={st.get('eps')})")
     except Exception:
         pass
 
@@ -1363,6 +1483,31 @@ def run(
                  skip_raw=skip_final_raw_eval, normalize=not no_normalize_bc)
 
 
+def resolve_lr_args(learning_rate: float | None, bc_lr: float | None,
+                    bc_lr_final: float | None) -> tuple[tuple[float, float, float], str]:
+    """Разрешает lr для PPO и BC с учётом совместимости со старыми командами.
+
+    Правила:
+      * PPO lr: `--learning-rate`/`--lr`, по умолчанию 2e-4;
+      * BC lr: `--bc-lr`, по умолчанию 1e-3 (рекомендация), НО если `--bc-lr` не задан,
+        а `--learning-rate`/`--lr` задан явно — берём его (старые команды задавали lr именно
+        для BC, напр. `--total-timesteps 0 --lr 3e-4`);
+      * конечный lr BC: `--bc-lr-final`, по умолчанию 1e-4; если BC lr ниже 1e-4 — 0.1*BC lr.
+    """
+    lr_given = learning_rate is not None
+    lr = float(learning_rate) if lr_given else 2e-4
+    note = ""
+    if bc_lr is None:
+        bc_lr = lr if lr_given else 1e-3
+        if lr_given:
+            note = (f"BC lr не задан (--bc-lr): беру --learning-rate={bc_lr:.2e} (как в старых командах); "
+                    f"рекомендация для BC — 1e-3 со спадом до 1e-4")
+    bc_lr = float(bc_lr)
+    if bc_lr_final is None:
+        bc_lr_final = 1e-4 if bc_lr >= 1e-4 else bc_lr * 0.1
+    return (lr, bc_lr, float(bc_lr_final)), note
+
+
 def build_parser() -> "argparse.ArgumentParser":
     """CLI-парсер (вынесен из __main__, чтобы флаги можно было проверять тестами)."""
 
@@ -1380,8 +1525,55 @@ def build_parser() -> "argparse.ArgumentParser":
                     help="оставить статистику нормализации даже при несовместимой размерности "
                          "(прежнее поведение: добить нулями)")
     parser.add_argument("--ent-coef", type=float, default=None)
-    parser.add_argument("--learning-rate", type=float, default=2e-4, dest="learning_rate", help="Начальный learning_rate (линейно аннилится до 0). По умолчанию 2e-4, для дообучения после BC рекомендуется 5e-5..1e-4")
+    parser.add_argument("--learning-rate", type=float, default=None, dest="learning_rate",
+                        help="Начальный lr PPO-policy (по умолчанию 2e-4; для дообучения после BC "
+                             "рекомендуется 1e-4..3e-4). Если --bc-lr не задан явно, этот lr "
+                             "используется и для BC (совместимость со старыми командами)")
     parser.add_argument("--lr", type=float, default=None, dest="lr_alias", help="Алиас для --learning-rate")
+    parser.add_argument("--lr-policy", type=float, default=None,
+                        help="lr ТОЛЬКО для policy-головы (mlp_extractor.policy_net/action_net/log_std). "
+                             "По умолчанию = --learning-rate")
+    parser.add_argument("--lr-value", type=float, default=None,
+                        help="lr ТОЛЬКО для value-головы (mlp_extractor.value_net/value_net)")
+    parser.add_argument("--lr-shared", type=float, default=None,
+                        help="lr для экстрактора признаков (общая часть сети)")
+    parser.add_argument("--eps-policy", type=float, default=None, help="Adam eps для policy (по умолчанию 1e-5)")
+    parser.add_argument("--eps-value", type=float, default=None, help="Adam eps для value")
+    parser.add_argument("--eps-shared", type=float, default=None, help="Adam eps для экстрактора")
+    parser.add_argument("--beta1", type=float, default=0.9, help="Adam beta1 (0.9)")
+    parser.add_argument("--beta2", type=float, default=0.999, help="Adam beta2 (0.999)")
+    parser.add_argument("--weight-decay", type=float, default=0.0, help="Adam weight_decay (0 по умолчанию)")
+    parser.add_argument("--lr-schedule", type=str, default="linear",
+                        choices=["constant", "linear", "cosine"],
+                        help="форма спада lr за прогон: linear (как раньше, до нуля), cosine, constant")
+    parser.add_argument("--lr-final-ratio", type=float, default=0.0,
+                        help="во сколько раз lr падает к концу (0.1 = до 10%% от начального; для constant игнорируется)")
+    parser.add_argument("--lr-warmup-frac", type=float, default=0.0,
+                        help="доля прогона на линейный прогрев lr от 0 (0 = без прогрева)")
+    parser.add_argument("--lr-adapt", type=str, default="off", choices=["off", "plateau", "gnorm"],
+                        help="адаптивное управление lr: gnorm — самокалибровка по норме градиента, "
+                             "plateau — снижение при остановке train/policy_loss")
+    parser.add_argument("--lr-adapt-factor", type=float, default=0.5, help="во сколько раз резать lr на плато")
+    parser.add_argument("--lr-adapt-patience", type=int, default=2, help="сколько неудачных замеров терпеть")
+    parser.add_argument("--lr-adapt-min", type=float, default=0.1, help="нижняя граница адаптивного множителя")
+    parser.add_argument("--reset-optimizer", action="store_true", default=None,
+                        help="на resume НЕ тянуть моменты Adam из чекпоинта (начать с чистого оптимизатора)")
+    parser.add_argument("--keep-optimizer", action="store_false", dest="reset_optimizer",
+                        help="явно сохранить моменты Adam при resume (поведение по умолчанию)")
+    parser.add_argument("--bc-lr", type=float, default=None,
+                        help="lr оптимизатора BC (по рекомендации 1e-3, спад до --bc-lr-final). "
+                             "Не задан — берём 1e-3, а если задан --lr/--learning-rate, то его")
+    parser.add_argument("--bc-lr-final", type=float, default=None,
+                        help="конечный lr BC (по умолчанию 1e-4; если --bc-lr меньше 1e-4, берём 0.1*--bc-lr)")
+    parser.add_argument("--bc-lr-schedule", type=str, default="cosine", choices=["constant", "linear", "cosine"],
+                        help="форма спада lr внутри BC (cosine по умолчанию)")
+    parser.add_argument("--bc-eps", type=float, default=1e-8, help="Adam eps на этапе BC (1e-8)")
+    parser.add_argument("--bc-lr-value", type=float, default=None,
+                        help="отдельный (абсолютный) lr value-головы на BC; по умолчанию как --bc-lr")
+    parser.add_argument("--bc-adapt", type=str, default="off", choices=["off", "plateau", "gnorm"],
+                        help="адаптация lr на BC (обычно не нужна: есть спад --bc-lr-schedule)")
+    parser.add_argument("--bc-keep-optimizer", action="store_false", dest="bc_reset_optimizer",
+                        default=True, help="не пересоздавать оптимизатор в начале BC (продолжить с чужими моментами)")
     parser.add_argument("--pretrain-battles", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--dataset-path", type=str, default=None, help="Путь к готовому датасету для BC; если указан и файл существует — BC включится даже без --pretrain-battles. По умолчанию None, чтобы старый models/heuristic_dataset.npz не включал BC неявно")
@@ -1429,6 +1621,11 @@ if __name__ == "__main__":
     # поддержка алиаса --lr
     if args.lr_alias is not None:
         args.learning_rate = args.lr_alias
+    # совместимость: явный --lr/--learning-rate при молчащем --bc-lr задаёт и BC lr
+    (args.learning_rate, args.bc_lr, args.bc_lr_final), note = resolve_lr_args(
+        args.learning_rate, args.bc_lr, args.bc_lr_final)
+    if note and (args.dataset_path or args.pretrain_battles):
+        print(note)
 
     run(
         resume_from=args.resume,
@@ -1453,6 +1650,16 @@ if __name__ == "__main__":
         value_warmup_steps=args.value_warmup_steps,
         min_winrate=args.min_winrate,
         reset_schedules=args.reset_schedules,
+        lr_policy=args.lr_policy, lr_value=args.lr_value, lr_shared=args.lr_shared,
+        eps_policy=args.eps_policy, eps_value=args.eps_value, eps_shared=args.eps_shared,
+        beta1=args.beta1, beta2=args.beta2, weight_decay=args.weight_decay,
+        lr_schedule=args.lr_schedule, lr_final_ratio=args.lr_final_ratio,
+        lr_warmup_frac=args.lr_warmup_frac, lr_adapt=args.lr_adapt,
+        lr_adapt_factor=args.lr_adapt_factor, lr_adapt_patience=args.lr_adapt_patience,
+        lr_adapt_min=args.lr_adapt_min, reset_optimizer=args.reset_optimizer,
+        bc_lr=args.bc_lr, bc_lr_final=args.bc_lr_final, bc_lr_schedule=args.bc_lr_schedule,
+        bc_eps=args.bc_eps, bc_lr_value=args.bc_lr_value, bc_adapt=args.bc_adapt,
+        bc_reset_optimizer=args.bc_reset_optimizer,
         eval_battles=args.eval_battles,
         skip_eval=args.skip_eval,
         features_dim=args.features_dim,

@@ -1977,6 +1977,101 @@ fuseTypes(types1, types2) = [types1[0], types2[1] ? types2[1] : types2[0]]   # �
 * `test_fusion_types.py` 71 PASS, `test_mirror_features_live.py` PASS, `test_dim_migration.py`
   75 PASS, батарея из 17 файлов — PASS.
 
+## 29. Adam для learning rate: раздельные lr/eps policy/value/shared, BC-расписание, свежий оптимизатор на BC -> PPO
+
+Новый модуль `agents/optim.py` + изменения в `agents/policy.py`, `agents/training.py`,
+`agents/policy_player.py`. Тест — `test_optim_split.py` (122 проверки, части A..H).
+
+### 29.1 Что требовалось
+
+1. BC: `Adam(lr=1e-3, eps=1e-8)`, плавный спад lr до `1e-4` к концу датасета (cosine/linear).
+2. Точка BC -> PPO: **новый объект** оптимизатора, моменты градиентов из BC не переносятся.
+3. PPO: `Adam(lr=1e-4..3e-4, eps=1e-5)`, при этом lr/eps задаются **раздельно** для policy, value и
+   экстрактора признаков (shared).
+
+### 29.2 `SplitAdam`
+
+* группы собираются по ИМЕНАМ параметров (`classify_param_name`): `pi.*`/`log_std`/`action_net` ->
+  `policy`, `value_net`/`vf.*` -> `value`, остальное (mlp_extractor/features_extractor) -> `shared`;
+* `base_lr`/`base_eps` на группу + `lr_base`/`eps_base` в самом `param_group` (уезжают в чекпоинт)
+  и `_lr_ratio` = отношение группы к policy. `set_lrs(policy_lr)` — единственная точка входа: lr
+  групп = `policy_lr * ratio * adapt_scale`;
+* `lr_value`/`lr_shared`/`eps_*` — АБСОЛЮТНЫЕ значения флагов CLI; если флаг не задан, берётся
+  `lr`/`eps` (то есть группы не разъезжаются «сами»).
+
+**Грабли (найдены тестом E).** SB3 строит оптимизатор как
+`optimizer_class(self.parameters(), lr=lr_schedule(1.0), **optimizer_kwargs)` — без имён, поэтому
+первый объект получается из одной плоской группы. Если считать группы «уже определёнными по
+именам», то `lr_value=0.25` при базе `2e-4` даёт ratio 1250 и мусорный lr. Поэтому:
+
+* `_as_groups()` возвращает признак `classified`: для плоского входа lr/eps групп = общие
+  `lr`/`eps`, а ratio = 1.0;
+* политика после создания оптимизатора пересобирает его по `named_parameters()`
+  (`MaskedActorCriticPolicy._install_split_optimizer`), а базовый lr берёт из `self.lr_schedule(1.0)`,
+  а НЕ из `param_groups[0]["lr"]` (после `set_lrs` там уже ratio-масштабированное значение).
+
+### 29.3 Адаптивное управление lr и расписания
+
+* расписания: `constant` / `linear` / `cosine` с `final_ratio` и `warmup_frac`
+  (`schedule_factor`), прогресс берётся из `steps_holder["value"]` (глобальный счётчик шагов, чтобы
+  расписание не сбивалось на нескольких фазах `learn()`);
+* `adapt=gnorm`: `scale = clip(sqrt(target/ema_gnorm), min, max)`, target — EMA нормы градиента
+  после прогрева (`tick_after_step` из `optimizer.step`);
+* `adapt=plateau`: множитель `adapt_factor` (0.5) после `adapt_patience` (2) нелучших замеров
+  `train/policy_loss` (из `logger.name_to_value`), пол `adapt_min` (0.1);
+* множитель применяется к ВСЕМ группам одинаково (сохраняет ratio), в TB пишется
+  `train/lr_policy|value|shared` и `train/lr_adapt_scale`.
+
+### 29.4 BC-этап и переход BC -> PPO
+
+* `pretrain_policy_bc(...)`: свежий оптимизатор в начале BC (`reset_at_start`), свой lr/eps
+  (`--bc-lr 1e-3`, `--bc-eps 1e-8`, `--bc-lr-value` — отдельный lr value), спад lr ВНУТРИ эпохи по
+  числу пройденных батчей (`lr = lr_final + (lr - lr_final) * factor`), лог `lr=policy/value/shared`
+  в каждой эпохе;
+* в конце BC оптимизатор создаётся заново (`reset_policy_optimizer`) с RL-настройками
+  (`--lr-policy`/`--lr-value`/`--lr-shared`/`--eps-*`/`--lr-adapt`) — моменты BC не переносятся,
+  это и есть «новый объект Adam» из требования. `--bc-keep-optimizer` + `--keep-optimizer`
+  отключают пересборку.
+
+### 29.5 Resume: конфиг CLI должен побеждать чекпоинт
+
+`PPO.load()` возвращает БАЗОВЫЙ `PPO`, а SB3-шный `_update_learning_rate` перезаписывает lr ВСЕМ
+группам одним числом — то есть на `--resume` раздельные lr молча терялись ровно там, где нужны
+(дообучение после BC). Исправлено:
+
+* `ensure_split_ppo(ppo)` возвращает загруженному объекту класс `SplitLRPPO` (смена `__class__`
+  на месте, веса/моменты не трогаются) — живой прогон подтвердил: `_update_learning_rate` больше
+  не падает без логгера (раньше `AttributeError: _logger` съедался `except Exception: pass`,
+  и lr оставался от чекпоинта);
+* `SplitAdam.apply_settings(...)` применяет lr/eps/betas/adapt к ЖИВОМУ оптимизатору, сохраняя
+  моменты Adam; незаданные `lr_value`/`lr_shared` сохраняют прежнее отношение к policy;
+* `adopt_optimizer(policy)`: плоский `torch.optim.Adam` из СТАРОГО чекпоинта превращается в
+  `SplitAdam` с ПЕРЕНОСОМ моментов (state у Adam привязан к тензору параметра, а не к группе) —
+  иначе раздельные lr на старых чекпоинтах не работают вовсе;
+* свой чекпоинт round-trip: 3 группы, раздельные lr/eps и моменты на месте (проверено загрузкой
+  `models/resume_check.zip`); чужой (плоский) — моменты отбрасываются с RuntimeWarning, наши
+  lr/eps применяются, загрузка не падает.
+
+### 29.6 Совместимость со старыми командами
+
+`--learning-rate`/`--lr` теперь `default=None`: если `--bc-lr` не задан, а `--lr` задан явно
+(маршрут `--total-timesteps 0 --lr 3e-4`), то BC берёт этот lr и печатает «BC lr не задан: беру
+--learning-rate=...». Без флагов дефолты остаются: PPO `2e-4`, BC `1e-3 -> 1e-4`, `eps` PPO
+`1e-5`, BC `1e-8` (`resolve_lr_args`, покрыто `test_training_route.py`).
+
+### 29.7 Проверки
+
+* `test_optim_split.py` 122 PASS (A расписания, B группы на реальной политике, C адаптация,
+  D BC+сброс, E `SplitLRPPO._update_learning_rate`, F совместимость чекпоинтов, G value-warmup,
+  H resume-контракт: `ensure_split_ppo`, `apply_settings`, перенос моментов из плоского Adam).
+* `test_training_route.py` 49 PASS (флаги CLI, маршрут шага 1/шага 2, дефолты).
+* Живые прогоны: BC-only (`--lr 3e-4 --total-timesteps 0`): lr батчей 1e-3 -> 1.15e-4, ниже 1e-4 не
+  уходит, eps 1e-8; после BC — сообщение «моменты BC не переносятся», lr/eps = RL-настройки;
+  RL-дообучение с `--resume`: `lr: policy=3e-05, value=1e-05, shared=1e-05`, моменты Adam
+  сохранены, в TB `train/lr_policy|value|shared` и `train/lr_adapt_scale`.
+* Батарея 18 файлов (features_consistency 102, fusion_types 71, dim_migration 75, obs_norm 54,
+  training_route 49, curiosity 40, no_shadowing 55, self_play_migration 15, остальные PASS).
+
 ---
 
 *Автор аудита: Agent Arena — полный проход по `policy_player.py` + всем его зависимостям.*

@@ -341,6 +341,38 @@ def test_cli_wiring():
     check("CLI: --skip-final-raw-eval существует",
           bool(pp.parse_args(["--skip-final-raw-eval"]).skip_final_raw_eval))
 
+    # --- Adam: какие lr получат BC и PPO на маршруте пользователя (--lr без --bc-lr) ---
+    (lr1, bc1, bcf1), note1 = pp.resolve_lr_args(3e-4, None, None)
+    check("маршрут шаг 1: --lr 3e-4 при молчащем --bc-lr задаёт BC (совместимость)",
+          abs(bc1 - 3e-4) < 1e-12 and abs(lr1 - 3e-4) < 1e-12 and bool(note1), f"{bc1}")
+    (lr2, bc2, bcf2), _ = pp.resolve_lr_args(3e-5, None, None)
+    check("маршрут шаг 2: --lr 3e-5 остаётся lr PPO", abs(lr2 - 3e-5) < 1e-12, f"{lr2}")
+    check("маршрут шаг 2: BC-lr ниже 1e-4 — конечный lr 0.1*lr (не растём при спаде)",
+          abs(bcf2 - 3e-6) < 1e-12, f"{bcf2}")
+    (lr3, bc3, bcf3), note3 = pp.resolve_lr_args(None, None, None)
+    check("дефолты без флагов: PPO 2e-4, BC 1e-3 -> 1e-4 (рекомендация)",
+          abs(lr3 - 2e-4) < 1e-12 and abs(bc3 - 1e-3) < 1e-12 and abs(bcf3 - 1e-4) < 1e-12
+          and not note3, f"{lr3}/{bc3}/{bcf3}")
+    (lr4, bc4, bcf4), _ = pp.resolve_lr_args(2e-4, 5e-4, None)
+    check("явный --bc-lr не перетирается --lr",
+          abs(bc4 - 5e-4) < 1e-12 and abs(lr4 - 2e-4) < 1e-12, f"{bc4}")
+
+    # --- Adam: флаги раздельных lr/eps и BC-настроек доезжают до run() ---
+    args3 = pp.parse_args(["--lr-policy", "3e-4", "--lr-value", "1e-4", "--lr-shared", "1e-4",
+                           "--eps-policy", "1e-5", "--bc-lr", "1e-3", "--bc-lr-final", "1e-4",
+                           "--bc-lr-schedule", "cosine", "--bc-eps", "1e-8", "--bc-lr-value", "5e-4",
+                           "--lr-schedule", "cosine", "--lr-adapt", "gnorm", "--reset-optimizer"])
+    check("CLI Adam: раздельные lr/eps и BC-расписание распознаны",
+          abs(args3.lr_policy - 3e-4) < 1e-12 and abs(args3.lr_value - 1e-4) < 1e-12
+          and abs(args3.lr_shared - 1e-4) < 1e-12 and abs(args3.eps_policy - 1e-5) < 1e-12
+          and args3.bc_lr_schedule == "cosine" and abs(args3.bc_eps - 1e-8) < 1e-18
+          and abs(args3.bc_lr_value - 5e-4) < 1e-12 and args3.lr_adapt == "gnorm"
+          and args3.reset_optimizer is True,
+          f"{args3.lr_policy}/{args3.lr_value}/{args3.lr_shared}/{args3.bc_lr_value}")
+    check("CLI Adam: старые команды без новых флагов не ломаются (дефолты = None/2e-4)",
+          pp.parse_args([]).learning_rate is None and pp.parse_args([]).bc_lr is None
+          and abs(float(pp.parse_args(["--learning-rate", "1e-4"]).learning_rate) - 1e-4) < 1e-12)
+
 
 def main() -> int:
     import warnings
