@@ -100,6 +100,7 @@ def _record_qualified(save_path: str, win_rates: dict, base_min: int, phase_coun
         return None
 from agents.env import ExampleEnv
 from agents.policy import MaskedActorCriticPolicy
+from agents.policy import reinit_new_outputs_  # ortho-инициализация ТОЛЬКО новых выходов
 from agents.players import PolicyPlayer
 from agents.training import (
     StepCounterCallback,
@@ -547,6 +548,13 @@ def _migrate_checkpoint_dim(ppp_path: str, target_dim: int | None = None, force_
             _say(f"  Сохраняю пропатченный чекпоинт во временный файл {tmp_path}")
             ppo_new = PPO.load(tmp_path, device="cpu")
             _say(f"  Успешно загрузил мигрированный PPO")
+            # новые ВЫХОДЫ (головы шире, чем в чекпоинте / их не было вовсе) — ортогонально,
+            # потому что нули в action_net дали бы мёртвую голову, а случайный init — скачок логитов.
+            # При обычной миграции размеров head ничего не меняется, и это no-op.
+            try:
+                reinit_new_outputs_(ppo_new.policy, old_state=policy_state, verbose=True)
+            except Exception as _ie:
+                print(f"    [init] не удалось инициализировать новые выходы: {_ie}")
             # критично: сбрасываем Adam моменты старой размерности — иначе exp_avg old vs grad new -> RuntimeError
             try:
                 if hasattr(ppo_new, "policy") and hasattr(ppo_new.policy, "optimizer") and ppo_new.policy.optimizer is not None:
@@ -656,6 +664,14 @@ def _migrate_checkpoint_dim(ppp_path: str, target_dim: int | None = None, force_
                     if _critical:
                         print(f"  ВНИМАНИЕ: {len(_critical)} критичных весов НЕ загружены (остались случайными): "
                               f"{_critical[:4]}{' ...' if len(_critical) > 4 else ''}")
+                    # новые выходы (которых в чекпоинте не было) — ортогонально, а не «как повезло»
+                    try:
+                        _notes = reinit_new_outputs_(ppo_new.policy, old_state=policy_state2,
+                                                     missing_keys=_missing, verbose=False)
+                        for _n in _notes:
+                            print(f"  [init] {_n}")
+                    except Exception as _ie:
+                        print(f"  [init] не удалось ортогонально инициализировать новые выходы: {_ie}")
                     if _missing:
                         print(f"  Fallback: не загружено ключей: {len(_missing)} (первые: {_missing[:3]})")
                     if _unexpected:
