@@ -230,3 +230,7 @@ __marimo__/
 .streamlit/secrets.toml
 # models — weights/datasets large, keep local only
 models/
+
+# memmap-кэш obs для BC (создаётся рядом с датасетом, может быть на десятки ГБ)
+*_bc_obs.npy
+*_bc_obs.npy.meta.json

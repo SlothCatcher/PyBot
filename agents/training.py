@@ -3,6 +3,7 @@ import os
 import gc
 import pickle
 import glob
+import time
 import numpy as np
 import torch
 from poke_env.player import MaxBasePowerPlayer, Player, RandomPlayer, SimpleHeuristicsPlayer
@@ -294,16 +295,28 @@ def save_dataset(dataset: list, path: str):
         np.savez_compressed(path, obs=obs_arr, mask=mask_arr, action=action_arr)
     print(f"Датасет сохранён: {path} ({len(dataset)} примеров)")
 
+# С какого числа примеров датасет отдаётся ленивым view (без list(zip(...)) в RAM).
+VIEW_MIN_ROWS = 200_000
+
 def load_dataset(path: str) -> list:
-    # Лёгкая обёртка для совместимости — для больших файлов лучше использовать load_dataset_arrays (mmap)
+    """Ленивая загрузка датасета: заголовки читаются из zip, члены — только по требованию.
+
+    Раньше здесь проверялось `data["obs"].shape[0]` — а numpy для .npz читает член ЦЕЛИКОМ
+    (mmap внутри zip не работает), т.е. на датасете 3.27M x 991 это 13 ГБ ещё до BC.
+    Для больших файлов возвращаем ленивый `_DatasetView` с путём: pretrain_policy_bc по нему
+    пойдёт через memmap-кэш obs и в RAM датасет не поднимет.
+    """
     data = np.load(path, mmap_mode='r') if os.path.getsize(path) > 500_000_000 else np.load(path)
-    if "ret" in data:
-        # для больших файлов не делаем list(zip) — это дублирует память (1.2M туплов ~10GB), возвращаем ленивый вид
-        # но для совместимости со старым кодом пока делаем list только для маленьких файлов
-        if data["obs"].shape[0] > 200_000:
-            print(f"Датасет {path} большой ({data['obs'].shape[0]} примеров), возвращаю mmap-вид (без list) — используйте pretrain_policy_bc с путём")
-            # вернём специальный объект-обёртку, который pretrain поймёт
-            return _DatasetView(data)
+    info = npz_member_info(path, "obs.npy")
+    n_examples = int(info["shape"][0]) if info and len(info["shape"]) == 2 else None
+    if n_examples is None:                     # файл нестандартный — определяем как раньше
+        n_examples = int(data["obs"].shape[0])
+    has_ret = "ret" in getattr(data, "files", ())
+    if has_ret:
+        if n_examples > VIEW_MIN_ROWS:
+            print(f"Датасет {path} большой ({n_examples} примеров), возвращаю mmap-вид (без list) — "
+                  f"используйте pretrain_policy_bc с путём")
+            return _DatasetView(data, path=path, n_examples=n_examples)
         dataset = list(zip(data["obs"], data["mask"], data["action"], data["ret"]))
     else:
         dataset = list(zip(data["obs"], data["mask"], data["action"]))
@@ -312,21 +325,75 @@ def load_dataset(path: str) -> list:
     return dataset
 
 class _DatasetView:
-    """Лёгкий view на npz без копирования — для больших датасетов, чтобы проверка кэша не ела RAM."""
-    def __init__(self, npz):
+    """Лёгкий view на npz без копирования — для больших датасетов, чтобы проверка кэша не ела RAM.
+
+    Члены читаются ТОЛЬКО при первом обращении и кэшируются (numpy отдаёт член .npz целиком).
+    Сам факт создания view памяти не стоит; если у view есть `path`, pretrain_policy_bc идёт
+    memory-safe маршрутом (memmap-кэш obs) и члены вообще не читает.
+    """
+
+    def __init__(self, npz, path: str | None = None, n_examples: int | None = None):
         self.npz = npz
-        self.obs = npz["obs"]
-        self.mask = npz["mask"]
-        self.action = npz["action"]
-        self.ret = npz["ret"] if "ret" in npz else None
+        self.path = path
+        self._n_examples = n_examples
+        self._members: dict = {}
+
+    def _member(self, key: str):
+        if key not in self._members:
+            files = getattr(self.npz, "files", None)
+            if files is not None and key not in files:
+                self._members[key] = None
+            else:
+                self._members[key] = self.npz[key]
+        return self._members[key]
+
+    @property
+    def obs(self):
+        return self._member("obs")
+
+    @property
+    def mask(self):
+        return self._member("mask")
+
+    @property
+    def action(self):
+        return self._member("action")
+
+    @property
+    def ret(self):
+        return self._member("ret")
+
     def __len__(self):
+        if self._n_examples is not None:
+            return int(self._n_examples)
         return int(self.obs.shape[0])
+
     def __getitem__(self, idx):
         if self.ret is not None:
             return (self.obs[idx], self.mask[idx], int(self.action[idx]), float(self.ret[idx]))
         return (self.obs[idx], self.mask[idx], int(self.action[idx]))
 
 # ---------------- Chunked / streaming helpers (fix 61GB swap on 50k) ----------------
+
+# Порог, выше которого BC НЕ материализует нормализованный obs в RAM, а нормализует батч на лету.
+# 0.5 ГБ: для маленьких датасетов оставляем прежний путь (одним массивом), большие не копируем
+# (датасет 3.27M x 991 = 13 ГБ в float32, копия съедала ещё столько же).
+# Переопределяется переменной окружения PYBOT_BC_MATERIALIZE_LIMIT_GB.
+BC_MATERIALIZE_LIMIT_BYTES = 500_000_000
+# С какого размера obs (несжатых байт внутри .npz) выгружать их в memmap вместо загрузки в RAM.
+BC_NPZ_RAM_LIMIT_BYTES = 1_500_000_000
+try:
+    _lim2_gb = os.environ.get("PYBOT_BC_NPZ_RAM_LIMIT_GB")
+    if _lim2_gb:
+        BC_NPZ_RAM_LIMIT_BYTES = int(float(_lim2_gb) * 1e9)
+except Exception:
+    pass
+try:
+    _lim_gb = os.environ.get("PYBOT_BC_MATERIALIZE_LIMIT_GB")
+    if _lim_gb:
+        BC_MATERIALIZE_LIMIT_BYTES = int(float(_lim_gb) * 1e9)
+except Exception:
+    pass
 
 HEURISTIC_RAW_CACHE = "models/heuristic_raw_cache.pkl"
 HEURISTIC_RAW_CACHE_DIR = "models/heuristic_raw_chunks"
@@ -1467,44 +1534,269 @@ _EMA_ALPHA = 0.3
 _MIN_WEIGHT = 0.10
 _MAX_WEIGHT = 0.45
 
-def warm_up_vec_normalize(vec_normalize, dataset):
+def npz_member_info(npz_path: str, member: str = "obs.npy") -> dict | None:
+    """Метаданные члена .npz (форма, dtype, размер) БЕЗ чтения данных.
+
+    Зачем: numpy-овский `NpzFile.__getitem__` игнорирует `mmap_mode` (в исходниках numpy на
+    этом месте стоит FIXME) и всегда читает член целиком в RAM. Для датасета 3.27M x 991 это
+    ~13 ГБ, причём даже `data["obs"].shape` в прежнем `validate_bc_dataset` тянул весь массив.
+    Здесь читаем только npy-заголовок из zip-потока.
+    """
+    import zipfile
+    try:
+        with zipfile.ZipFile(npz_path) as z:
+            info = z.getinfo(member)
+            raw = int(info.file_size)
+            comp = int(info.compress_type)
+            with z.open(member) as f:
+                version = np.lib.format.read_magic(f)
+                major = version[0] if isinstance(version, tuple) else int(version)
+                reader = {1: np.lib.format.read_array_header_1_0,
+                          2: np.lib.format.read_array_header_2_0}.get(major)
+                if reader is None:
+                    return None
+                shape, fortran, dtype = reader(f)
+        dt = np.dtype(dtype)
+        n_elems = 1
+        for ax in shape:
+            n_elems *= int(ax)
+        return {"shape": tuple(int(x) for x in shape), "dtype": dt,
+                "fortran_order": bool(fortran), "raw_bytes": raw,
+                "data_bytes": int(n_elems) * int(dt.itemsize),
+                "compressed": comp != zipfile.ZIP_STORED}
+    except Exception:
+        return None
+
+
+def _stream_npz_member_to_npy(npz_path: str, out_path: str, member: str = "obs.npy",
+                              chunk_bytes: int = 64 << 20, verbose: bool = True) -> str | None:
+    """Копирует член .npz в несжатый .npy на диске, НЕ поднимая его в RAM.
+
+    Читаем прямо из zip-потока порциями по 64 МБ и пишем в memmap-файл — пик памяти = порция.
+    Так датасет становится настоящим memmap (numpy умеет mmap только для отдельных .npy).
+    """
+    info = npz_member_info(npz_path, member)
+    if info is None:
+        return None
+    import zipfile
+    tmp_out = out_path + ".tmp"
+    try:
+        out = np.lib.format.open_memmap(tmp_out, mode="w+", dtype=info["dtype"],
+                                        shape=info["shape"],
+                                        fortran_order=info["fortran_order"])
+        flat = out.reshape(-1).view(np.uint8)
+        written = 0
+        t0 = time.time()
+        with zipfile.ZipFile(npz_path) as z, z.open(member) as f:
+            version = np.lib.format.read_magic(f)
+            major = version[0] if isinstance(version, tuple) else int(version)
+            {1: np.lib.format.read_array_header_1_0, 2: np.lib.format.read_array_header_2_0}[major](f)
+            while True:
+                buf = f.read(chunk_bytes)
+                if not buf:
+                    break
+                arr = np.frombuffer(buf, dtype=np.uint8)
+                flat[written:written + arr.size] = arr
+                written += arr.size
+        out.flush()
+        del flat, out
+        expected = int(info.get("data_bytes", info["raw_bytes"]))
+        if written != expected:
+            print(f"BC: кэш obs записан не полностью ({written} из {expected} байт данных) — отбрасываю")
+            os.remove(tmp_out)
+            return None
+        os.replace(tmp_out, out_path)
+        if verbose:
+            print(f"BC: obs выгружены в несжатый memmap {out_path} "
+                  f"({written / 1e9:.2f} ГБ, {time.time() - t0:.0f} с) — дальше читаем с диска")
+        return out_path
+    except Exception as e:
+        print(f"BC: не удалось сделать memmap-кэш obs: {type(e).__name__}: {e}")
+        try:
+            if os.path.exists(tmp_out):
+                os.remove(tmp_out)
+        except Exception:
+            pass
+        return None
+
+
+def ensure_obs_memmap(npz_path: str, verbose: bool = True, force: bool = False) -> str | None:
+    """Возвращает путь к .npy-memmap с obs (создаёт один раз рядом с датасетом).
+
+    Кэш валидируется по метаданным источника (размер/время/форма/dtype), поэтому пересоздаётся
+    только когда датасет правда изменился. Если на диске не хватает места — возвращаем None
+    и работаем как раньше (в RAM), но с явным сообщением о цене.
+    """
+    import json
+    import shutil
+    info = npz_member_info(npz_path, "obs.npy")
+    if info is None or len(info["shape"]) != 2:
+        return None
+    cache = os.path.splitext(npz_path)[0] + "_bc_obs.npy"
+    meta_path = cache + ".meta.json"
+    try:
+        src_stat = os.stat(npz_path)
+        meta = {"source": os.path.abspath(npz_path), "source_size": int(src_stat.st_size),
+                "source_mtime": int(src_stat.st_mtime), "shape": list(info["shape"]),
+                "dtype": str(info["dtype"])}
+    except Exception:
+        meta = None
+    if (not force) and os.path.exists(cache) and os.path.exists(meta_path):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            if saved == meta:
+                if verbose:
+                    print(f"BC: использую memmap-кэш obs {cache} "
+                          f"({int(info['raw_bytes']) / 1e9:.2f} ГБ, {info['shape']})")
+                return cache
+        except Exception:
+            pass
+    need = int(info.get("data_bytes", info["raw_bytes"])) + (64 << 20)
+    try:
+        free = shutil.disk_usage(os.path.dirname(os.path.abspath(npz_path)) or ".").free
+        if free < need:
+            print(f"BC: для memmap-кэша obs нужно {need / 1e9:.1f} ГБ, свободно {free / 1e9:.1f} ГБ — "
+                  f"продолжаю с загрузкой obs в RAM (numpy для .npz не умеет mmap; пик памяти "
+                  f"~{int(info['raw_bytes']) / 1e9:.1f} ГБ)")
+            return None
+    except Exception:
+        pass
+    got = _stream_npz_member_to_npy(npz_path, cache, "obs.npy", verbose=verbose)
+    if got and meta is not None:
+        try:
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+    return got
+
+
+def bc_obs_array(dataset, obs_cache: str = "auto", verbose: bool = True):
+    """obs для BC без подъёма большого .npz в RAM. Возвращает (массив, это_memmap).
+
+    numpy читает член .npz целиком (mmap внутри zip не работает), поэтому большой obs один раз
+    выгружается потоком в несжатый .npy рядом с датасетом (см. ensure_obs_memmap) и дальше
+    читается как memmap. Пик памяти при выгрузке = один чанк (64 МБ) + запас на проверку места.
+    """
+    if isinstance(dataset, _DatasetView):
+        if dataset.path:
+            return bc_obs_array(dataset.path, obs_cache=obs_cache, verbose=verbose)
+        arr = dataset.obs
+        return arr, isinstance(arr, np.memmap)
+    if not isinstance(dataset, str):
+        arr = dataset if isinstance(dataset, np.ndarray) else np.asarray(dataset)
+        return arr, isinstance(arr, np.memmap)
+    path = dataset
+    if path.endswith(".npy"):
+        return np.load(path, mmap_mode="r"), True
+    info = npz_member_info(path, "obs.npy")
+    raw_bytes = int(info["raw_bytes"]) if info else None
+    cache_allowed = str(obs_cache).lower() != "off"
+    if raw_bytes is not None and cache_allowed and raw_bytes > BC_NPZ_RAM_LIMIT_BYTES:
+        if verbose and raw_bytes > (64 << 20):
+            print(f"BC: obs в датасете {raw_bytes / 1e9:.2f} ГБ — numpy читает .npz целиком "
+                  f"(mmap внутри zip не работает)")
+        cache_path = ensure_obs_memmap(path, verbose=verbose,
+                                       force=(str(obs_cache).lower() == "on"))
+        if cache_path:
+            return np.load(cache_path, mmap_mode="r"), True
+    return np.load(path)["obs"], False       # фолбэк: как раньше, obs в RAM (с сообщением)
+
+
+def bc_obs_normalizer(vec_normalize):
+    """Нормализатор obs для BC: `VecNormStats` по живым статистикам VecNormalize.
+
+    Почему не `vec_normalize.normalize_obs({"observation": x})`: SB3 2.9 нормализует КЛЮЧИ
+    ПРОСТРАНСТВА (`norm_obs_keys`), и если VecNormalize создан без явного
+    `norm_obs_keys=["observation"]`, вызов с одним ключом падает `KeyError: 'action_mask'`.
+    Плюс `VecNormStats` — тот же класс, на котором работает инференс (см. vecnorm_utils),
+    то есть формула 1:1 и в обучении, и в игре.
+    """
+    try:
+        from .vecnorm_utils import VecNormStats
+    except ImportError:  # pragma: no cover
+        from vecnorm_utils import VecNormStats
+    rms = vec_normalize.obs_rms
+    if isinstance(rms, dict):
+        rms = rms.get("observation", rms.get("obs"))
+    return VecNormStats(mean=np.asarray(rms.mean), var=np.asarray(rms.var),
+                        clip_obs=float(getattr(vec_normalize, "clip_obs", 10.0)),
+                        epsilon=float(getattr(vec_normalize, "epsilon", 1e-8)))
+
+
+def warm_up_vec_normalize(vec_normalize, dataset, chunk_rows: int = 20_000,
+                          verbose: bool = True):
+    """Переоценка статистики нормализации по датасету БЕЗ материализации его в RAM.
+
+    Грабли (стоили прерванного прогона BC на 3.27M примерах): SB3-шный
+    `RunningMeanStd.update(arr)` считает `np.mean(arr, axis=0)` и `np.var(arr, axis=0)` по всему
+    переданному массиву, а `np.var` поднимает временный массив того же размера. На датасете
+    3.27M x 991 это ещё ~13 ГБ сверху к самому датасету. Пик на Windows упирается в
+    коммит-лимит, и процесс убивается БЕЗ traceback. Поэтому считаем чанками: `update()` по
+    куску даёт те же моменты (RunningMeanStd объединяет их взвешенно), пик памяти = чанк.
+    """
     if len(dataset) == 0:
         return
-    # поддержка _DatasetView: у него obs уже массив (mmap)
+    if "observation" not in vec_normalize.obs_rms:
+        return
+    rms = vec_normalize.obs_rms["observation"]
+    try:
+        rms_dim = int(np.asarray(rms.mean).size)
+    except Exception:
+        rms_dim = None
+
+    def _align(piece):
+        """Приводит кусок к размерности статистики так же, как это делает BC (паддинг в хвост).
+
+        Без этого `RunningMeanStd.update` падает на broadcast (obs 715 против статистики 991).
+        Паддим ПО КУСКАМ: на датасете 3.27M x 715 цельный паддинг — это лишние 13 ГБ.
+        """
+        if rms_dim is None or piece.shape[1] == rms_dim:
+            return piece
+        if piece.shape[1] > rms_dim:
+            return np.ascontiguousarray(piece[:, :rms_dim])
+        if piece.shape[1] < MIN_PREFIX_OBS_DIM:
+            raise ValueError(dataset_layout_error(piece.shape[1], rms_dim,
+                                                  label="датасет для warm-up статистики"))
+        out = np.zeros((piece.shape[0], rms_dim), dtype=np.float32)
+        out[:, :piece.shape[1]] = piece
+        return out
+
+    def _update_chunked(arr, n_rows: int) -> None:
+        chunk = max(int(chunk_rows), 1)
+        for s in range(0, n_rows, chunk):
+            e = min(s + chunk, n_rows)
+            rms.update(_align(np.asarray(arr[s:e], dtype=np.float32)))
+
+    # путь к датасету (или view с путём) — берём obs memory-safe: memmap-кэш вместо чтения .npz
+    if isinstance(dataset, str) or (isinstance(dataset, _DatasetView) and dataset.path):
+        obs, _is_mmap = bc_obs_array(dataset, obs_cache="auto", verbose=verbose)
+        if verbose and int(obs.shape[0]) > 200_000:
+            print(f"BC: статистика нормализации по чанкам по {chunk_rows} строк "
+                  f"({obs.shape[0]} всего; одним куском np.var поднял бы временный массив "
+                  f"на {obs.shape[0] * obs.shape[1] * 4 / 1e9:.1f} ГБ)")
+        _update_chunked(obs, int(obs.shape[0]))
+        return
+    # поддержка _DatasetView без пути: obs уже прочитаны
     if isinstance(dataset, _DatasetView):
-        obs_arr = np.asarray(dataset.obs, dtype=np.float32)
-    elif isinstance(dataset, np.ndarray) and dataset.ndim == 2:
-        # уже готовый массив obs (например выровненный по размерности признаков)
-        obs_arr = np.asarray(dataset, dtype=np.float32)
-    elif isinstance(dataset, str) and os.path.exists(dataset):
-        data = np.load(dataset, mmap_mode='r')
-        obs_arr = np.asarray(data["obs"], dtype=np.float32)
-    else:
-        # list path — для больших датасетов делаем батчевую оценку чтобы не stack 3.6GB сразу
-        if len(dataset) > 200_000:
-            # считаем среднее по батчам 10k
-            batch = 10000
-            # возьмём первые 50000 для warmup чтобы не грузить всё
-            sample_n = min(len(dataset), 50000)
-            obs_sample = np.stack([dataset[i][0] for i in range(sample_n)]).astype(np.float32)
-            if "observation" in vec_normalize.obs_rms:
-                vec_normalize.obs_rms["observation"].update(obs_sample)
-            return
-        obs_arr = np.stack([d[0] for d in dataset]).astype(np.float32)
-    if "observation" in vec_normalize.obs_rms:
-        rms = vec_normalize.obs_rms["observation"]
-        try:
-            rms_dim = int(np.asarray(rms.mean).size)
-            if obs_arr.shape[1] != rms_dim:
-                # размерности должны совпадать: иначе RunningMeanStd.update падает на broadcast
-                # (obs 418 против статистики 870). Приводим тем же правилом, что и сам BC.
-                obs_arr = _pad_obs_to_features(obs_arr, rms_dim, label="датасет для warm-up статистики")
-        except ValueError:
-            raise
-        except Exception as e:
-            print(f"BC: warm-up статистики пропущен ({e})")
-            return
-        rms.update(np.asarray(obs_arr, dtype=np.float32))
+        _update_chunked(dataset.obs, len(dataset))
+        return
+    if isinstance(dataset, np.ndarray) and dataset.ndim == 2:
+        if verbose and int(dataset.shape[0]) > 200_000:
+            print(f"BC: статистика нормализации по чанкам по {chunk_rows} строк "
+                  f"({dataset.shape[0]} всего; одним куском np.var поднял бы временный массив "
+                  f"на {dataset.shape[0] * dataset.shape[1] * 4 / 1e9:.1f} ГБ)")
+        _update_chunked(dataset, dataset.shape[0])
+        return
+    # list path — для больших датасетов берём выборку
+    if len(dataset) > 200_000:
+        sample_n = min(len(dataset), 50_000)
+        obs_sample = np.stack([dataset[i][0] for i in range(sample_n)]).astype(np.float32)
+        _update_chunked(obs_sample, int(obs_sample.shape[0]))
+        return
+    obs_arr = np.stack([d[0] for d in dataset]).astype(np.float32)
+    _update_chunked(obs_arr, int(obs_arr.shape[0]))
 
 def _update_opponent_weights(win_rates: dict[str, float]):
     for name, rate in win_rates.items():
@@ -1674,6 +1966,13 @@ def validate_bc_dataset(path: str, target_dim: int) -> dict:
     try:
         with _np.load(path, mmap_mode="r") as data:
             keys = set(data.files)
+        # ВАЖНО: `data["obs"]` у npz читает массив ЦЕЛИКОМ (numpy игнорирует mmap_mode),
+        # то есть проверка формы стоила 13 ГБ RAM на датасете 3.27M x 991. Берём заголовок.
+        info = npz_member_info(path, "obs.npy") if "obs" in keys else None
+        if info is not None:
+            obs_dim, examples = int(info["shape"][1]), int(info["shape"][0])
+        else:
+            data = _np.load(path, mmap_mode="r")
             obs_dim = int(data["obs"].shape[1])
             examples = int(data["obs"].shape[0])
     except SystemExit:
@@ -1740,6 +2039,12 @@ def pretrain_policy_bc(
     betas: tuple = (0.9, 0.999), adapt: str = "off", adapt_factor: float = 0.5,
     adapt_patience: int = 2, adapt_min: float = 0.1,
     reset_at_start: bool = True,
+    # --- память и наблюдаемость на больших датасетах (см. AUDIT 30) ---
+    normalize_mode: str = "auto",          # auto | in_memory | on_the_fly
+    obs_cache: str = "auto",               # auto | on | off — выгружать obs из .npz в memmap
+    max_examples: int | None = None,       # подвыборка для BC (None = все примеры)
+    progress_every: int = 200,             # печатать прогресс каждые N батчей (0 = выключить)
+    checkpoint_path: str | None = None,    # сохранять веса после каждой эпохи (страховка)
     # --- и сразу настройки оптимизатора для последующего RL (правило перехода BC -> PPO) ---
     reset_optimizer: bool = True, rl_lr: float | None = None, rl_lr_value: float | None = None,
     rl_lr_shared: float | None = None,
@@ -1747,15 +2052,19 @@ def pretrain_policy_bc(
     rl_adapt: str = "off", rl_adapt_factor: float = 0.5, rl_adapt_patience: int = 2,
     rl_adapt_min: float = 0.1, verbose: bool = True,
 ):
+    # view с путём к источнику эквивалентен самому пути: идём memory-safe маршрутом (memmap-кэш)
+    if isinstance(dataset, _DatasetView) and getattr(dataset, "path", None):
+        dataset = dataset.path
     # dataset может быть list, _DatasetView (mmap) или путь к .npz
     if isinstance(dataset, str) and os.path.exists(dataset):
-        # путь — грузим mmap
-        print(f"BC: гружу датасет по пути {dataset} (mmap)")
+        print(f"BC: гружу датасет по пути {dataset}")
         data = np.load(dataset, mmap_mode='r') if os.path.getsize(dataset) > 200_000_000 else np.load(dataset)
         if "ret" not in data:
             raise ValueError("Датасет без ret: соберите заново с _compute_bc_returns (нужен victory_value).")
-        # используем mmap напрямую без list(zip)
-        obs_arr = data["obs"]
+        # obs из .npz ВСЕГДА читается целиком (numpy не умеет mmap внутри zip): для большого
+        # датасета делаем несжатый .npy-кэш и работаем с ним как с memmap — иначе один только
+        # `data["obs"]` на 3.27M x 991 это ~13 ГБ RAM и убитый Windows-процесс без traceback.
+        obs_arr, _obs_is_mmap = bc_obs_array(dataset, obs_cache=obs_cache, verbose=verbose)
         mask_arr = data["mask"]
         action_arr = data["action"]
         return_arr = data["ret"]
@@ -1807,31 +2116,46 @@ def pretrain_policy_bc(
     # для mmap это уже np.memmap, для list — обычные ndarray
     # dim уже проверен выше, повторная проверка не нужна
 
+    obs_normalizer = None          # не None -> obs нормализуются батчем в цикле обучения
     if normalize:
         vec_normalize = ppo.get_vec_normalize_env()
         if vec_normalize is not None:
-            # warm_up: для пути dataset это data view, для _DatasetView — сам объект
-            warm_arg = dataset
-            if isinstance(dataset, str) and 'data' in locals():
-                # создаём view для warm_up
-                try:
-                    warm_arg = _DatasetView(data)
-                except Exception:
-                    warm_arg = dataset
-            # warm-up должен видеть ровно те obs, на которых пойдёт BC (obs_arr уже
-            # выровнен по размерности признаков), иначе статистика окажется чужой размерности
-            warm_up_vec_normalize(vec_normalize, obs_arr if obs_arr is not None else warm_arg)
-            if is_mmap and obs_arr.shape[0] > 200_000:
-                print(f"BC: нормализую большой mmap ({obs_arr.shape[0]}) по частям")
+            # warm-up должен видеть ровно те obs, на которых пойдёт BC (obs_arr уже выровнен по
+            # размерности признаков), иначе статистика окажется чужой размерности.
+            # obs_arr — memmap или RAM-массив (никогда не None), статистика идёт чанками.
+            warm_up_vec_normalize(vec_normalize, obs_arr)
+            want_bytes = int(obs_arr.shape[0]) * int(obs_arr.shape[1]) * 4
+            mode = str(normalize_mode or "auto").lower()
+            if mode == "auto":
+                # нормализовать весь массив в RAM дорого: столько же памяти, сколько датасет
+                mode = "in_memory" if want_bytes <= BC_MATERIALIZE_LIMIT_BYTES else "on_the_fly"
+            print(f"BC: нормализация obs: {want_bytes / 1e9:.2f} ГБ данных, режим {mode} "
+                  f"(порог материализации {BC_MATERIALIZE_LIMIT_BYTES / 1e9:.1f} ГБ, "
+                  f"PYBOT_BC_MATERIALIZE_LIMIT_GB меняет порог)")
+            if mode == "on_the_fly":
+                # НЕ копируем датасет: нормализуем батч в цикле обучения (формула 1:1 с SB3).
+                # Раньше здесь был np.empty(obs_arr.shape) = +13 ГБ на датасете 3.27M x 991 —
+                # процесс убивался без traceback (Windows: коммит-лимит).
+                obs_normalizer = bc_obs_normalizer(vec_normalize)
+                print(f"BC: obs нормализуются на лету (mean {vec_normalize.obs_rms['observation'].mean[:3]}), "
+                      f"память под датасет не выделяется")
+            elif mode == "in_memory" or obs_arr.shape[0] <= 200_000:
+                obs_arr = bc_obs_normalizer(vec_normalize).normalize(np.asarray(obs_arr, dtype=np.float32))
+                obs_normalizer = None
+                print(f"BC: нормализовал {len(obs_arr)} obs через VecNormalize "
+                      f"(mean {vec_normalize.obs_rms['observation'].mean[:3]}, "
+                      f"{obs_arr.nbytes / 1e9:.2f} ГБ RAM)")
+            else:
+                print(f"BC: нормализую большой mmap ({obs_arr.shape[0]}) по частям "
+                      f"({want_bytes / 1e9:.2f} ГБ RAM — следите за свободной памятью)")
                 normed = np.empty(obs_arr.shape, dtype=np.float32)
+                _bc_norm = bc_obs_normalizer(vec_normalize)
                 chunk = 50000
                 for s in range(0, obs_arr.shape[0], chunk):
                     e = min(s+chunk, obs_arr.shape[0])
-                    normed[s:e] = vec_normalize.normalize_obs({"observation": np.asarray(obs_arr[s:e], dtype=np.float32)})["observation"]
+                    normed[s:e] = _bc_norm.normalize(np.asarray(obs_arr[s:e], dtype=np.float32))
                 obs_arr = normed
-                print(f"BC: нормализовал {len(obs_arr)} obs через VecNormalize (mean {vec_normalize.obs_rms['observation'].mean[:3]})")
-            else:
-                obs_arr = vec_normalize.normalize_obs({"observation": np.asarray(obs_arr, dtype=np.float32)})["observation"]
+                obs_normalizer = None
                 print(f"BC: нормализовал {len(obs_arr)} obs через VecNormalize (mean {vec_normalize.obs_rms['observation'].mean[:3]})")
         else:
             print("BC: normalize=True но VecNormalize не найден — обучаю на сырых obs")
@@ -1846,6 +2170,12 @@ def pretrain_policy_bc(
     n_val = max(1, int(n * val_frac))
     perm = np.random.permutation(n)
     val_idx, train_idx = perm[:n_val], perm[n_val:]
+    if max_examples and len(train_idx) > int(max_examples):
+        # 3.27M примеров x 15 эпох — это часы на CPU и почти всегда избыточно:
+        # даём ограничить число шагов BC, val при этом не трогаем
+        keep = np.random.permutation(len(train_idx))[:int(max_examples)]
+        train_idx = np.sort(train_idx[keep])
+        print(f"BC: подвыборка --bc-max-examples={int(max_examples)} из {n - n_val} обучающих примеров")
 
     device = ppo.policy.device
     best_val_loss = float("inf")
@@ -1875,103 +2205,151 @@ def pretrain_policy_bc(
                   f"{lr_schedule}, eps={bc_eps if bc_eps else 'как есть'})")
     n_batches_total = max(1, int(np.ceil(len(train_idx) / batch_size)))
 
-    for epoch in range(epochs):
-        train_perm = np.random.permutation(train_idx)
-        total_policy_loss, total_value_loss, n_batches = 0.0, 0.0, 0
-        for start in range(0, len(train_perm), batch_size):
-            idx = train_perm[start:start + batch_size]
-            obs_dict = {
-                "observation": torch.as_tensor(obs_arr[idx], device=device),
-                "action_mask": torch.as_tensor(mask_arr[idx], device=device),
-            }
-            action_batch = torch.as_tensor(action_arr[idx], device=device)
-            return_batch = torch.as_tensor(return_arr[idx], device=device)
+    interrupted = False
+    t_bc_start = time.time()
+    try:
+        for epoch in range(epochs):
+            train_perm = np.random.permutation(train_idx)
+            total_policy_loss, total_value_loss, n_batches = 0.0, 0.0, 0
+            t_epoch = time.time()
+            for start in range(0, len(train_perm), batch_size):
+                idx = train_perm[start:start + batch_size]
+                obs_raw = obs_arr[idx]
+                if obs_normalizer is not None:
+                    # нормализация «на лету»: формула 1:1 с SB3 (x - mean) / sqrt(var + eps), clip ±10
+                    obs_raw = obs_normalizer.normalize(np.asarray(obs_raw, dtype=np.float32))
+                obs_dict = {
+                    "observation": torch.as_tensor(obs_raw, device=device),
+                    "action_mask": torch.as_tensor(mask_arr[idx], device=device),
+                }
+                action_batch = torch.as_tensor(action_arr[idx], device=device)
+                return_batch = torch.as_tensor(return_arr[idx], device=device)
 
-            features = ppo.policy.extract_features(obs_dict)
-            latent_pi, latent_vf = ppo.policy.mlp_extractor(features)
-            ppo.policy._mask = obs_dict["action_mask"]
-            distribution = ppo.policy._get_action_dist_from_latent(latent_pi)
-            if contrastive:
-                log_prob = distribution.log_prob(action_batch)
-                prob = log_prob.exp().clamp(1e-6, 1-1e-6)
-                win_mask = return_batch > 0
-                lose_mask = return_batch < 0
-                win_loss = -log_prob[win_mask].mean() if win_mask.any() else torch.tensor(0.0, device=device)
-                if lose_mask.any():
-                    lose_loss = -torch.log(1 - prob[lose_mask] + 1e-8).mean()
-                    policy_loss = win_loss + neg_weight * lose_loss
+                features = ppo.policy.extract_features(obs_dict)
+                latent_pi, latent_vf = ppo.policy.mlp_extractor(features)
+                ppo.policy._mask = obs_dict["action_mask"]
+                distribution = ppo.policy._get_action_dist_from_latent(latent_pi)
+                if contrastive:
+                    log_prob = distribution.log_prob(action_batch)
+                    prob = log_prob.exp().clamp(1e-6, 1-1e-6)
+                    win_mask = return_batch > 0
+                    lose_mask = return_batch < 0
+                    win_loss = -log_prob[win_mask].mean() if win_mask.any() else torch.tensor(0.0, device=device)
+                    if lose_mask.any():
+                        lose_loss = -torch.log(1 - prob[lose_mask] + 1e-8).mean()
+                        policy_loss = win_loss + neg_weight * lose_loss
+                    else:
+                        policy_loss = win_loss
                 else:
-                    policy_loss = win_loss
-            else:
-                policy_loss = -distribution.log_prob(action_batch).mean()
-            values = ppo.policy.value_net(latent_vf).flatten()
-            value_loss = torch.nn.functional.mse_loss(values, return_batch)
-            loss = policy_loss + value_coef * value_loss
+                    policy_loss = -distribution.log_prob(action_batch).mean()
+                values = ppo.policy.value_net(latent_vf).flatten()
+                value_loss = torch.nn.functional.mse_loss(values, return_batch)
+                loss = policy_loss + value_coef * value_loss
 
-            # спад lr внутри эпохи: прогресс = (эпоха + доля батчей) / эпох
-            batch_idx = start // batch_size
-            progress = (epoch + batch_idx / n_batches_total) / max(epochs, 1)
-            cur_lr = bc_lr_at(min(progress, 1.0), bc_lr, bc_lr_final, lr_schedule)
-            try:
-                opt.set_lrs(policy_lr=cur_lr, progress_done=min(progress, 1.0))
-            except Exception:
-                pass
-            ppo.policy.optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(ppo.policy.parameters(), 0.5)
-            ppo.policy.optimizer.step()
-            total_policy_loss += policy_loss.item()
-            total_value_loss += value_loss.item()
-            n_batches += 1
+                # спад lr внутри эпохи: прогресс = (эпоха + доля батчей) / эпох
+                batch_idx = start // batch_size
+                progress = (epoch + batch_idx / n_batches_total) / max(epochs, 1)
+                cur_lr = bc_lr_at(min(progress, 1.0), bc_lr, bc_lr_final, lr_schedule)
+                try:
+                    opt.set_lrs(policy_lr=cur_lr, progress_done=min(progress, 1.0))
+                except Exception:
+                    pass
+                ppo.policy.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(ppo.policy.parameters(), 0.5)
+                ppo.policy.optimizer.step()
+                total_policy_loss += policy_loss.item()
+                total_value_loss += value_loss.item()
+                n_batches += 1
+                if progress_every and (n_batches % int(progress_every) == 0):
+                    done = n_batches
+                    frac = done / max(n_batches_total, 1)
+                    spent = time.time() - t_epoch
+                    eta = spent / max(frac, 1e-9) - spent
+                    # flush: без него на Windows вывод буферизуется и «обрыв» выглядит как зависание
+                    print(f"BC epoch {epoch+1}/{epochs}: батч {done}/{n_batches_total} "
+                          f"({frac * 100:.1f}%), loss={total_policy_loss / max(n_batches, 1):.4f}, "
+                          f"lr={opt.lr_by_group().get('policy', float('nan')):.2e}, "
+                          f"прошло {spent / 60:.1f} мин, ETA эпохи {eta / 60:.1f} мин", flush=True)
 
-        with torch.no_grad():
-            obs_dict = {
-                "observation": torch.as_tensor(obs_arr[val_idx], device=device),
-                "action_mask": torch.as_tensor(mask_arr[val_idx], device=device),
-            }
-            action_batch = torch.as_tensor(action_arr[val_idx], device=device)
-            return_batch = torch.as_tensor(return_arr[val_idx], device=device)
-            features = ppo.policy.extract_features(obs_dict)
-            latent_pi, latent_vf = ppo.policy.mlp_extractor(features)
-            ppo.policy._mask = obs_dict["action_mask"]
-            distribution = ppo.policy._get_action_dist_from_latent(latent_pi)
-            if contrastive:
-                log_prob = distribution.log_prob(action_batch)
-                prob = log_prob.exp().clamp(1e-6, 1-1e-6)
-                win_mask = return_batch > 0
-                lose_mask = return_batch < 0
-                win_loss = -log_prob[win_mask].mean().item() if win_mask.any() else 0.0
-                if lose_mask.any():
-                    lose_loss = -torch.log(1 - prob[lose_mask] + 1e-8).mean().item()
-                    val_policy_loss = win_loss + neg_weight * lose_loss
+            with torch.no_grad():
+                # dropout экстрактора выключаем: иначе val_loss шумит и ранняя остановка
+                # срабатывает случайно (плюс прогон на двух разных путях данных не сравнить)
+                ppo.policy.eval()
+                obs_dict = {
+                    "observation": torch.as_tensor(obs_arr[val_idx], device=device),
+                    "action_mask": torch.as_tensor(mask_arr[val_idx], device=device),
+                }
+                action_batch = torch.as_tensor(action_arr[val_idx], device=device)
+                return_batch = torch.as_tensor(return_arr[val_idx], device=device)
+                features = ppo.policy.extract_features(obs_dict)
+                latent_pi, latent_vf = ppo.policy.mlp_extractor(features)
+                ppo.policy._mask = obs_dict["action_mask"]
+                distribution = ppo.policy._get_action_dist_from_latent(latent_pi)
+                if contrastive:
+                    log_prob = distribution.log_prob(action_batch)
+                    prob = log_prob.exp().clamp(1e-6, 1-1e-6)
+                    win_mask = return_batch > 0
+                    lose_mask = return_batch < 0
+                    win_loss = -log_prob[win_mask].mean().item() if win_mask.any() else 0.0
+                    if lose_mask.any():
+                        lose_loss = -torch.log(1 - prob[lose_mask] + 1e-8).mean().item()
+                        val_policy_loss = win_loss + neg_weight * lose_loss
+                    else:
+                        val_policy_loss = win_loss
                 else:
-                    val_policy_loss = win_loss
-            else:
-                val_policy_loss = -distribution.log_prob(action_batch).mean().item()
-            values = ppo.policy.value_net(latent_vf).flatten()
-            val_value_loss = torch.nn.functional.mse_loss(values, return_batch).item()
+                    val_policy_loss = -distribution.log_prob(action_batch).mean().item()
+                values = ppo.policy.value_net(latent_vf).flatten()
+                val_value_loss = torch.nn.functional.mse_loss(values, return_batch).item()
+                ppo.policy.train()          # возвращаем режим обучения (dropout)
+
             val_loss = val_policy_loss + value_coef * val_value_loss
 
-        try:
-            lr_now = opt.lr_by_group()
-            lr_msg = " lr=" + "/".join(f"{k}:{v:.2e}" for k, v in lr_now.items())
-        except Exception:
-            lr_msg = f" lr={cur_lr:.2e}"
-        print(
-            f"[BC epoch {epoch}] train_policy={total_policy_loss/n_batches:.4f} "
-            f"train_value={total_value_loss/n_batches:.4f} "
-            f"val_policy={val_policy_loss:.4f} val_value={val_value_loss:.4f}" + lr_msg
-        )
+            try:
+                lr_now = opt.lr_by_group()
+                lr_msg = " lr=" + "/".join(f"{k}:{v:.2e}" for k, v in lr_now.items())
+            except Exception:
+                lr_msg = f" lr={cur_lr:.2e}"
+            print(
+                f"[BC epoch {epoch}] train_policy={total_policy_loss/n_batches:.4f} "
+                f"train_value={total_value_loss/n_batches:.4f} "
+                f"val_policy={val_policy_loss:.4f} val_value={val_value_loss:.4f}" + lr_msg
+            )
 
-        if val_loss < best_val_loss - 1e-4:
-            best_val_loss = val_loss
-            epochs_without_improvement = 0
-            best_state = {k: v.clone() for k, v in ppo.policy.state_dict().items()}
-        else:
-            epochs_without_improvement += 1
-            if epochs_without_improvement >= patience:
-                print(f"Ранняя остановка на эпохе {epoch} (val loss не улучшается {patience} эпох)")
-                break
+            if checkpoint_path and epochs > 1:
+                # многочасовые прогоны: сохраняем после каждой эпохи, чтобы обрыв не стоил всего
+                try:
+                    ppo.save(checkpoint_path)
+                    print(f"  BC: веса после эпохи {epoch} сохранены в {checkpoint_path} "
+                          f"(продолжить: --resume {checkpoint_path} --bc-keep-optimizer)", flush=True)
+                except Exception as ce:
+                    print(f"  BC: не удалось сохранить чекпоинт {checkpoint_path}: {ce}")
+
+            if val_loss < best_val_loss - 1e-4:
+                best_val_loss = val_loss
+                epochs_without_improvement = 0
+                best_state = {k: v.clone() for k, v in ppo.policy.state_dict().items()}
+            else:
+                epochs_without_improvement += 1
+                if epochs_without_improvement >= patience:
+                    print(f"Ранняя остановка на эпохе {epoch} (val loss не улучшается {patience} эпох)")
+                    break
+
+    except MemoryError as me:
+        # Раньше процесс просто умирал без traceback: сначала np.empty(датасет) в RAM, потом
+        # падение по памяти. Теперь говорим явно, что делать, и не теряем прогресс.
+        interrupted = True
+        print(f"BC: не хватило памяти ({me}). Уже сделано эпох: {epoch}. "
+              f"Варианты: --bc-normalize-mode on_the_fly (не копировать датасет), "
+              f"--bc-max-examples 300000 (урезать шаги BC), --batch-size поменьше. "
+              f"Веса текущей эпохи сохраняются.", flush=True)
+    except KeyboardInterrupt:
+        interrupted = True
+        print(f"BC: прервано пользователем на эпохе {epoch}; сохраняю текущие веса, "
+              f"чтобы прогресс не потерялся", flush=True)
+    finally:
+        spent = time.time() - t_bc_start
+        print(f"BC: обучение заняло {spent / 60:.1f} мин", flush=True)
 
     # сброс оптимизатора для RL: правило «BC -> PPO начинает с нового Adam»
     if reset_optimizer:
@@ -1996,6 +2374,9 @@ def pretrain_policy_bc(
         except Exception:
             pass
 
+    if interrupted:
+        print("BC: прогон прерван — применяю лучшие по val_loss веса из уже пройденных эпох",
+              flush=True)
     if best_state is not None:
         ppo.policy.load_state_dict(best_state)
         print("Восстановлены веса с лучшей val_loss")

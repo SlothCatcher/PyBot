@@ -95,14 +95,23 @@ def write_old_stats(path: str, dim: int = 418) -> str:
 
 
 def main() -> int:
+    # models/ в git не хранится (untrack), поэтому в свежем клоне репо-артефакта может не быть.
+    # Для проверки вердикта подставляем такой же legacy-файл на 418, НЕ трогая VECNORM_PATH:
+    # отсутствие файла — отдельный сценарий, который проверяется ниже (eval -> None + предупреждение).
+    repo_path = VECNORM_PATH
+    if load_vecnorm_state(repo_path) is None:
+        tmp_ref = tempfile.mkdtemp(prefix="vecnorm_ref_")
+        repo_path = write_old_stats(os.path.join(tmp_ref, "vecnormalize.pkl"), 418)
+        print(f"models/vecnormalize.pkl недоступен — для вердикта беру синтетическую статистику 418: "
+              f"{repo_path}")
     print(f"N_FEATURES={N_FEATURES}, VECNORM_PATH={VECNORM_PATH}")
     print(f"repo-статистика читается: {load_vecnorm_state(VECNORM_PATH) is not None}")
     print("-" * 74)
 
     # ------------------------------------------------------------------ вердикт ---
-    src_dim = int(np.asarray(load_vecnorm_state(VECNORM_PATH)["mean"]).size)
-    st = load_vecnorm_state(VECNORM_PATH)
-    keep, reason = stats_verdict(VECNORM_PATH, N_FEATURES, st["mean"], st["var"])
+    src_dim = int(np.asarray(load_vecnorm_state(repo_path)["mean"]).size)
+    st = load_vecnorm_state(repo_path)
+    keep, reason = stats_verdict(repo_path, N_FEATURES, st["mean"], st["var"])
     check(f"repo-статистика ({src_dim}) не считается статистикой текущей раскладки ({N_FEATURES})",
           (src_dim == N_FEATURES) or (keep is False), f"keep={keep}, reason={reason}")
 

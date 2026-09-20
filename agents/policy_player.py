@@ -876,6 +876,12 @@ def run(
     bc_lr_value: float | None = None,
     bc_adapt: str = "off",
     bc_reset_optimizer: bool = True,
+    bc_normalize_mode: str = "auto",
+    bc_obs_cache: str = "auto",
+    bc_max_examples: int | None = None,
+    bc_progress_every: int = 200,
+    bc_checkpoint_every_epoch: bool = True,
+    bc_checkpoint_path: str | None = None,
     eval_battles: int = 20,
     skip_eval: bool = False,
     # --- ICM Variant B ---
@@ -906,6 +912,13 @@ def run(
                       "играют на сырых признаках (это разойдётся с обучением)")
         except Exception as e:
             print(f"self-play: не удалось проверить нормализацию obs: {e}")
+
+    if bc_checkpoint_path is None:
+        _base = (save_as or "bc_pretrain") if isinstance(save_as, str) else "bc_pretrain"
+        bc_checkpoint_path = os.path.join(os.path.dirname(_base) or "models",
+                                          os.path.basename(_base) + "_bc_latest.zip")
+    print(f"BC: страховочный чекпоинт после каждой эпохи -> {bc_checkpoint_path} "
+          f"(отключается --no-bc-checkpoint)")
 
     # BC-датасет проверяем ДО создания env: без ret обучать нечему, а старая раскладка
     # признаков раньше молча портила колонки (см. training.dataset_layout_error)
@@ -1142,6 +1155,10 @@ def run(
                 rl_adapt=lr_adapt, rl_adapt_factor=lr_adapt_factor,
                 rl_adapt_patience=lr_adapt_patience, rl_adapt_min=lr_adapt_min,
                 weight_decay=weight_decay, betas=(float(beta1), float(beta2)),
+                normalize_mode=bc_normalize_mode, obs_cache=bc_obs_cache,
+                max_examples=bc_max_examples,
+                progress_every=bc_progress_every,
+                checkpoint_path=(bc_checkpoint_path if bc_checkpoint_every_epoch else None),
             )
 
     # FIX: SB3 хранит расписание в ppo.lr_schedule (FloatSchedule), а не в learning_rate.
@@ -1588,6 +1605,24 @@ def build_parser() -> "argparse.ArgumentParser":
                         help="отдельный (абсолютный) lr value-головы на BC; по умолчанию как --bc-lr")
     parser.add_argument("--bc-adapt", type=str, default="off", choices=["off", "plateau", "gnorm"],
                         help="адаптация lr на BC (обычно не нужна: есть спад --bc-lr-schedule)")
+    parser.add_argument("--bc-normalize-mode", type=str, default="auto",
+                        choices=["auto", "in_memory", "on_the_fly"],
+                        help="как нормализовать obs на BC: auto (in_memory до 1.5 ГБ, дальше "
+                             "on_the_fly), in_memory (копия датасета в RAM) или on_the_fly "
+                             "(нормализация батча в цикле, память O(batch))")
+    parser.add_argument("--bc-obs-cache", type=str, default="auto", choices=["auto", "on", "off"],
+                        help="выгружать obs из .npz в несжатый .npy-memmap рядом с датасетом "
+                             "(numpy не умеет mmap внутри zip: без этого большой датасет грузится "
+                             "в RAM целиком). auto — при obs > 1.5 ГБ, off — как раньше")
+    parser.add_argument("--bc-max-examples", type=int, default=None,
+                        help="ограничить число обучающих примеров BC (например 300000: у 3.27M "
+                             "датасета 15 эпох — это часы на CPU и почти всегда избыточно)")
+    parser.add_argument("--bc-progress-every", type=int, default=200,
+                        help="печатать прогресс BC каждые N батчей (0 — выключить)")
+    parser.add_argument("--no-bc-checkpoint", action="store_false", dest="bc_checkpoint_every_epoch",
+                        default=True,
+                        help="не сохранять веса BC после каждой эпохи (по умолчанию сохраняются: "
+                             "многочасовой прогон не должен теряться при обрыве)")
     parser.add_argument("--bc-keep-optimizer", action="store_false", dest="bc_reset_optimizer",
                         default=True, help="не пересоздавать оптимизатор в начале BC (продолжить с чужими моментами)")
     parser.add_argument("--pretrain-battles", type=int, default=0)
@@ -1676,6 +1711,10 @@ if __name__ == "__main__":
         bc_lr=args.bc_lr, bc_lr_final=args.bc_lr_final, bc_lr_schedule=args.bc_lr_schedule,
         bc_eps=args.bc_eps, bc_lr_value=args.bc_lr_value, bc_adapt=args.bc_adapt,
         bc_reset_optimizer=args.bc_reset_optimizer,
+        bc_normalize_mode=args.bc_normalize_mode, bc_obs_cache=args.bc_obs_cache,
+        bc_max_examples=args.bc_max_examples,
+        bc_progress_every=args.bc_progress_every,
+        bc_checkpoint_every_epoch=args.bc_checkpoint_every_epoch,
         eval_battles=args.eval_battles,
         skip_eval=args.skip_eval,
         features_dim=args.features_dim,
