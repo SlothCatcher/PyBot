@@ -172,7 +172,13 @@ class PolicyPlayer(FusionInfoParser, Player):
         moves_base_power = -np.ones(4)
         moves_dmg_multiplier = np.ones(4)
         type_chart = GenData.from_gen(battle.gen).type_chart
-        for i, move in enumerate(battle.available_moves):
+        # слоты приёмов = раскладка действий 6..9 (known_moves[:4]): available_moves короче и
+        # без «дыр», когда часть приёмов выключена (PP=0/Disable/Taunt/Choice-lock)
+        try:
+            from agents.features import move_slots_for_action as _slots_for_action
+        except ImportError:
+            from features import move_slots_for_action as _slots_for_action  # type: ignore
+        for i, move in enumerate(_slots_for_action(battle)):
             moves_base_power[i] = move.base_power / 100
             if battle.opponent_active_pokemon is not None:
                 # безопасный расчёт: при неизвестном втором типе (??? / STELLAR) иммунитет

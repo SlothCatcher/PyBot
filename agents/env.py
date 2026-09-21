@@ -12,7 +12,7 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.monitor import Monitor
 
 from .config import BATTLE_FORMAT, N_FEATURES, QUALIFIED_PREFIX
-from .features import _move_wasted_flag, embed_battle_with_fusion
+from .features import _move_wasted_flag, embed_battle_with_fusion, move_slots_for_action
 
 try:
     from .type_utils import damage_multiplier_safe, summary_line
@@ -1250,15 +1250,11 @@ class ExampleEnv(SinglesEnv):
     def _moves_for_action(battle) -> list:
         """Приёмы в том же порядке, что использует SinglesEnv.action_to_order.
 
-        poke-env берёт known_moves активного (первые 4), а если доступен ровно один приём,
-        которого нет среди известных — именно его. Повторяем ровно эту логику, иначе
-        бухгалтерия wasted-штрафа разъедется с реально выбранным приёмом.
+        Тонкая обёртка над features.move_slots_for_action: логика раскладки слотов живёт в
+        ОДНОМ месте, потому что её используют и бухгалтерия награды, и признаки (иначе
+        wasted-штраф и признаки в слотах разъедутся с реально выбранным приёмом).
         """
-        known_moves = list(getattr(getattr(battle, "active_pokemon", None), "moves", {}).values())[:4]
-        avail = list(getattr(battle, "available_moves", []) or [])
-        if len(avail) == 1 and avail[0].id not in [m.id for m in known_moves]:
-            return avail
-        return known_moves
+        return move_slots_for_action(battle)
 
     def action_mix(self) -> dict:
         """Счётчик типов действий НАШЕЙ стороны: switch/move/tera/unknown (диагностика «только атаки»).

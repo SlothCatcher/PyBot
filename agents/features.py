@@ -1182,6 +1182,53 @@ def _move_wasted_flag(move, battle) -> float:
     return 0.0
 
 
+def move_slots_for_action(battle) -> list:
+    """Приёмы в том порядке, которому соответствуют действия 6..9 (и 22..25) poke-env.
+
+    Эталон — `poke_env.environment.singles_env.SinglesEnv` (action_to_order / order_to_action /
+    get_action_mask):
+
+        known_moves = list(battle.active_pokemon.moves.values())[:4]
+        mvs = battle.available_moves if (len(available_moves) == 1
+                                         and available_moves[0].id not in known_ids) else known_moves
+
+    `battle.available_moves` — НЕ тот список, который нумеруют действия: он короче и без «дыр»
+    (сервер присылает только невыключенные приёмы: PP=0, Disable, Taunt, Choice-lock, Heal Block,
+    Torment, ...). Маска и action_to_order при этом всегда нумеруют СЛОТЫ known_moves, поэтому
+    `enumerate(battle.available_moves)` сдвигал признаки: при выключенном приёме №2 слот 1
+    описывал приём №3, а слот 2 — приём №4, тогда как легальные действия 8/9 указывали на
+    приёмы №3/№4, т.е. сеть видела характеристики не тех вариантов, что реально выбирала.
+
+    Возвращаем ровно список слотов действий (длиной не больше 4); пустые слоты остаются
+    дефолтными у вызывающего.
+    """
+    pokemon = getattr(battle, "active_pokemon", None)
+    if pokemon is None:
+        known_moves = []
+    else:
+        known_moves = list((getattr(pokemon, "moves", {}) or {}).values())[:4]
+    avail = list(getattr(battle, "available_moves", None) or [])
+    if len(avail) == 1 and avail[0].id not in [m.id for m in known_moves]:
+        # редкий случай poke-env: доступен ровно один приём, которого нет среди известных
+        return avail
+    return known_moves
+
+
+def move_slot_index(battle, move_id: str):
+    """Индекс слота (0..3) для id приёма в раскладке действий, либо None."""
+    mid = str(move_id or "").lower()
+    for i, move in enumerate(move_slots_for_action(battle)):
+        if str(getattr(move, "id", "") or "").lower() == mid:
+            return i
+    return None
+
+
+def available_move_ids(battle) -> set:
+    """id приёмов, которые СЕЙЧАС разрешены сервером (для флага wasted недоступных слотов)."""
+    return {str(getattr(m, "id", "") or "").lower()
+            for m in (getattr(battle, "available_moves", None) or [])}
+
+
 def _damage_block(battle, our_fusion, opp_fusion, our_team_fusions=None, opp_team_fusions=None) -> np.ndarray:
     """Признаки потенциального урона: по приёмам активного, входящий удар и матрицы 6x6.
 
@@ -1207,7 +1254,9 @@ def _damage_block(battle, our_fusion, opp_fusion, our_team_fusions=None, opp_tea
         opp_active = prepare_mon(getattr(battle, "opponent_active_pokemon", None), opp_fusion)
 
         # --- 1) по приёмам нашего активного против их активного ---
-        moves = list(getattr(battle, "available_moves", []) or [])[:4]
+        # слоты приёмов — как у действий 6..9 (known_moves), а не порядок available_moves:
+        # иначе урон в слоте i описывал не тот приём, на который указывает действие 6+i
+        moves = move_slots_for_action(battle)
         if our_active is not None and opp_active is not None:
             hp_now, hp_max = opp_active["hp_now"], opp_active["hp_max"]
             for i, move in enumerate(moves):
@@ -1334,7 +1383,13 @@ def embed_battle_with_fusion(battle, our_fusion, opp_fusion, our_protected_last_
     moves_category = np.zeros((4, 3), dtype=np.float32)
     type_chart = GenData.from_gen(battle.gen).type_chart
 
-    for i, move in enumerate(battle.available_moves):
+    # Слоты приёмов нумеруются как действия poke-env (known_moves[:4]), а не как
+    # battle.available_moves: если часть приёмов выключена (PP=0/Disable/Taunt/Choice-lock),
+    # available_moves короче и без «дыр», и признаки в слотах разъезжались с действиями
+    # 6..9/22..25 (см. move_slots_for_action).
+    _slots = move_slots_for_action(battle)
+    _avail_ids = available_move_ids(battle)
+    for i, move in enumerate(_slots):
         moves_base_power[i] = move.base_power / 100
         raw_acc = move.accuracy
         if raw_acc is True:
@@ -1344,7 +1399,12 @@ def embed_battle_with_fusion(battle, our_fusion, opp_fusion, our_protected_last_
         else:
             moves_accuracy[i] = raw_acc / 100.0 if raw_acc > 1.0 else raw_acc
         moves_pp_frac[i] = move.current_pp / max(move.max_pp, 1)
-        moves_wasted[i] = _move_wasted_flag(move, battle)
+        if str(getattr(move, "id", "") or "").lower() in _avail_ids:
+            moves_wasted[i] = _move_wasted_flag(move, battle)
+        else:
+            # приём есть в мувсете, но сервер его сейчас не разрешает (PP=0, Disable, Taunt,
+            # Choice-lock, Heal Block, Torment) — для действия это ровно «бесполезен сейчас»
+            moves_wasted[i] = 1.0
         if battle.opponent_active_pokemon is not None:
             # FIX: раньше при KeyError писался нейтрал 1.0, из-за чего модель не видела
             # иммунитет (Electric vs Ground-фьюжн со вторым типом "???"). Теперь 0.0 сохраняется.

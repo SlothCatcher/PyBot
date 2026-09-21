@@ -155,7 +155,12 @@ class TypeDiagPlayer(PolicyPlayer):
         return SinglesEnv.action_to_order(action, battle)
 
     def _log_decision(self, battle, action: int):
-        moves = list(getattr(battle, "available_moves", []) or [])
+        # СЛОТЫ действий (known_moves[:4]), а не available_moves: у SinglesEnv действие >= 6 —
+        # это приём со слотом (action-6)%4, а 0..5 — свитч. Прежняя логика
+        # `if action < len(available_moves)` и нумерация effs по available_moves путали
+        # выбранный приём (диагностика приписывала ходу чужой приём).
+        from agents.features import move_slots_for_action
+        moves = move_slots_for_action(battle)
         opp = battle.opponent_active_pokemon
         t1, t2 = _type_pair(opp)
         pair = f"{t1}/{t2}"
@@ -187,21 +192,23 @@ class TypeDiagPlayer(PolicyPlayer):
 
         # выбранный приём
         chosen = None
-        if action < len(moves):
-            chosen = effs[action]
-            m, mult, unknown, damaging = chosen
-            self.stats["chosen_moves"][str(getattr(m, "id", "?"))] += 1
-            if damaging:
-                self.stats["damaging_chosen"] += 1
-                if mult == 0:
-                    self.stats["immune_chosen"] += 1
-                    self.stats["immune_matchups"][f"{getattr(m, 'id', '?')} vs {pair}"] += 1
-                best = max([e[1] for e in effs if e[3]] or [0.0])
-                if mult < best:
-                    self.stats["best_missed"] += 1
-            if unknown and mult == 0:
-                # именно этот случай старый патч превращал в 1.0
-                self.stats["would_mask"] += 1
+        if action >= 6:
+            slot = (action - 6) % 4
+            if slot < len(effs):
+                chosen = effs[slot]
+                m, mult, unknown, damaging = chosen
+                self.stats["chosen_moves"][str(getattr(m, "id", "?"))] += 1
+                if damaging:
+                    self.stats["damaging_chosen"] += 1
+                    if mult == 0:
+                        self.stats["immune_chosen"] += 1
+                        self.stats["immune_matchups"][f"{getattr(m, 'id', '?')} vs {pair}"] += 1
+                    best = max([e[1] for e in effs if e[3]] or [0.0])
+                    if mult < best:
+                        self.stats["best_missed"] += 1
+                if unknown and mult == 0:
+                    # именно этот случай старый патч превращал в 1.0
+                    self.stats["would_mask"] += 1
 
         # раз в бой печатаем типы (видно "???")
         tag = getattr(battle, "battle_tag", "?")
@@ -215,7 +222,12 @@ class TypeDiagPlayer(PolicyPlayer):
             moves_str = ", ".join(
                 f"{getattr(m, 'id', '?')}({mult:g}{'?' if unk else ''})" for m, mult, unk, dmg in effs
             )
-            ch = f"{getattr(chosen[0], 'id', '?')}={chosen[1]:g}" if chosen else f"switch(idx {action})"
+            if chosen:
+                ch = f"{getattr(chosen[0], 'id', '?')}={chosen[1]:g}"
+            elif action < 6:
+                ch = f"switch(idx {action})"
+            else:
+                ch = f"move вне слотов(idx {action})"     # маска такое действие не разрешает
             print(f"[diag] ход {self.stats['turns']:3d} vs {pair:28s} выбрано {ch:22s} | доступно: {moves_str}")
 
     # --- сверки с логом сервера -------------------------------------------------
@@ -278,10 +290,13 @@ class TypeDiagPlayer(PolicyPlayer):
             our_team_fusions=self.get_team_fusion_map(battle, is_ours=True),
             opp_team_fusions=self.get_team_fusion_map(battle, is_ours=False),
         )
-        for i, m in enumerate(moves):
-            if 4 + i >= len(raw):
-                break
-            obs_mult = float(raw[4 + i])           # moves_dmg_multiplier[i]
+        from agents.features import move_slot_index
+        for m in moves:
+            # индекс слота именно ЭТОГО приёма (не порядковый номер в available_moves)
+            i = move_slot_index(battle, getattr(m, "id", ""))
+            if i is None or 4 + i >= len(raw):
+                continue
+            obs_mult = float(raw[4 + i])           # moves_dmg_multiplier[слот]
             srv_mult = float(damage_multiplier_safe(getattr(m, "type", None), s1, s2))
             self.stats["obs_checks"] += 1
             if abs(obs_mult - srv_mult) > 1e-6:

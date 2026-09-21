@@ -32,12 +32,25 @@ def check(label, got, want):
     print(f"{'OK  ' if ok else 'FAIL'} {label}: got={got!r} want={want!r}")
 
 
-def mk_battle():
+def mk_battle(our_moves=()):
     b = Battle(battle_tag=TAG, username="Me", logger=logging.getLogger("quiet"), gen=9)
     for m in (["", "player", "p1", "Me", "", ""], ["", "player", "p2", "Opp", "", ""], ["", "start"],
               ["", "switch", "p1a: Our", "stonjourner, L50, M", "100/100"],
               ["", "switch", "p2a: +Snorlax", "snorlax, L50, M", "100/100"]):
         b.parse_message(m)
+    if our_moves:
+        # мувсет активного приходит в request (как в живом бою): признаки берут СЛОТЫ известных
+        # приёмов, поэтому в фикстуре их надо завести, а не только _available_moves
+        b.parse_request({
+            "active": [{"moves": [{"move": m.id.capitalize(), "id": m.id, "pp": 16, "maxpp": 16,
+                                   "target": "normal", "disabled": False} for m in our_moves]}],
+            "side": {"id": "p1", "name": "Me", "pokemon": [
+                {"ident": "p1: Our", "details": "stonjourner, L50, M", "condition": "100/100",
+                 "active": True,
+                 "stats": {"atk": 250, "def": 250, "spa": 250, "spd": 250, "spe": 250},
+                 "moves": [m.id for m in our_moves], "baseAbility": "klutz", "item": "leftovers",
+                 "pokeball": "pokeball", "ability": "klutz"}]},
+            "rqid": 1})
     return b
 
 
@@ -101,7 +114,7 @@ def test_obs_uses_server_types():
     print("--- 2. obs против серверных типов ---")
     moves = [Move("earthquake", gen=9), Move("thunderbolt", gen=9)]
     # бой синхронизирован с сервером -> obs корректен
-    b = mk_battle()
+    b = mk_battle(our_moves=moves)
     b.parse_message(["", "-start", "p2a: +Snorlax", "typechange", "Poison/Normal", "[silent]"])
     set_server_msg("p2a: +Snorlax", "Poison/Normal")
     b._available_moves = list(moves)
@@ -110,7 +123,7 @@ def test_obs_uses_server_types():
     check("obs по серверным типам (earthquake vs Poison/Normal = 2x)", (p.stats["obs_checks"], p.stats["obs_stale"]), (2, 0))
 
     # бой отстал: типы боя = базовые (Normal), сервер = Poison/Normal -> obs устарел
-    b = mk_battle()
+    b = mk_battle(our_moves=moves)
     b._available_moves = list(moves)
     set_server_msg("p2a: +Snorlax", "Poison/Normal")
     p = mk_player()
