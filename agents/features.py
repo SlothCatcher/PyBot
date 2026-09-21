@@ -34,13 +34,13 @@ except ImportError:  # запуск модуля вне пакета
         their_known_moves_damage,
     )
 
+# Размерность obs объявлена в agents/dims.py (без импортов) — см. комментарий там о цикле
+# config -> action_space -> features. Никаких fallback-констант: расхождение ловят
+# obs_layout()/embed_battle_with_fusion сразу, а не на этапе загрузки чекпоинта.
 try:
-    from .config import N_FEATURES          # размерность obs: нужна для проверки раскладки
+    from .dims import N_FEATURES
 except ImportError:  # запуск модуля вне пакета
-    try:
-        from config import N_FEATURES       # type: ignore
-    except Exception:                       # pragma: no cover — тесты без config
-        N_FEATURES = 991
+    from dims import N_FEATURES       # type: ignore
 
 _STATUSES = [None, Status.BRN, Status.PAR, Status.SLP, Status.FRZ, Status.PSN, Status.TOX]
 
@@ -133,6 +133,266 @@ _KEY_ABILITIES = [
 ]
 _ABILITY_INDEX = {a:i for i,a in enumerate(_KEY_ABILITIES)}
 _PHAZE_MOVES = {"roar","whirlwind","dragontail","circlethrow","yawn"}
+# Полная оценка приёмов (см. AUDIT 33): 7 статов, включая accuracy/evasion — бусты по ним
+# в старых 5-флаговых блоках не были видны вовсе (Hone Claws/Sand Attack и т.п.).
+_BOOST_KEYS_EXT = _BOOST_KEYS + ["accuracy", "evasion"]
+_BOOST_KEY_INDEX = {k: i for i, k in enumerate(_BOOST_KEYS_EXT)}
+# Хазарды, которые приём СТАВИТ (sideCondition в данных Showdown): sr/spikes/tspikes/web.
+_HAZARD_SET_KEYS = ["stealthrock", "spikes", "toxicspikes", "stickyweb"]
+# Флаги флагов-взаимодействий со способностями: Bulletproof/Sharpness/Strong Jaw/Iron Fist/
+# Mega Launcher/Wind Rider/Dancer (порошковые — «на кого действует Powder»).
+_ABILITY_MOVE_FLAGS = ["bullet", "slicing", "bite", "punch", "pulse", "wind", "dance", "powder"]
+# Приёмы, накладывающие статус НА СЕБЯ, у которых в данных нет ни self.status, ни secondary
+# (Rest применяет сон через onHit, а не через поля данных).
+_SELF_STATUS_MOVES = {"rest": 1.0}
+# Приёмы с зарядкой (страховка, если в данных нет flags.charge — например, кастомные моды)
+_CHARGE_MOVES = {
+    "solarbeam", "solarblade", "fly", "dig", "dive", "bounce", "phantomforce", "shadowforce",
+    "skyattack", "skullbash", "razorwind", "meteorbeam", "electroshot", "geomancy",
+    "freezeshock", "iceburn", "iceball",
+}
+
+
+def _chance_frac(sec: dict) -> float:
+    """chance из secondary-эффекта как доля 0..1 (по умолчанию 100%)."""
+    try:
+        c = sec.get("chance", 100)
+        c = float(c)
+        return float(np.clip(c / 100.0, 0.0, 1.0)) if c > 1 else float(np.clip(c, 0.0, 1.0))
+    except Exception:
+        return 1.0
+
+
+def _move_boost_magnitude(move, kind: str = "own") -> np.ndarray:
+    """Сколько стадий бустов/дебаффов даёт приём, по 7 статам (atk..spe + accuracy/evasion).
+
+    kind="own"  — изменения НАШИХ статов (в т.ч. отрицательные: Close Combat/Overheat),
+    kind="opp"  — изменения статов СОПЕРНИКА (обычно отрицательные: Memento/Growl).
+
+    Почему магнитуды, а не флаги: флаг говорил только «какой-то буст в этот стат», а модель
+    не могла отличить Swords Dance (+2 atk) от Howl (+1 atk) и не видела, что Close Combat
+    СНИЖАЕТ свои def/spd. Secondary-эффекты взвешиваются их шансом (ожидаемое изменение).
+    """
+    vec = np.zeros(len(_BOOST_KEYS_EXT), dtype=np.float32)
+    if move is None:
+        return vec
+    try:
+        entry = getattr(move, "entry", {}) or {}
+        # Цели «нашей» стороны: self (сам), allies/allySide/allyTeam (Howl, Tailwind, экраны).
+        # Раньше проверялся только "self", и Howl (+1 atk союзникам) не давал признака вовсе.
+        target_own_side = str(entry.get("target", "")).lower() in (
+            "self", "allies", "allyside", "allyteam")
+
+        def _add(boosts, chance=1.0):
+            if not isinstance(boosts, dict):
+                return
+            for key, val in boosts.items():
+                idx = _BOOST_KEY_INDEX.get(str(key))
+                if idx is None:
+                    continue
+                try:
+                    vec[idx] += float(val) * float(chance)
+                except Exception:
+                    continue
+
+        # прямые изменения статов цели: для self-targeting это НАШИ статы, иначе — соперника
+        boosts = getattr(move, "boosts", None)
+        if boosts is None:
+            boosts = entry.get("boosts")
+        if target_own_side:
+            if kind == "own":
+                _add(boosts)
+        else:
+            if kind == "opp":
+                _add(boosts)
+        # self.boosts — изменения НАШИХ статов самим приёмом (Close Combat, Overheat)
+        if kind == "own":
+            self_boost = getattr(move, "self_boost", None)
+            if self_boost is None:
+                self_entry = entry.get("self")
+                if isinstance(self_entry, dict):
+                    self_boost = self_entry.get("boosts")
+                if self_boost is None and isinstance(entry.get("selfBoost"), dict):
+                    self_boost = entry["selfBoost"].get("boosts")
+            _add(self_boost)
+        # secondary-эффекты (взвешены шансом)
+        for sec in getattr(move, "secondary", []) or []:
+            if not isinstance(sec, dict):
+                continue
+            ch = _chance_frac(sec)
+            if kind == "own":
+                own_sec = sec.get("self")
+                if isinstance(own_sec, dict):
+                    _add(own_sec.get("boosts"), ch)
+            else:
+                _add(sec.get("boosts"), ch)
+        if kind == "opp" and not isinstance(move.secondary, list):
+            for sec in entry.get("secondaries", []) or []:
+                if isinstance(sec, dict) and "self" not in sec:
+                    _add(sec.get("boosts"), _chance_frac(sec))
+    except Exception:
+        pass
+    return vec
+
+
+def _move_status_self_prob(move) -> float:
+    """Шанс наложить статус НА СЕБЯ (Rest — 100% сна; rare self-secondary)."""
+    if move is None:
+        return 0.0
+    try:
+        mid = str(getattr(move, "id", "") or "").lower().replace(" ", "").replace("-", "")
+        if mid in _SELF_STATUS_MOVES:
+            return float(_SELF_STATUS_MOVES[mid])
+        entry = getattr(move, "entry", {}) or {}
+        self_entry = entry.get("self")
+        if isinstance(self_entry, dict) and self_entry.get("status"):
+            return 1.0
+        best = 0.0
+        for sec in getattr(move, "secondary", []) or []:
+            if not isinstance(sec, dict):
+                continue
+            own_sec = sec.get("self")
+            if isinstance(own_sec, dict) and own_sec.get("status"):
+                best = max(best, _chance_frac(sec))
+        if best == 0.0:
+            for sec in entry.get("secondaries", []) or []:
+                own_sec = sec.get("self") if isinstance(sec, dict) else None
+                if isinstance(own_sec, dict) and own_sec.get("status"):
+                    best = max(best, _chance_frac(sec))
+        return float(np.clip(best, 0.0, 1.0))
+    except Exception:
+        return 0.0
+
+
+def _move_charge_turns(move) -> float:
+    """Сколько ходов приём заряжается (Solar Beam/Fly/Dig/Geomancy -> 1)."""
+    if move is None:
+        return 0.0
+    try:
+        entry = getattr(move, "entry", {}) or {}
+        flags = entry.get("flags") or {}
+        if flags.get("charge"):
+            return 1.0
+        if entry.get("charge"):
+            return 1.0
+        mid = str(getattr(move, "id", "") or "").lower().replace(" ", "").replace("-", "")
+        if mid in _CHARGE_MOVES:
+            return 1.0
+    except Exception:
+        pass
+    return 0.0
+
+
+def _move_recharge_flag(move) -> float:
+    """Приём требует хода на перезарядку (Hyper Beam и родня)."""
+    if move is None:
+        return 0.0
+    try:
+        entry = getattr(move, "entry", {}) or {}
+        flags = entry.get("flags") or {}
+        if flags.get("recharge"):
+            return 1.0
+        self_entry = entry.get("self")
+        if isinstance(self_entry, dict) and self_entry.get("volatileStatus") == "mustrecharge":
+            return 1.0
+    except Exception:
+        pass
+    return 0.0
+
+
+def _move_revive_frac(move) -> float:
+    """Возрождение союзного покемона: доля HP, с которой он возвращается (Revival Blessing)."""
+    if move is None:
+        return 0.0
+    try:
+        entry = getattr(move, "entry", {}) or {}
+        if str(entry.get("slotCondition", "")).lower() == "revivalblessing":
+            heal = entry.get("heal")
+            if isinstance(heal, (list, tuple)) and len(heal) == 2 and heal[1]:
+                return float(np.clip(heal[0] / heal[1], 0, 1))
+            return 0.5
+        mid = str(getattr(move, "id", "") or "").lower().replace(" ", "").replace("-", "")
+        if mid == "revivalblessing":
+            return 0.5
+        if entry.get("revive"):
+            try:
+                return float(np.clip(float(entry["revive"]), 0, 1))
+            except Exception:
+                return 0.5
+    except Exception:
+        pass
+    return 0.0
+
+
+def _move_faint_user_flag(move) -> float:
+    """Приём роняет СВОЕГО покемона (Explosion/Self-Destruct/Memento/Healing Wish)."""
+    if move is None:
+        return 0.0
+    try:
+        entry = getattr(move, "entry", {}) or {}
+        sd = entry.get("selfdestruct")
+        if sd in ("always", "ifHit", True) or sd == 1:
+            return 1.0
+        flags = entry.get("flags") or {}
+        if flags.get("selfdestruct"):
+            return 1.0
+    except Exception:
+        pass
+    return 0.0
+
+
+def _move_hazard_set_flags(move) -> np.ndarray:
+    """Какие хазарды приём СТАВИТ: [stealthrock, spikes, toxicspikes, stickyweb]."""
+    vec = np.zeros(len(_HAZARD_SET_KEYS), dtype=np.float32)
+    if move is None:
+        return vec
+    try:
+        entry = getattr(move, "entry", {}) or {}
+        cond = str(entry.get("sideCondition", "") or "").lower()
+        if not cond:
+            mid = str(getattr(move, "id", "") or "").lower().replace(" ", "").replace("-", "")
+            cond = mid if mid in _HAZARD_SET_KEYS else ""
+        if cond in _HAZARD_SET_KEYS:
+            vec[_HAZARD_SET_KEYS.index(cond)] = 1.0
+    except Exception:
+        pass
+    return vec
+
+
+def _move_ability_flags(move) -> np.ndarray:
+    """Флаги, через которые приём взаимодействует со способностями (Bulletproof, Sharpness,
+    Strong Jaw, Iron Fist, Mega Launcher, Wind Rider, Dancer, Powder)."""
+    vec = np.zeros(len(_ABILITY_MOVE_FLAGS), dtype=np.float32)
+    if move is None:
+        return vec
+    try:
+        entry = getattr(move, "entry", {}) or {}
+        flags = entry.get("flags") or {}
+        for i, name in enumerate(_ABILITY_MOVE_FLAGS):
+            if flags.get(name):
+                vec[i] = 1.0
+    except Exception:
+        pass
+    return vec
+
+
+def _move_drain_pct(move) -> float:
+    """Доля УРОНА, возвращаемая в HP (Giga Drain и родня); отдельно от прямого heal."""
+    if move is None:
+        return 0.0
+    try:
+        d = getattr(move, "drain", 0.0)
+        if isinstance(d, (int, float)) and d > 0:
+            return float(np.clip(d, 0, 1))
+        entry = getattr(move, "entry", {}) or {}
+        d = entry.get("drain")
+        if isinstance(d, (list, tuple)) and len(d) == 2 and d[1]:
+            return float(np.clip(d[0] / d[1], 0, 1))
+        if isinstance(d, (int, float)) and d > 0:
+            return float(np.clip(d, 0, 1))
+    except Exception:
+        pass
+    return 0.0
 _SCREEN_SIDE = [SideCondition.REFLECT, SideCondition.LIGHT_SCREEN, SideCondition.AURORA_VEIL]
 
 def _revealed_moves_frac(pokemon) -> float:
@@ -1309,10 +1569,31 @@ OBS_BLOCKS = (
     ("protect", 2, "context"),
     ("damage", DAMAGE_BLOCK_SIZE, "damage"),
     ("type_matchup", TYPE_MATCHUP_BLOCK_SIZE, "type_matchup"),
+    # --- полная оценка приёмов (AUDIT 33): только ХВОСТ, чтобы старые колонки не сдвигались ---
+    ("moves_boost_own_stages", 4 * 7, "per_move"),        # магнитуды по 7 статам (+/-, с шансом)
+    ("moves_drop_opp_stages", 4 * 7, "per_move"),         # изменения статов соперника
+    ("moves_status_self", 4, "per_move"),              # шанс статуса НА СЕБЯ (Rest)
+    ("moves_charge_turns", 4, "per_move"),             # сколько ходов заряжается
+    ("moves_recharge", 4, "per_move"),                 # тратит следующий ход (Hyper Beam)
+    ("moves_revive", 4, "per_move"),                   # возрождение союзника (доля HP)
+    ("moves_faint_user", 4, "per_move"),               # роняет своего (Explosion/Memento)
+    ("moves_drain", 4, "per_move"),                    # доля урона в HP (Giga Drain)
+    ("moves_hazard_set", 4 * 4, "per_move"),           # sr/spikes/tspikes/web
+    ("moves_ability_flags", 4 * len(_ABILITY_MOVE_FLAGS), "per_move"),  # bullet/punch/slicing/...
 )
 
 # сколько признаков кандидата уходит в его embedding
-MOVE_FEATURES_PER_SLOT = 30            # сумма per_move-блоков / 4
+# сумма per_move-блоков / 4 — считается из OBS_BLOCKS, чтобы не разъезжаться с раскладкой
+MOVE_FEATURES_PER_SLOT = int(sum(w for _n, w, k in OBS_BLOCKS if k == "per_move") / 4)
+# Хвостовые блоки «полной оценки приёмов» (AUDIT 33). Отдельная константа нужна тестам
+# миграции чекпоинтов: они сравнивают рост obs_dim с суммой блоков.
+MOVE_EFFECT_TAIL_BLOCKS = (
+    "moves_boost_own_stages", "moves_drop_opp_stages", "moves_status_self", "moves_charge_turns",
+    "moves_recharge", "moves_revive", "moves_faint_user", "moves_drain", "moves_hazard_set",
+    "moves_ability_flags",
+)
+MOVE_EFFECT_BLOCK_SIZE = int(sum(w for n, w, _k in OBS_BLOCKS if n in MOVE_EFFECT_TAIL_BLOCKS))
+assert MOVE_EFFECT_BLOCK_SIZE == 128, MOVE_EFFECT_BLOCK_SIZE
 MOVE_DAMAGE_TRIPLE = 3                 # damage[3*i:3*i+3]: min_frac, max_frac, guaranteed_ko
 MOVE_CAND_FLAGS = 2                    # can_tera, is_tera
 MOVE_FEATURES_DIM = MOVE_FEATURES_PER_SLOT + MOVE_DAMAGE_TRIPLE                    # 33 без флагов
@@ -1653,6 +1934,17 @@ def embed_battle_with_fusion(battle, our_fusion, opp_fusion, our_protected_last_
     moves_multihit = np.zeros(4, dtype=np.float32)
     moves_type = np.zeros(4, dtype=np.float32)
     moves_category = np.zeros((4, 3), dtype=np.float32)
+    # --- полная оценка эффектов приёма (AUDIT 33) ---
+    moves_boost_own_stages = np.zeros((4, 7), dtype=np.float32)      # +7: accuracy/evasion
+    moves_drop_opp_stages = np.zeros((4, 7), dtype=np.float32)
+    moves_status_self = np.zeros(4, dtype=np.float32)
+    moves_charge_turns = np.zeros(4, dtype=np.float32)
+    moves_recharge = np.zeros(4, dtype=np.float32)
+    moves_revive = np.zeros(4, dtype=np.float32)
+    moves_faint_user = np.zeros(4, dtype=np.float32)
+    moves_drain = np.zeros(4, dtype=np.float32)
+    moves_hazard_set = np.zeros((4, len(_HAZARD_SET_KEYS)), dtype=np.float32)
+    moves_ability_flags = np.zeros((4, len(_ABILITY_MOVE_FLAGS)), dtype=np.float32)
     type_chart = GenData.from_gen(battle.gen).type_chart
 
     # Слоты приёмов нумеруются как действия poke-env (known_moves[:4]), а не как
@@ -1701,6 +1993,16 @@ def embed_battle_with_fusion(battle, our_fusion, opp_fusion, our_protected_last_
         moves_multihit[i] = _move_multihit_flag(move)
         moves_type[i] = _move_type_scalar(move)
         moves_category[i] = _move_category_vec(move)
+        moves_boost_own_stages[i] = _move_boost_magnitude(move, "own")
+        moves_drop_opp_stages[i] = _move_boost_magnitude(move, "opp")
+        moves_status_self[i] = _move_status_self_prob(move)
+        moves_charge_turns[i] = _move_charge_turns(move)
+        moves_recharge[i] = _move_recharge_flag(move)
+        moves_revive[i] = _move_revive_frac(move)
+        moves_faint_user[i] = _move_faint_user_flag(move)
+        moves_drain[i] = _move_drain_pct(move)
+        moves_hazard_set[i] = _move_hazard_set_flags(move)
+        moves_ability_flags[i] = _move_ability_flags(move)
 
     fainted_mon_team = len([mon for mon in battle.team.values() if mon.fainted]) / 6
     fainted_mon_opponent = len([mon for mon in battle.opponent_team.values() if mon.fainted]) / 6
@@ -1768,6 +2070,10 @@ def embed_battle_with_fusion(battle, our_fusion, opp_fusion, our_protected_last_
     moves_drop_opp_flat = moves_drop_opp.flatten()
     moves_hazard_clear_flat = moves_hazard_clear.flatten()
     moves_category_flat = moves_category.flatten()
+    moves_boost_own_stages_flat = moves_boost_own_stages.flatten()
+    moves_drop_opp_stages_flat = moves_drop_opp_stages.flatten()
+    moves_hazard_set_flat = moves_hazard_set.flatten()
+    moves_ability_flags_flat = moves_ability_flags.flatten()
     # Имена блоков нужны не для красоты: verify_obs_layout сверяет сборку с OBS_BLOCKS, на
     # которую опираются срезы кандидатов (режим embed). Молчаливый сдвиг блоков ловится здесь.
     named_blocks = [
@@ -1826,6 +2132,16 @@ def embed_battle_with_fusion(battle, our_fusion, opp_fusion, our_protected_last_
         ("protect", [our_protected_last_turn, opp_protected_last_turn]),
         ("damage", damage_feats),
         ("type_matchup", type_matchup_feats),
+        ("moves_boost_own_stages", moves_boost_own_stages_flat),
+        ("moves_drop_opp_stages", moves_drop_opp_stages_flat),
+        ("moves_status_self", moves_status_self),
+        ("moves_charge_turns", moves_charge_turns),
+        ("moves_recharge", moves_recharge),
+        ("moves_revive", moves_revive),
+        ("moves_faint_user", moves_faint_user),
+        ("moves_drain", moves_drain),
+        ("moves_hazard_set", moves_hazard_set_flat),
+        ("moves_ability_flags", moves_ability_flags_flat),
     ]
     verify_obs_layout(named_blocks)
     obs = np.concatenate(

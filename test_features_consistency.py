@@ -54,7 +54,7 @@ from agents.config import N_FEATURES
 from poke_env.data import GenData
 
 GENDATA_TYPE_CHART = GenData.from_gen(9).type_chart
-from agents.features import _TYPE_INDEX as TYPE_INDEX
+from agents.features import _TYPE_INDEX as TYPE_INDEX, MOVE_EFFECT_BLOCK_SIZE
 from agents.damage import DAMAGE_BLOCK_SIZE, EFFECT_FLAGS, FLAGS_BASE, MIRROR_BASE, TEAM_BASE
 from agents.features import (
     TYPE_MATCHUP_BASE, TYPE_MATCHUP_BLOCK_SIZE, _eff_types, _matchup_team_slots,
@@ -253,6 +253,10 @@ LAYOUT = [
     ("sub_damage", 2), ("restricted", 1), ("volatiles", 22), ("items", 22), ("bench", 400),
     ("vulnerability", 2), ("tera_meta", 3), ("is_tera", 2), ("tera_type", 19), ("protect", 2),
     ("damage", DAMAGE_BLOCK_SIZE), ("type_matchup", TYPE_MATCHUP_BLOCK_SIZE),
+    # AUDIT 33: полная оценка приёмов (только хвост, старые колонки не сдвинуты)
+    ("moves_boost_own_stages", 28), ("moves_drop_opp_stages", 28), ("moves_status_self", 4),
+    ("moves_charge_turns", 4), ("moves_recharge", 4), ("moves_revive", 4), ("moves_faint_user", 4),
+    ("moves_drain", 4), ("moves_hazard_set", 16), ("moves_ability_flags", 32),
 ]
 
 
@@ -287,8 +291,13 @@ def part1_layout():
              off["type_matchup"][0], TYPE_MATCHUP_BASE)
     check_eq("TYPE_MATCHUP_BASE = префикс + блок урона",
              MIN_PREFIX_OBS_DIM + DAMAGE_BLOCK_SIZE, TYPE_MATCHUP_BASE)
-    check_eq("блок типов соперника в хвосте (после него ничего нет)",
-             off["type_matchup"][1], N_FEATURES)
+    check_eq("блок типов соперника идёт сразу перед блоком полной оценки приёмов",
+             off["type_matchup"][1], off["moves_boost_own_stages"][0])
+    check_eq("блок типов соперника больше не последний: после него только хвост AUDIT 33",
+             off["type_matchup"][1], 991)
+    check_eq("хвост полной оценки приёмов кончается там же, где obs (N_FEATURES)",
+             off["moves_ability_flags"][1], N_FEATURES)
+    check_eq("размер хвоста полной оценки приёмов", N_FEATURES - 991, MOVE_EFFECT_BLOCK_SIZE)
     check_eq("TYPE_MATCHUP_BLOCK_SIZE = типы активного + 12 строк + 6 флагов",
              19 + 2 * 8 * 6 + 6, TYPE_MATCHUP_BLOCK_SIZE)
 
