@@ -922,6 +922,15 @@ def run(
     KEEP_OBS_STATS = bool(keep_obs_stats)
     # self-play оппоненты в env-процессах: нормализовать obs тем же способом, что и обучение
     os.environ["PYBOT_SELF_PLAY_NORM"] = "0" if no_normalize_bc else "1"
+    # РЕЖИМ ДЕЙСТВИЙ — до создания любых env. Было: в ветке без resume SubprocVecEnv создавался
+    # РАНЬШЕ, чем выставлялся режим, поэтому воркеры стартовали в indices (дефолт), а политика
+    # в главном процессе считала кандидатов в embed. Маска приезжала в нумерации team, свитч-
+    # действие j в воркере означало другого монстра — при внешне успешном обучении получался
+    # винрейт уровня случайной игры. Теперь режим выставляется здесь: он экспортируется в
+    # PYBOT_ACTION_MODE (наследуют дочерние процессы) и дополнительно передаётся в create_env.
+    from agents.action_space import set_action_mode as _set_action_mode, describe as _describe_mode
+    _mode = _set_action_mode(action_mode)
+    print(f"Режим действий: {_describe_mode()}")
     if not no_normalize_bc:
         try:
             # логируем один раз в главном процессе (в воркерах печать подавляется)
@@ -1076,7 +1085,8 @@ def run(
                     else:
                         setattr(ppo, attr, val)
         # создаём env заново; если был VecNormalize — загружаем (с миграцией 713->715 если нужно)
-        base_env = SubprocVecEnv([ExampleEnv.create_env for _ in range(num_envs)])
+        base_env = SubprocVecEnv([partial(ExampleEnv.create_env, action_mode=_mode)
+                                  for _ in range(num_envs)])
         if not no_normalize_bc:
             if os.path.isfile(VECNORM_PATH):
                 env = _migrate_vecnormalize_713_to_715(VECNORM_PATH, base_env)
@@ -1108,7 +1118,8 @@ def run(
                     icm_wrapper = None
     else:
         steps_done_holder = {"value": 0}
-        base_env = SubprocVecEnv([ExampleEnv.create_env for _ in range(num_envs)])
+        base_env = SubprocVecEnv([partial(ExampleEnv.create_env, action_mode=_mode)
+                                  for _ in range(num_envs)])
         if not no_normalize_bc:
             env = VecNormalize(base_env, norm_obs=True, norm_reward=norm_reward, gamma=0.99, norm_obs_keys=["observation"])
         else:
@@ -1134,13 +1145,8 @@ def run(
                     print(f"Не удалось включить ICM: {e}")
                     import traceback; traceback.print_exc()
                     icm_wrapper = None
-        # Режим действий: indices (раскладка poke-env) или embed (политика оценивает кандидатов
-        # по их признакам; свитч-действие j = j-й резерв в каноническом порядке bench-блока).
-        # Режим влияет на маску действий во ВСЕХ путях (env, игроки, диагностика) — он живёт в
-        # agents/action_space.py, а здесь задаётся один раз для всего прогона.
-        from agents.action_space import set_action_mode, describe as _describe_mode
-        _mode = set_action_mode(action_mode)
-        print(f"Режим действий: {_describe_mode()}")
+        # Режим действий уже выставлен в начале run() — до создания env (см. комментарий там),
+        # здесь только выбираем класс политики под режим.
         policy_class = MaskedActorCriticPolicy
         if _mode == "embed":
             from agents.policy import EmbeddedActorCriticPolicy
@@ -1497,7 +1503,8 @@ def run(
             _save_vecnorm(env, VECNORM_PATH)
             env.close()
             raw_env = SubprocVecEnv(
-                [partial(ExampleEnv.create_env, opponent_weights=current_weights) for _ in range(num_envs)]
+                [partial(ExampleEnv.create_env, opponent_weights=current_weights, action_mode=_mode)
+                 for _ in range(num_envs)]
             )
             try:
                 env = _migrate_vecnormalize_713_to_715(VECNORM_PATH, raw_env)
@@ -1509,7 +1516,8 @@ def run(
         else:
             env.close()
             raw_env = SubprocVecEnv(
-                [partial(ExampleEnv.create_env, opponent_weights=current_weights) for _ in range(num_envs)]
+                [partial(ExampleEnv.create_env, opponent_weights=current_weights, action_mode=_mode)
+                 for _ in range(num_envs)]
             )
             env = raw_env
         # --- ICM re-wrap для новой фазы (сохраняем тот же icm_module и optimizer) ---

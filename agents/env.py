@@ -212,6 +212,25 @@ def _make_self_play_opponents(model_dir: str = "models/", cache_dir: str | None 
                     _SELF_PLAY_LOAD_ERRORS_REPORTED.add(fname)
                     print(f"Failed to load qualified snapshot {fname}: {info.get('error')}")
                 continue
+            # Режим self-play снапшота обязан совпасть с режимом процесса: иначе он выбирает
+            # индекс в своей семантике (напр. indices-модель — индекс в порядке team), а
+            # маска/ордера в этом процессе — в текущей. Молча это деградирует обучение
+            # (соперник играет шумом), поэтому предупреждаем один раз на файл.
+            try:
+                from .checkpoint_utils import action_mode_from_checkpoint
+                from .action_space import get_action_mode
+
+                snap_mode = action_mode_from_checkpoint(join(model_dir, fname))
+                cur_mode = get_action_mode()
+                if snap_mode and snap_mode != cur_mode:
+                    key = f"mode:{fname}"
+                    if key not in _SELF_PLAY_LOAD_ERRORS_REPORTED:
+                        _SELF_PLAY_LOAD_ERRORS_REPORTED.add(key)
+                        print(f"self-play {fname}: режим {snap_mode}, а прогон в {cur_mode} — "
+                              f"этот соперник будет играть некорректно (пересоберите снапшоты "
+                              f"в текущем режиме или исключите файл)")
+            except Exception:
+                pass
             players.append(PolicyPlayer(policy=snap.policy, battle_format=BATTLE_FORMAT,
                                         start_listening=False,
                                         obs_normalizer=_self_play_obs_normalizer()))
@@ -268,6 +287,22 @@ class DecisionWrapper(SingleAgentWrapper):
         return obs, total, term, trunc, info
 
 
+def _apply_worker_action_mode(action_mode: str | None) -> str | None:
+    """Выставить режим действий внутри процесса-воркера (см. ExampleEnv.create_env).
+
+    Возвращает фактический режим (None, если ничего не меняли). Импорт локальный: agents.env
+    не должен тянуть action_space при обычном импорте (там настраивается poke-env).
+    """
+    if action_mode is None:
+        return None
+    try:
+        from .action_space import set_action_mode, get_action_mode
+    except ImportError:  # pragma: no cover — запуск модуля вне пакета
+        from action_space import set_action_mode, get_action_mode  # type: ignore
+    set_action_mode(action_mode)
+    return get_action_mode()
+
+
 class ExampleEnv(SinglesEnv):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -287,7 +322,20 @@ class ExampleEnv(SinglesEnv):
         self._action_counts: dict[str, int] = {"switch": 0, "move": 0, "tera": 0, "unknown": 0}
 
     @classmethod
-    def create_env(cls, opponent_weights: dict[str, float] | None = None) -> Monitor:
+    def create_env(cls, opponent_weights: dict[str, float] | None = None,
+                   action_mode: str | None = None) -> Monitor:
+        """Фабрика env для SubprocVecEnv. `action_mode` применяется В ВОРКЕРЕ первой строкой.
+
+        Зачем явный аргумент, если режим и так экспортируется в PYBOT_ACTION_MODE: env-воркеры
+        создаются ДО того, как в главном процессе выставится режим (и со spawn переимпортируют
+        модули), поэтому полагаться только на переменную окружения нельзя. Режим, переданный
+        аргументом, доезжает до воркера через pickle и не зависит от порядка инициализации.
+        """
+        _apply_worker_action_mode(action_mode)
+        return cls._build_env(opponent_weights)
+
+    @classmethod
+    def _build_env(cls, opponent_weights: dict[str, float] | None = None) -> Monitor:
         env = cls(battle_format=BATTLE_FORMAT, log_level=40, open_timeout=None)
         # Тренируем только против сильного соперника: Random/Max слишком легкие,
         # агент находит читерскую стратегию против них и забывает эвристику (31% -> 13%).

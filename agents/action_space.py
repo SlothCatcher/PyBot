@@ -60,16 +60,28 @@ def get_action_mode() -> str:
 
 
 def set_action_mode(mode: str | None) -> str:
-    """Задать режим (CLI/тесты). Влияет на маску и на разбор ордеров во всех путях сразу."""
+    """Задать режим (CLI/тесты). Влияет на маску и на разбор ордеров во всех путях сразу.
+
+    Режим ЭКСПОРТИРУЕТСЯ в PYBOT_ACTION_MODE: env-воркеры (SubprocVecEnv со spawn) и
+    форк-процессы наследуют окружение, поэтому без экспорта они остаются в `indices`,
+    пока политика в главном процессе выбирает в `embed`. Последствие — тихое расхождение
+    семантики: маска в obs приходит в нумерации team, а политика читает её как канонический
+    порядок резервов, и свитч-действие j в воркере означает другого монстра. Именно так
+    embed-прогон давал винрейт ~как у случайной игры (53% против random, 1.7% против
+    эвристики) при внешне исправном обучении.
+    """
     global _MODE
     _MODE = normalize_mode(mode) if mode is not None else None
-    return get_action_mode()
+    _mode = get_action_mode()
+    os.environ["PYBOT_ACTION_MODE"] = _mode
+    return _mode
 
 
 def reset_action_mode() -> None:
     """Сбросить кэш режима (для тестов: снова читаем PYBOT_ACTION_MODE)."""
     global _MODE
     _MODE = None
+    os.environ.pop("PYBOT_ACTION_MODE", None)
 
 
 def embed_reserves(battle) -> list:

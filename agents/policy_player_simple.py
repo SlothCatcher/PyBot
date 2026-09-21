@@ -280,6 +280,16 @@ class ExampleEnv(SinglesEnv):
 
 
 def train():
+    # Этот (легаси) скрипт умеет только indices: политика здесь позиционная, а embed-режим
+    # требует другой класс политики и другой нумерации свитчей. Молча играть в embed-маске
+    # позиционной политикой — гарантированный шум, поэтому лучше явная ошибка.
+    import os as _os
+    _mode = _os.environ.get("PYBOT_ACTION_MODE", "indices").strip().lower()
+    if _mode != "indices":
+        raise SystemExit(
+            "policy_player_simple.py не поддерживает режим действий "
+            f"{_mode!r}: используйте agents/policy_player.py --action-mode {_mode}"
+        )
     num_envs = 2
     total_timesteps = 2_000_000
     phase_size = 200_000  # раз в столько шагов обновляем self-play снапшот

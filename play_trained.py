@@ -192,6 +192,19 @@ def main() -> int:
         return selfcheck(args.model, args.vecnorm)
 
     ppo, _ = load_policy(args.model, allow_migrate=not args.no_migrate)
+    # Режим действий — свойство модели: embed-политика ждёт свитч-действие j = j-й резерв
+    # канонического порядка. Без этой строки inference играл в indices, и свитч-действие
+    # означало другого монстра (винрейт уровня случайной игры).
+    try:
+        from agents.action_space import describe as _describe_mode, set_action_mode
+        from agents.checkpoint_utils import action_mode_from_checkpoint
+
+        _mode = action_mode_from_checkpoint(args.model)
+        if _mode:
+            set_action_mode(_mode)
+            print(f"Режим действий из чекпоинта: {_describe_mode()}")
+    except Exception as e:  # noqa: BLE001 — диагностика не должна ломать запуск
+        print(f"не удалось применить режим действий модели: {e}")
     agent = build_player(ppo, args.vecnorm, args.deterministic, use_norm=not args.no_normalize)
 
     async def run():
