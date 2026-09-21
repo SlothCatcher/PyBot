@@ -34,6 +34,14 @@ except ImportError:  # запуск модуля вне пакета
         their_known_moves_damage,
     )
 
+try:
+    from .config import N_FEATURES          # размерность obs: нужна для проверки раскладки
+except ImportError:  # запуск модуля вне пакета
+    try:
+        from config import N_FEATURES       # type: ignore
+    except Exception:                       # pragma: no cover — тесты без config
+        N_FEATURES = 991
+
 _STATUSES = [None, Status.BRN, Status.PAR, Status.SLP, Status.FRZ, Status.PSN, Status.TOX]
 
 _HAZARD_MOVES = {
@@ -1229,6 +1237,270 @@ def available_move_ids(battle) -> set:
             for m in (getattr(battle, "available_moves", None) or [])}
 
 
+# =====================================================================================
+# Раскладка obs и «кандидатные» срезы (режим embed, см. AUDIT 32)
+# =====================================================================================
+# Второй режим работы политики оценивает КАНДИДАТОВ по их собственным признакам, а не по
+# номеру слота. Для этого obs нужно уметь разрезать на:
+#   * контекст (всё, что не про конкретного кандидата),
+#   * векторы 4 приёмов (по 30 признаков на приём из головы + оценка урона),
+#   * векторы 5 резервов (bench-слот 40 признаков + 12 множителей угрозы по типам соперника).
+# Таблица ниже — единственный источник истины о раскладке. Сборка obs (embed_battle_with_fusion)
+# сверяет с ней имена и ширины блоков и падает при расхождении, поэтому срезы не могут
+# тихо разъехаться при правке признаков (как это уже случалось с N_FEATURES).
+# kinds: per_move (ширина делится на 4 слота), bench (5 слотов по BENCH_SLOT_DIM),
+#        damage (особый: [0:12] — по 3 значения на приём), type_matchup (особый), context.
+BENCH_SLOT_DIM = 40                    # _RESERVE_SLOT_SIZE, см. _reserve_slot_vec
+# TYPE_MATCHUP_ROW_SIZE / TYPE_MATCHUP_TYPE_SLOTS / TYPE_MATCHUP_TEAM_SLOTS определены выше
+
+OBS_BLOCKS = (
+    ("moves_base_power", 4, "per_move"),
+    ("moves_dmg_multiplier", 4, "per_move"),
+    ("moves_wasted", 4, "per_move"),
+    ("moves_accuracy", 4, "per_move"),
+    ("moves_pp_frac", 4, "per_move"),
+    ("moves_boost_own", 20, "per_move"),
+    ("moves_drop_opp", 20, "per_move"),
+    ("moves_hazard_clear", 8, "per_move"),
+    ("moves_heal", 4, "per_move"),
+    ("moves_status_prob", 4, "per_move"),
+    ("moves_priority", 4, "per_move"),
+    ("moves_stab", 4, "per_move"),
+    ("moves_recoil", 4, "per_move"),
+    ("moves_phaze", 4, "per_move"),
+    ("moves_contact", 4, "per_move"),
+    ("moves_sound", 4, "per_move"),
+    ("moves_multihit", 4, "per_move"),
+    ("moves_type", 4, "per_move"),
+    ("moves_category", 12, "per_move"),
+    ("faint_hp", 4, "context"),
+    ("our_status", 7, "context"),
+    ("opp_status", 7, "context"),
+    ("our_hazards", 4, "context"),
+    ("opp_hazards", 4, "context"),
+    ("our_switches", 2, "context"),
+    ("opp_switches", 2, "context"),
+    ("our_boosts", 7, "context"),
+    ("opp_boosts", 7, "context"),
+    ("our_actual_stats", 6, "context"),
+    ("opp_actual_stats", 6, "context"),
+    ("our_ability", 20, "context"),
+    ("opp_ability", 20, "context"),
+    ("weather", 5, "context"),
+    ("field", 5, "context"),
+    ("trick_room_tailwind", 3, "context"),
+    ("our_screens", 3, "context"),
+    ("opp_screens", 3, "context"),
+    ("speed_advantage", 1, "context"),
+    ("revealed", 2, "context"),
+    ("semi_invuln", 2, "context"),
+    ("sub_damaged", 2, "context"),
+    ("restricted", 1, "context"),
+    ("our_volatiles", 11, "context"),
+    ("opp_volatiles", 11, "context"),
+    ("our_item", 11, "context"),
+    ("opp_item", 11, "context"),
+    ("our_bench", 5 * BENCH_SLOT_DIM, "bench"),
+    ("opp_bench", 5 * BENCH_SLOT_DIM, "context"),
+    ("vulnerability", 2, "context"),
+    ("tera_flags", 3, "context"),
+    ("is_tera", 2, "context"),
+    ("our_tera_type", 19, "context"),
+    ("protect", 2, "context"),
+    ("damage", DAMAGE_BLOCK_SIZE, "damage"),
+    ("type_matchup", TYPE_MATCHUP_BLOCK_SIZE, "type_matchup"),
+)
+
+# сколько признаков кандидата уходит в его embedding
+MOVE_FEATURES_PER_SLOT = 30            # сумма per_move-блоков / 4
+MOVE_DAMAGE_TRIPLE = 3                 # damage[3*i:3*i+3]: min_frac, max_frac, guaranteed_ko
+MOVE_CAND_FLAGS = 2                    # can_tera, is_tera
+MOVE_FEATURES_DIM = MOVE_FEATURES_PER_SLOT + MOVE_DAMAGE_TRIPLE                    # 33 без флагов
+MOVE_CAND_DIM = MOVE_FEATURES_DIM + MOVE_CAND_FLAGS                                # 35 с флагами
+SWITCH_THREAT_DIM = TYPE_MATCHUP_TYPE_SLOTS * TYPE_MATCHUP_TEAM_SLOTS  # 12 строк: 2 слота типов x 6 слотов соперника
+SWITCH_CAND_DIM = BENCH_SLOT_DIM + SWITCH_THREAT_DIM                               # 52
+
+
+def obs_layout() -> dict:
+    """{имя: (start, width, kind)} + итог; считается из OBS_BLOCKS один раз."""
+    global _OBS_LAYOUT_CACHE
+    if _OBS_LAYOUT_CACHE is None:
+        out = {}
+        off = 0
+        for name, width, kind in OBS_BLOCKS:
+            out[name] = (off, int(width), kind)
+            off += int(width)
+        out["_total"] = (0, off, "total")
+        _OBS_LAYOUT_CACHE = out
+    return _OBS_LAYOUT_CACHE
+
+
+_OBS_LAYOUT_CACHE = None
+
+
+def verify_obs_layout(named_blocks) -> None:
+    """Сверяет фактическую сборку obs с OBS_BLOCKS (имена и ширины, по порядку).
+
+    Без этой сверки срезы кандидатов (и весь режим embed) молча поехали бы при правке
+    признаков — ровно та же болезнь, что была с ручным подсчётом N_FEATURES.
+    """
+    expected = [(name, int(width)) for name, width, _kind in OBS_BLOCKS]
+    got = [(name, int(np.asarray(arr).shape[-1]) if np.asarray(arr).ndim else 1)
+           for name, arr in named_blocks]
+    if got != expected:
+        diff = next((f"{i}: {g} != {e}" for i, (g, e) in enumerate(zip(got, expected)) if g != e),
+                    f"длина {len(got)} != {len(expected)}")
+        raise AssertionError(
+            f"раскладка obs разошлась с OBS_BLOCKS ({diff}). Обнови OBS_BLOCKS в features.py "
+            f"вместе с изменением набора признаков — на таблицу опирается режим embed."
+        )
+
+
+def _index_maps() -> dict:
+    """Индексные карты срезов: (4,33) приёмы, (5,52) резервы, (599,) контекст, can_tera.
+
+    Модель (режим embed) берёт признаки кандидатов НЕ резанием по слотам, а этими картами:
+    `x[:, MOVE_FEATURE_IDX]` -> (B, 4, 33). Карты считаются из OBS_BLOCKS, поэтому совпадают
+    со сборкой obs по построению (см. verify_obs_layout).
+    """
+    global _INDEX_MAPS_CACHE
+    if _INDEX_MAPS_CACHE is not None:
+        return _INDEX_MAPS_CACHE
+    layout = obs_layout()
+    if layout["_total"][1] != N_FEATURES:
+        raise AssertionError(f"OBS_BLOCKS дают {layout['_total'][1]} признаков, а N_FEATURES={N_FEATURES}")
+
+    # карта приёмов: (4, 33) — строка = слот, столбцы = признаки этого приёма по порядку блоков
+    # (собираем ПО СЛОТАМ, а не плоским списком: иначе reshape перепутал бы слоты с признаками)
+    per_move_blocks = [(st, w) for st, w, kind in
+                       (layout[name] for name, _w, _k in OBS_BLOCKS) if kind == "per_move"]
+    d_start, _dw, _dk = layout["damage"]
+    move_idx = np.zeros((4, MOVE_FEATURES_DIM), dtype=np.int64)
+    col = 0
+    for start, width in per_move_blocks:
+        per = width // 4
+        for slot in range(4):
+            move_idx[slot, col:col + per] = np.arange(start + slot * per, start + (slot + 1) * per)
+        col += per
+    for slot in range(4):
+        move_idx[slot, col:col + MOVE_DAMAGE_TRIPLE] = np.arange(
+            d_start + 3 * slot, d_start + 3 * slot + MOVE_DAMAGE_TRIPLE)
+
+    t_start, t_width, _ = layout["type_matchup"]
+    n_types = 19
+    b_start, _bw, _bk = layout["our_bench"]
+    switch_core = np.zeros((5, BENCH_SLOT_DIM), dtype=np.int64)
+    for slot in range(5):
+        switch_core[slot] = np.arange(b_start + slot * BENCH_SLOT_DIM,
+                                      b_start + (slot + 1) * BENCH_SLOT_DIM)
+    threat_cols = []
+    for row in range(TYPE_MATCHUP_TYPE_SLOTS * TYPE_MATCHUP_TEAM_SLOTS):
+        threat_cols.append(t_start + n_types + row * TYPE_MATCHUP_ROW_SIZE + 2)   # колонка актива
+
+    used = np.zeros(N_FEATURES, dtype=bool)
+    used[move_idx.reshape(-1)] = True
+    used[switch_core.reshape(-1)] = True
+    for our_slot in range(1, 6):
+        for row in range(TYPE_MATCHUP_TYPE_SLOTS * TYPE_MATCHUP_TEAM_SLOTS):
+            used[t_start + n_types + row * TYPE_MATCHUP_ROW_SIZE + 2 + our_slot] = True
+    ctx_idx = np.flatnonzero(~used).astype(np.int64)
+
+    switch_idx = np.zeros((5, BENCH_SLOT_DIM + SWITCH_THREAT_DIM), dtype=np.int64)
+    switch_idx[:, :BENCH_SLOT_DIM] = switch_core
+    for slot in range(5):
+        for row, base_col in enumerate(threat_cols):
+            switch_idx[slot, BENCH_SLOT_DIM + row] = base_col + (slot + 1)
+
+    _INDEX_MAPS_CACHE = {
+        "move": move_idx,                                   # (4, 33)
+        "switch": switch_idx,                               # (5, 52)
+        "context": ctx_idx,                                 # (599,)
+        "can_tera": int(layout["tera_flags"][0]),           # скаляр-индекс
+        "is_tera": int(layout["is_tera"][0]),
+    }
+    return _INDEX_MAPS_CACHE
+
+
+_INDEX_MAPS_CACHE = None
+
+
+def move_feature_index() -> np.ndarray:
+    """(4, 33) индексы признаков приёмов (без флагов кандидата)."""
+    return _index_maps()["move"]
+
+
+def switch_feature_index() -> np.ndarray:
+    """(5, 52) индексы признаков резервов."""
+    return _index_maps()["switch"]
+
+
+def context_feature_index() -> np.ndarray:
+    """(599,) индексы контекста (всё, что не про конкретного кандидата)."""
+    return _index_maps()["context"]
+
+
+def context_dim() -> int:
+    """Длина контекстного вектора (все признаки, не относящиеся к конкретному кандидату)."""
+    return int(context_feature_index().shape[0])
+
+
+def can_tera_index() -> int:
+    """Индекс признака our_can_tera_now (нужен как флаг кандидата)."""
+    return _index_maps()["can_tera"]
+
+
+def context_vector(obs) -> np.ndarray:
+    """Всё, что не относится к конкретному кандидату (для оценки совместимости)."""
+    obs = np.asarray(obs)
+    return np.ascontiguousarray(obs[..., context_feature_index()], dtype=np.float32)
+
+
+def move_candidate_matrix(obs, with_flags: bool = True) -> np.ndarray:
+    """(4, 33|35): признаки каждого приёма в СВОЁМ слоте (как действия 6..9).
+
+    with_flags=True добавляет 2 колонки-флага кандидата: can_tera (доступна ли тера) и
+    is_tera (0 для обычного приёма) — их подставляет модель, чтобы обычные и теровые
+    кандидаты различались при одинаковых признаках приёма.
+    """
+    obs = np.asarray(obs)
+    core = obs[..., move_feature_index()]
+    if not with_flags:
+        return np.ascontiguousarray(core, dtype=np.float32)
+    out = np.zeros(core.shape[:-1] + (MOVE_CAND_DIM,), dtype=np.float32)
+    out[..., :core.shape[-1]] = core
+    out[..., -2] = obs[..., can_tera_index()]
+    out[..., -1] = 0.0
+    return out
+
+
+def tera_candidate_matrix(obs) -> np.ndarray:
+    """(4, 35): те же приёмы, но как теровые кандидаты (is_tera=1)."""
+    out = move_candidate_matrix(obs)
+    out[..., -1] = 1.0
+    return out
+
+
+def switch_candidate_matrix(obs) -> np.ndarray:
+    """(5, SWITCH_CAND_DIM): признаки каждого резерва в КАНОНИЧЕСКОМ порядке bench-блока.
+
+    Именно этот порядок использует режим embed для действий-свитчей 0..4, поэтому признаки
+    кандидата и действие, которым его выбирают, — одно и то же (в режиме indices действия
+    нумеруются порядком team, который к признакам отношения не имеет).
+    """
+    obs = np.asarray(obs)
+    return np.ascontiguousarray(obs[..., switch_feature_index()], dtype=np.float32)
+
+
+def candidate_slices_ok(obs) -> bool:
+    """Самопроверка: срезы не пересекаются и вместе с контекстом покрывают obs ровно один раз."""
+    n = int(np.asarray(obs).shape[-1])
+    used = np.zeros(n, dtype=np.int32)
+    for idx in (move_feature_index(), switch_feature_index()):
+        used[idx.reshape(-1)] += 1
+    used[context_feature_index()] += 1
+    return bool((used == 1).all())
+
+
 def _damage_block(battle, our_fusion, opp_fusion, our_team_fusions=None, opp_team_fusions=None) -> np.ndarray:
     """Признаки потенциального урона: по приёмам активного, входящий удар и матрицы 6x6.
 
@@ -1496,7 +1768,71 @@ def embed_battle_with_fusion(battle, our_fusion, opp_fusion, our_protected_last_
     moves_drop_opp_flat = moves_drop_opp.flatten()
     moves_hazard_clear_flat = moves_hazard_clear.flatten()
     moves_category_flat = moves_category.flatten()
+    # Имена блоков нужны не для красоты: verify_obs_layout сверяет сборку с OBS_BLOCKS, на
+    # которую опираются срезы кандидатов (режим embed). Молчаливый сдвиг блоков ловится здесь.
+    named_blocks = [
+        ("moves_base_power", moves_base_power),
+        ("moves_dmg_multiplier", moves_dmg_multiplier),
+        ("moves_wasted", moves_wasted),
+        ("moves_accuracy", moves_accuracy),
+        ("moves_pp_frac", moves_pp_frac),
+        ("moves_boost_own", moves_boost_own_flat),
+        ("moves_drop_opp", moves_drop_opp_flat),
+        ("moves_hazard_clear", moves_hazard_clear_flat),
+        ("moves_heal", moves_heal),
+        ("moves_status_prob", moves_status_prob),
+        ("moves_priority", moves_priority),
+        ("moves_stab", moves_stab),
+        ("moves_recoil", moves_recoil),
+        ("moves_phaze", moves_phaze),
+        ("moves_contact", moves_contact),
+        ("moves_sound", moves_sound),
+        ("moves_multihit", moves_multihit),
+        ("moves_type", moves_type),
+        ("moves_category", moves_category_flat),
+        ("faint_hp", [fainted_mon_team, fainted_mon_opponent, our_hp, opp_hp]),
+        ("our_status", our_status),
+        ("opp_status", opp_status),
+        ("our_hazards", our_hazards),
+        ("opp_hazards", opp_hazards),
+        ("our_switches", our_switches),
+        ("opp_switches", opp_switches),
+        ("our_boosts", our_boosts),
+        ("opp_boosts", opp_boosts),
+        ("our_actual_stats", our_actual_stats),
+        ("opp_actual_stats", opp_actual_stats),
+        ("our_ability", our_ability),
+        ("opp_ability", opp_ability),
+        ("weather", weather_vec),
+        ("field", field_vec),
+        ("trick_room_tailwind", [trick_room, our_tailwind, opp_tailwind]),
+        ("our_screens", our_screens),
+        ("opp_screens", opp_screens),
+        ("speed_advantage", [speed_advantage]),
+        ("revealed", [our_revealed, opp_revealed]),
+        ("semi_invuln", [our_semi_invuln, opp_semi_invuln]),
+        ("sub_damaged", [our_sub_damaged, opp_sub_damaged]),
+        ("restricted", [our_restricted]),
+        ("our_volatiles", our_volatiles),
+        ("opp_volatiles", opp_volatiles),
+        ("our_item", our_item),
+        ("opp_item", opp_item),
+        ("our_bench", our_bench),
+        ("opp_bench", opp_bench),
+        ("vulnerability", [our_vulnerability, opp_vulnerability]),
+        ("tera_flags", [our_can_tera_now, our_used_tera, opp_used_tera]),
+        ("is_tera", [our_is_tera, opp_is_tera]),
+        ("our_tera_type", our_tera_type),
+        ("protect", [our_protected_last_turn, opp_protected_last_turn]),
+        ("damage", damage_feats),
+        ("type_matchup", type_matchup_feats),
+    ]
+    verify_obs_layout(named_blocks)
     obs = np.concatenate(
+        [arr for _name, arr in named_blocks], dtype=np.float32,
+    )
+    if False:  # старая сборка оставлена ниже закомментированной для истории правок
+      obs = np.concatenate(
         [
             moves_base_power, moves_dmg_multiplier, moves_wasted, moves_accuracy, moves_pp_frac,
             moves_boost_own_flat, moves_drop_opp_flat, moves_hazard_clear_flat, moves_heal, moves_status_prob,
@@ -1523,7 +1859,7 @@ def embed_battle_with_fusion(battle, our_fusion, opp_fusion, our_protected_last_
             type_matchup_feats,
         ],
         dtype=np.float32,
-    )
+      )
     if not np.isfinite(obs).all():
         if debug:
             print(f"WARN embed_battle_with_fusion non-finite: {np.where(~np.isfinite(obs))[0][:10]}")

@@ -119,6 +119,19 @@ def load_policy(model_path: str, cache_dir: str | None = None):
     else:
         logger.info("модель %s: obs %s, признаки совпадают", model_path, N_FEATURES)
 
+    # Режим действий — свойство модели: embed-политика ждёт свитч-действие j = j-й резерв
+    # канонического порядка. Если не применить его на инференсе, маска/ордера разъедутся с
+    # тем, что видела политика при обучении.
+    try:
+        from agents.action_space import describe as _describe_mode, set_action_mode
+        from agents.checkpoint_utils import action_mode_from_checkpoint
+        mode = action_mode_from_checkpoint(model_path)
+        if mode:
+            set_action_mode(mode)
+            logger.info("режим действий из чекпоинта: %s", _describe_mode())
+    except Exception as e:  # noqa: BLE001 — инференс не должен падать из-за диагностики
+        logger.warning("не удалось определить режим действий чекпоинта: %s", e)
+
     policy = ppo.policy
     # ВАЖНО: после PPO.load политика в train-режиме, то есть Dropout(0.1) в экстракторе
     # признаков работает и на инференсе: решения становятся шумными, а поведение бота

@@ -27,23 +27,31 @@ MIN_WINRATE_TO_QUALIFY = 25  # было 50 -> 30, но у тебя после BC
 
 _original_order_to_action = SinglesEnv.order_to_action
 
+# Режим действий (indices | embed) живёт в agents/action_space.py: там маска и разбор ордеров
+# с учётом нумерации свитчей. Патчи ниже остаются «последним рубежом» и просто зовут его.
+from .action_space import (  # noqa: E402
+    action_to_order as _mode_action_to_order,
+    get_action_mask as _mode_get_action_mask,
+    order_to_action as _mode_order_to_action,
+)
+
 def _safe_order_to_action(order, battle, fake=False, strict=True):
     try:
-        return _original_order_to_action(order, battle, fake=fake, strict=strict)
+        return _mode_order_to_action(order, battle, fake=fake, strict=strict)
     except ValueError:
         pass
 
     try:
         fallback_order = Player.choose_random_move(battle)
-        return _original_order_to_action(fallback_order, battle, fake=fake, strict=strict)
+        return _mode_order_to_action(fallback_order, battle, fake=fake, strict=strict)
     except ValueError:
         pass
 
     try:
-        return _original_order_to_action(DefaultBattleOrder(), battle, fake=fake, strict=strict)
+        return _mode_order_to_action(DefaultBattleOrder(), battle, fake=fake, strict=strict)
     except ValueError:
         # Последний рубеж: берём индекс первого действия, разрешённого маской
-        mask = SinglesEnv.get_action_mask(battle)
+        mask = _mode_get_action_mask(battle)
         for idx, allowed in enumerate(mask):
             if allowed:
                 return idx
@@ -53,7 +61,7 @@ SinglesEnv.order_to_action = staticmethod(_safe_order_to_action)
 _original_action_to_order = SinglesEnv.action_to_order
 
 def _safe_action_to_order(action, battle, fake=False, strict=True):
-    mask = SinglesEnv.get_action_mask(battle)
+    mask = _mode_get_action_mask(battle)
     if sum(mask) == 0:
         return DefaultBattleOrder()
     # poke_env ожидает np.int64 с методом .item(), а PolicyPlayer отдаёт Python int
@@ -62,11 +70,17 @@ def _safe_action_to_order(action, battle, fake=False, strict=True):
             action = np.int64(action)
         elif isinstance(action, np.ndarray) and action.ndim == 0:
             action = np.int64(action.item())
-        return _original_action_to_order(action, battle, fake=fake, strict=strict)
+        return _mode_action_to_order(action, battle, fake=fake, strict=strict)
     except (ValueError, AttributeError, TypeError):
         return DefaultBattleOrder()
 
 SinglesEnv.action_to_order = staticmethod(_safe_action_to_order)
+
+# Маска тоже режимная: в embed свитч-действие j — это j-й резерв в каноническом порядке.
+# Патчим статик SinglesEnv, поэтому все существующие вызовы `SinglesEnv.get_action_mask(battle)`
+# (env, players, диагностика) и `PokeEnv.step` автоматически получают нужную нумерацию.
+_original_get_action_mask = SinglesEnv.get_action_mask
+SinglesEnv.get_action_mask = staticmethod(_mode_get_action_mask)
 
 _original_damage_multiplier = PokemonType.damage_multiplier
 

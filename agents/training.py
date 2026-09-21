@@ -281,10 +281,58 @@ def make_ent_schedule(total_timesteps: int, steps_holder: dict):
     return ent_schedule
 
 
+def _current_action_mode() -> str:
+    try:
+        from .action_space import get_action_mode
+    except ImportError:  # pragma: no cover
+        from action_space import get_action_mode  # type: ignore
+    return get_action_mode()
+
+
+def dataset_meta_path(path: str) -> str:
+    return str(path) + ".meta.json"
+
+
+def write_dataset_meta(path: str, obs_dim: int, mask_dim: int | None = None, extra: dict | None = None):
+    """Сайдкар датасета: режим действий, размерности, отпечаток признаков.
+
+    Главное здесь — `action_mode`: метки свитчей в режимах indices и embed означают РАЗНОЕ
+    (индекс в порядке team против индекса в каноническом порядке резервов), поэтому обучать BC
+    на датасете чужого режима нельзя — это тихая порча политики свитчей.
+    """
+    import json
+    meta = {
+        "obs_dim": int(obs_dim),
+        "mask_dim": int(mask_dim) if mask_dim is not None else None,
+        "action_mode": _current_action_mode(),
+        "features_hash": _features_fingerprint(),
+        "saved_at": int(time.time()),
+    }
+    if extra:
+        meta.update(extra)
+    try:
+        with open(dataset_meta_path(path), "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+    except Exception as e:  # noqa: BLE001 — сайдкар не должен ронять сбор датасета
+        print(f"WARNING: не удалось записать {dataset_meta_path(path)}: {e}")
+    return meta
+
+
+def read_dataset_meta(path: str) -> dict | None:
+    import json
+    try:
+        with open(dataset_meta_path(path), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
 def save_dataset(dataset: list, path: str):
     if len(dataset) == 0:
         print(f"WARNING: save_dataset {path} пустой список, пропускаю")
         return
+    _ensure_dir(os.path.dirname(str(path)) or ".")
     obs_arr = np.stack([d[0] for d in dataset]).astype(np.float32)
     mask_arr = np.stack([d[1] for d in dataset]).astype(np.int8)
     action_arr = np.array([d[2] for d in dataset], dtype=np.int64)
@@ -293,6 +341,7 @@ def save_dataset(dataset: list, path: str):
         np.savez_compressed(path, obs=obs_arr, mask=mask_arr, action=action_arr, ret=return_arr)
     else:
         np.savez_compressed(path, obs=obs_arr, mask=mask_arr, action=action_arr)
+    write_dataset_meta(path, obs_arr.shape[1], mask_arr.shape[1])
     print(f"Датасет сохранён: {path} ({len(dataset)} примеров)")
 
 # С какого числа примеров датасет отдаётся ленивым view (без list(zip(...)) в RAM).
@@ -787,7 +836,9 @@ def _recompute_from_chunked_cache(n_battles: int) -> list:
             if (int(meta.get("obs_dim", -1)) == int(N_FEATURES)
                     and int(meta.get("battles_requested", -1)) == int(n_battles)
                     and meta.get("chunks") == fingerprint
-                    and meta.get("features_hash") == feature_hash):
+                    and meta.get("features_hash") == feature_hash
+                    # метки свитчей в разных режимах означают разное -> мерж чужого режима нельзя
+                    and str(meta.get("action_mode") or "indices") == _current_action_mode()):
                 data = np.load(merged_path)
                 if "ret" in data:
                     dataset = list(zip(data["obs"], data["mask"], data["action"], data["ret"]))
@@ -821,6 +872,7 @@ def _recompute_from_chunked_cache(n_battles: int) -> list:
                         with open(meta_path, "w", encoding="utf-8") as f:
                             json.dump({"obs_dim": int(N_FEATURES), "battles_requested": int(n_battles),
                                        "chunks": fingerprint, "features_hash": feature_hash,
+                                       "action_mode": _current_action_mode(),
                                        "examples": len(dataset), "adopted_without_sidecar": True},
                                       f, ensure_ascii=False)
                     except Exception:
@@ -944,6 +996,7 @@ def _recompute_from_chunked_cache(n_battles: int) -> list:
                 "battles_processed": int(tag_count),
                 "chunks": fingerprint,
                 "features_hash": feature_hash,
+                "action_mode": _current_action_mode(),
                 "examples": int(_get_npz_n_transitions(merged_path) or 0),
             }, f, ensure_ascii=False)
     except Exception as e:
@@ -1987,7 +2040,24 @@ def validate_bc_dataset(path: str, target_dim: int) -> dict:
         )
     if obs_dim != int(target_dim) and obs_dim < MIN_PREFIX_OBS_DIM:
         raise SystemExit(dataset_layout_error(obs_dim, target_dim, label=f"датасет {path}"))
-    return {"obs_dim": obs_dim, "has_ret": True, "examples": examples}
+    # режим действий: у старых датасетов сайдкара нет — это indices (обратная совместимость)
+    try:
+        from .action_space import get_action_mode
+    except ImportError:  # pragma: no cover
+        from action_space import get_action_mode  # type: ignore
+    meta = read_dataset_meta(path) or {}
+    dataset_mode = str(meta.get("action_mode") or "indices").lower()
+    current_mode = get_action_mode()
+    if dataset_mode != current_mode:
+        raise SystemExit(
+            f"Датасет {path} собран в режиме действий '{dataset_mode}', а сейчас включён "
+            f"'{current_mode}'.\n"
+            f"Метки свитчей в этих режимах означают разное (индекс в порядке team против индекса "
+            f"в каноническом порядке резервов), поэтому обучаться на нём нельзя.\n"
+            f"Либо убери --action-mode (останется indices), либо пересобери датасет в embed-режиме."
+        )
+    return {"obs_dim": obs_dim, "has_ret": True, "examples": examples,
+            "action_mode": dataset_mode}
 
 
 def _pad_obs_to_features(obs_arr, target_dim: int, *, label: str = "датасет",
@@ -2225,10 +2295,10 @@ def pretrain_policy_bc(
                 action_batch = torch.as_tensor(action_arr[idx], device=device)
                 return_batch = torch.as_tensor(return_arr[idx], device=device)
 
-                features = ppo.policy.extract_features(obs_dict)
-                latent_pi, latent_vf = ppo.policy.mlp_extractor(features)
-                ppo.policy._mask = obs_dict["action_mask"]
-                distribution = ppo.policy._get_action_dist_from_latent(latent_pi)
+                # policy-agnostic: у режима indices это те же extract_features/mlp_extractor/
+                # action_net, у режима embed — скоры кандидатов (см. policy.logits_and_values)
+                logits, values_t = ppo.policy.logits_and_values(obs_dict)
+                distribution = ppo.policy.distribution_for_logits(logits, obs_dict["action_mask"])
                 if contrastive:
                     log_prob = distribution.log_prob(action_batch)
                     prob = log_prob.exp().clamp(1e-6, 1-1e-6)
@@ -2242,7 +2312,7 @@ def pretrain_policy_bc(
                         policy_loss = win_loss
                 else:
                     policy_loss = -distribution.log_prob(action_batch).mean()
-                values = ppo.policy.value_net(latent_vf).flatten()
+                values = values_t.flatten()
                 value_loss = torch.nn.functional.mse_loss(values, return_batch)
                 loss = policy_loss + value_coef * value_loss
 
@@ -2282,10 +2352,8 @@ def pretrain_policy_bc(
                 }
                 action_batch = torch.as_tensor(action_arr[val_idx], device=device)
                 return_batch = torch.as_tensor(return_arr[val_idx], device=device)
-                features = ppo.policy.extract_features(obs_dict)
-                latent_pi, latent_vf = ppo.policy.mlp_extractor(features)
-                ppo.policy._mask = obs_dict["action_mask"]
-                distribution = ppo.policy._get_action_dist_from_latent(latent_pi)
+                logits, values_t = ppo.policy.logits_and_values(obs_dict)
+                distribution = ppo.policy.distribution_for_logits(logits, obs_dict["action_mask"])
                 if contrastive:
                     log_prob = distribution.log_prob(action_batch)
                     prob = log_prob.exp().clamp(1e-6, 1-1e-6)
@@ -2299,7 +2367,7 @@ def pretrain_policy_bc(
                         val_policy_loss = win_loss
                 else:
                     val_policy_loss = -distribution.log_prob(action_batch).mean().item()
-                values = ppo.policy.value_net(latent_vf).flatten()
+                values = values_t.flatten()
                 val_value_loss = torch.nn.functional.mse_loss(values, return_batch).item()
                 ppo.policy.train()          # возвращаем режим обучения (dropout)
 

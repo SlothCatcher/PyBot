@@ -378,6 +378,24 @@ def _checkpoint_arch(path: str) -> dict:
     return info
 
 
+def resume_migration_target(mode: str, resume_feat: int, resume_dim: int | None,
+                            cli_features_dim: int, n_features: int | None = None):
+    """Целевой features_dim и нужна ли миграция при resume. Возвращает (target, needed).
+
+    В embed-режиме легаси-ветки экстрактора (features_dim/net_arch) НЕ участвуют в выборе
+    действия: скор кандидатов считают свои головы, а легаси-ветки строятся крошечными
+    (features_dim 64). Поэтому их размер — не признак старой архитектуры, и embed-чекпоинт
+    нельзя тащить в миграцию: мигрируем только если разошлась размерность obs.
+    В indices-режиме features_dim сверяется с CLI (старое поведение).
+    """
+    if n_features is None:
+        n_features = int(N_FEATURES)
+    target = int(resume_feat) if mode == "embed" else int(cli_features_dim)
+    needed = ((resume_dim is not None and int(resume_dim) != int(n_features))
+              or target != int(resume_feat))
+    return target, bool(needed)
+
+
 def _migrate_checkpoint_dim(ppp_path: str, target_dim: int | None = None, force_fallback: bool = False,
                             target_features_dim: int | None = None, verbose: bool = True,
                             n_envs: int = 1):
@@ -845,6 +863,7 @@ def run(
     n_epochs: int = 10,
     batch_size: int = 128,
     features_dim: int = 512,
+    action_mode: str = "indices",
     vf_coef: float = 0.5,
     bc_value_coef: float = 0.0,
     value_warmup_steps: int = 0,
@@ -949,15 +968,39 @@ def run(
         resume_from = resolve_checkpoint_path(resume_from)
         if not os.path.isfile(resume_from):
             raise SystemExit(explain_missing_checkpoint(resume_from))
+        # РЕЖИМ ДЕЙСТВИЙ — свойство модели, а не флаг CLI: определяем его ДО проверки
+        # архитектуры. Иначе embed-чекпоинт (у него легаси-ветки экстрактора намеренно
+        # крошечные: features_dim 64 вместо 512) уходил в ветку «старая архитектура»,
+        # мигрировал, режим не переключался — и env играл в indices, а модель считала
+        # кандидатов по признакам: тихое расхождение семантики свитчей и логитов.
+        from agents.action_space import set_action_mode, describe as _describe_mode
+        ck_mode = None
+        try:
+            from agents.checkpoint_utils import action_mode_from_checkpoint
+            ck_mode = action_mode_from_checkpoint(resume_from)
+        except Exception as e:
+            print(f"не удалось определить режим действий чекпоинта: {e}")
+        _mode = set_action_mode(ck_mode or action_mode)
+        if ck_mode and ck_mode != action_mode:
+            print(f"Режим действий взят из чекпоинта: {_describe_mode()} "
+                  f"(CLI просил '{action_mode}')")
+        else:
+            print(f"Режим действий: {_describe_mode()}")
+        if _mode == "embed":
+            print("Политика: скор кандидатов по признакам (EmbeddedActorCriticPolicy)")
         _arch = _checkpoint_arch(resume_from)
         _resume_dim = _arch.get("obs_dim") if _arch else _checkpoint_obs_dim(resume_from)
         _resume_feat = int(_arch.get("features_dim") or 512)
-        if (_resume_dim is not None and _resume_dim != N_FEATURES) or _resume_feat != int(features_dim):
+        # в embed-режиме легаси-ветки (features_dim, net_arch) не участвуют в выборе действия,
+        # поэтому их размер — не признак старой архитектуры: мигрируем только по obs
+        _target_feat, _need_migration = resume_migration_target(
+            _mode, _resume_feat, _resume_dim, int(features_dim))
+        if _need_migration:
             print(f"Снапшот {resume_from}: obs {_resume_dim}, features_dim {_resume_feat} — "
-                  f"мигрирую на obs {N_FEATURES}, features_dim {features_dim} "
+                  f"мигрирую на obs {N_FEATURES}, features_dim {_target_feat} "
                   f"(паддинг весов + сброс optimizer state)...")
             ppo = _migrate_checkpoint_dim(resume_from, target_dim=N_FEATURES,
-                                          target_features_dim=int(features_dim),
+                                          target_features_dim=int(_target_feat),
                                           n_envs=int(num_envs))
         else:
             try:
@@ -977,6 +1020,15 @@ def run(
                                                   n_envs=int(num_envs))
                 else:
                     raise
+        # страховка: режим и политика обязаны совпадать, иначе выбор действия и env разъедутся
+        if _mode == "embed" and not (hasattr(ppo.policy, "action_net_move")
+                                     and hasattr(ppo.policy, "ctx_encoder")):
+            raise SystemExit(
+                f"Чекпоинт {resume_from} определён как embed, но в загруженной политике нет "
+                f"голов кандидатов (policy_kwargs action_mode="
+                f"{(getattr(ppo, 'policy_kwargs', None) or {}).get('action_mode')}); "
+                f"переключите режим через --action-mode или возьмите чекпоинт этого режима"
+            )
         # `PPO.load` возвращает базовый PPO: без этого шага `_update_learning_rate` берётся
         # из SB3 и перезаписывает lr всем группам одним числом — раздельные lr теряются.
         _opt_before = type(getattr(getattr(ppo, "policy", None), "optimizer", None)).__name__
@@ -1082,6 +1134,21 @@ def run(
                     print(f"Не удалось включить ICM: {e}")
                     import traceback; traceback.print_exc()
                     icm_wrapper = None
+        # Режим действий: indices (раскладка poke-env) или embed (политика оценивает кандидатов
+        # по их признакам; свитч-действие j = j-й резерв в каноническом порядке bench-блока).
+        # Режим влияет на маску действий во ВСЕХ путях (env, игроки, диагностика) — он живёт в
+        # agents/action_space.py, а здесь задаётся один раз для всего прогона.
+        from agents.action_space import set_action_mode, describe as _describe_mode
+        _mode = set_action_mode(action_mode)
+        print(f"Режим действий: {_describe_mode()}")
+        policy_class = MaskedActorCriticPolicy
+        if _mode == "embed":
+            from agents.policy import EmbeddedActorCriticPolicy
+            policy_class = EmbeddedActorCriticPolicy
+            print("Политика: скор кандидатов по признакам (EmbeddedActorCriticPolicy). "
+                  "Внимание: датасет для BC должен быть собран в этом же режиме "
+                  "(сайдкар <датасет>.meta.json, иначе BC откажется).")
+
         # Настройки SplitAdam уезжают в чекпоинт внутри policy_kwargs, поэтому загруженная
         # модель восстанавливает ту же схему групп (pi/vf/shared) с теми же eps/betas.
         opt_kwargs = {
@@ -1093,7 +1160,7 @@ def run(
         }
         opt_kwargs = {k: v for k, v in opt_kwargs.items() if v is not None}
         ppo = SplitLRPPO(
-            MaskedActorCriticPolicy,
+            policy_class,
             env,
             ent_coef=ent_coef if ent_coef is not None else 0.01,
             learning_rate=float(lr_policy) if lr_policy else learning_rate,
@@ -1109,10 +1176,13 @@ def run(
             # фиксируем размер экстрактора и голов в чекпоинте: иначе policy_kwargs пуст
             # и миграция не знает features_dim, поэтому не может расширять сеть
             policy_kwargs=dict(
-                features_extractor_kwargs=dict(features_dim=int(features_dim)),
-                net_arch=dict(pi=list(PI_LAYERS), vf=list(VF_LAYERS)),
+                features_extractor_kwargs=dict(
+                    features_dim=int(features_dim) if _mode != "embed" else 64),
+                net_arch=(dict(pi=list(PI_LAYERS), vf=list(VF_LAYERS)) if _mode != "embed"
+                          else dict(pi=[64], vf=[64])),
                 optimizer_class=SplitAdam,
                 optimizer_kwargs=opt_kwargs,
+                **({"action_mode": _mode} if _mode == "embed" else {}),
             ),
         )
         try:
@@ -1281,9 +1351,15 @@ def run(
         # и policy деградирует даже с замороженным action_net (было 31% -> 13% после 50k warmup)
         for p in ppo.policy.parameters():
             p.requires_grad = False
-        # размораживаем только value-часть
+        # размораживаем только value-часть. У режима embed value-голова своя
+        # (value_net_embed), а легаси value_net/mlp_extractor в forward не участвуют — если
+        # разморозить только легаси, обучение value не сдвинется вообще.
         for p in ppo.policy.value_net.parameters():
             p.requires_grad = True
+        _embed_value = getattr(ppo.policy, "value_net_embed", None)
+        if _embed_value is not None:
+            for p in _embed_value.parameters():
+                p.requires_grad = True
         try:
             for p in ppo.policy.mlp_extractor.value_net.parameters():
                 p.requires_grad = True
@@ -1500,7 +1576,15 @@ def run(
         _sync_model_n_envs(ppo, env)
         ppo.set_env(env)
 
-    final_path = f"models/{save_as}" if save_as else "models/ppo_policy_final"
+    # --save-as может быть и абсолютным путём: раньше он молча склеивался с models/ и модель
+    # уезжала в models//abs/path (см. смоук-прогон embed-режима)
+    if save_as:
+        final_path = save_as if os.path.isabs(save_as) else f"models/{save_as}"
+        # PPO.save сам добавляет .zip: не превращаем foo.zip в foo.zip.zip
+        if final_path.endswith(".zip"):
+            final_path = final_path[:-4]
+    else:
+        final_path = "models/ppo_policy_final"
     ppo.save(final_path)
     # сохраняем VecNormalize финальный
     if not no_normalize_bc and hasattr(env, "save"):
@@ -1648,6 +1732,12 @@ def build_parser() -> "argparse.ArgumentParser":
     parser.add_argument("--reset-schedules", action="store_true", help="Сбросить счетчик шагов для lr/ent расписаний при resume (lr 3e-5 снова с начала, ent 0.01). Нужно когда берешь фазу 300k и хочешь доучивать как с нуля)")
     parser.add_argument("--eval-battles", type=int, default=20, help="Сколько боев на каждого бота в оценке между фазами (было 60 -> 20, 60*4=240 боев виснет на 5-10 мин)")
     parser.add_argument("--skip-eval", action="store_true", help="Пропустить оценку winrate между фазами (самый быстрый, если виснет на 60 боев)")
+    parser.add_argument("--action-mode", type=str, default="indices", choices=["indices", "embed"],
+                        help="indices — раскладка действий poke-env (по умолчанию, совместимо со "
+                             "старыми датасетами и чекпоинтами); embed — политика оценивает "
+                             "КАНДИДАТОВ по их признакам, а не по номеру слота (свитч-действие j = "
+                             "j-й резерв в каноническом порядке bench-блока). Для embed нужен "
+                             "датасет, собранный в embed-режиме")
     parser.add_argument("--features-dim", type=int, default=512, help="Размер выхода экстрактора признаков (по умолчанию 512). При смене веса старого чекпоинта паддятся, новые нейроны входят с нулевыми весами (warm start); 640 стоит пробовать, если признаки урона не включаются")
 # --- ICM Variant B ---
     parser.add_argument("--icm", action="store_true", help="Включить Intrinsic Curiosity Module (Variant B) r = r_ext + beta*r_int")
@@ -1718,6 +1808,7 @@ if __name__ == "__main__":
         eval_battles=args.eval_battles,
         skip_eval=args.skip_eval,
         features_dim=args.features_dim,
+        action_mode=args.action_mode,
         icm=args.icm,
         icm_beta=args.icm_beta,
         icm_anneal=args.icm_anneal,

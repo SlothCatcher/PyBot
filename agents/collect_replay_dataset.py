@@ -835,6 +835,17 @@ def collect_replay_dataset(
     assert obs_arr.shape[1] == N_FEATURES, f"obs dim {obs_arr.shape[1]} != {N_FEATURES}"
     assert mask_arr.shape[1] == SinglesEnv.get_action_space_size(9), f"mask {mask_arr.shape[1]}"
     np.savez_compressed(out_path, obs=obs_arr, mask=mask_arr, action=action_arr, ret=ret_arr)
+    # ВАЖНО: метки свитчей здесь считает _switch_to_action по порядку battle.team — это
+    # семантика режима indices. В embed-режиме метка свитча означает индекс в КАНОНИЧЕСКОМ
+    # порядке резервов, поэтому такой датасет в embed использовать нельзя: пишем режим явно
+    # (не текущий!), чтобы BC отказался, а не учился на чужих метках.
+    try:
+        from agents.training import write_dataset_meta
+        write_dataset_meta(str(out_path), obs_arr.shape[1], mask_arr.shape[1],
+                           extra={"action_mode": "indices", "collected_by": "replay",
+                                  "replay_action_semantics": "team_order"})
+    except Exception as e:
+        logger.warning(f"не удалось записать сайдкар режима: {e}")
     logger.info(f"Датасет сохранён: {out_path} ({len(all_samples)} семплов, {ok_replays} реплеев)")
     # также выводим статистику по win/loss ret
     try:

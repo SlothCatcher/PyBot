@@ -40,6 +40,57 @@ def checkpoint_obs_dim(path: str):
         return None
 
 
+def action_mode_from_checkpoint(path: str):
+    """Режим действий, в котором обучался чекпоинт: "indices" | "embed" | None.
+
+    Режим — свойство МОДЕЛИ (и её датасета), а не CLI-флага: embed-политика ждёт маску, в которой
+    свитч-действие j — это j-й резерв канонического порядка. Если загрузить такой чекпоинт в
+    режиме indices (по умолчанию), маска и порядок действий разъедутся с тем, что видела политика
+    при обучении, — поэтому режим читаем из самого zip и применяем автоматически.
+    """
+    read_ok = False
+    data, params = {}, {}
+    try:
+        from stable_baselines3.common.save_util import load_from_zip_file
+
+        data, params, _ = load_from_zip_file(path, device="cpu", load_data=True)
+        read_ok = True
+    except Exception:
+        try:
+            import json
+            import zipfile
+
+            with zipfile.ZipFile(path) as z:
+                with z.open("data") as f:
+                    data = json.load(f)
+            read_ok = True
+        except Exception:
+            return None
+    pk = {}
+    try:
+        pk = data.get("policy_kwargs") or {}
+    except Exception:
+        pk = {}
+    for src in (pk, data):
+        try:
+            mode = src.get("action_mode")
+        except Exception:
+            mode = None
+        if mode:
+            return str(mode).lower()
+    # определяем по весам: у embed-политики есть ветки кандидатов
+    try:
+        for _, v in (params or {}).items():
+            if isinstance(v, dict):
+                if any("ctx_encoder" in k or "switch_encoder" in k or "action_net_move" in k
+                       for k in v.keys()):
+                    return "embed"
+    except Exception:
+        pass
+    # чекпоинт прочитан, но embed-веток нет -> это историческая (индексная) раскладка poke-env
+    return "indices" if read_ok else None
+
+
 def cached_migration_path(path: str, target_dim: int, cache_dir: str | None = None) -> str:
     cache_dir = cache_dir or DEFAULT_CACHE_DIR
     stem = os.path.splitext(os.path.basename(path))[0]
