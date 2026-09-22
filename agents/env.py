@@ -300,7 +300,14 @@ def _apply_worker_action_mode(action_mode: str | None) -> str | None:
     except ImportError:  # pragma: no cover — запуск модуля вне пакета
         from action_space import set_action_mode, get_action_mode  # type: ignore
     set_action_mode(action_mode)
-    return get_action_mode()
+    mode = get_action_mode()
+    # Диагностика (включается PYBOT_DEBUG_ACTION_MODE=1): без неё «воркер играет не в том
+    # режиме» не видно ни в одном логе — именно так и жил баг с винрейтом 53%/1.7%.
+    import os as _os
+
+    if _os.environ.get("PYBOT_DEBUG_ACTION_MODE", "") == "1":
+        print(f"[env-worker] режим действий: {mode} (pid={_os.getpid()})", flush=True)
+    return mode
 
 
 class ExampleEnv(SinglesEnv):

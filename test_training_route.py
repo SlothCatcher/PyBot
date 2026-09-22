@@ -222,7 +222,7 @@ def test_run_bc_only_offline(td):
     cwd = os.getcwd()
     env_fns_seen = []
 
-    def fake_subproc(fns):
+    def fake_subproc(fns, **kwargs):
         env_fns_seen.append(len(fns))
         return DummyVecEnv([lambda: Env870()])
 

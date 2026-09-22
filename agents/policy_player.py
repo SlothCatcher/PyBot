@@ -1086,7 +1086,8 @@ def run(
                         setattr(ppo, attr, val)
         # создаём env заново; если был VecNormalize — загружаем (с миграцией 713->715 если нужно)
         base_env = SubprocVecEnv([partial(ExampleEnv.create_env, action_mode=_mode)
-                                  for _ in range(num_envs)])
+                                  for _ in range(num_envs)],
+                                 start_method=_vec_start_method())
         if not no_normalize_bc:
             if os.path.isfile(VECNORM_PATH):
                 env = _migrate_vecnormalize_713_to_715(VECNORM_PATH, base_env)
@@ -1119,7 +1120,8 @@ def run(
     else:
         steps_done_holder = {"value": 0}
         base_env = SubprocVecEnv([partial(ExampleEnv.create_env, action_mode=_mode)
-                                  for _ in range(num_envs)])
+                                  for _ in range(num_envs)],
+                                 start_method=_vec_start_method())
         if not no_normalize_bc:
             env = VecNormalize(base_env, norm_obs=True, norm_reward=norm_reward, gamma=0.99, norm_obs_keys=["observation"])
         else:
@@ -1504,7 +1506,8 @@ def run(
             env.close()
             raw_env = SubprocVecEnv(
                 [partial(ExampleEnv.create_env, opponent_weights=current_weights, action_mode=_mode)
-                 for _ in range(num_envs)]
+                 for _ in range(num_envs)],
+                start_method=_vec_start_method(),
             )
             try:
                 env = _migrate_vecnormalize_713_to_715(VECNORM_PATH, raw_env)
@@ -1517,7 +1520,8 @@ def run(
             env.close()
             raw_env = SubprocVecEnv(
                 [partial(ExampleEnv.create_env, opponent_weights=current_weights, action_mode=_mode)
-                 for _ in range(num_envs)]
+                 for _ in range(num_envs)],
+                start_method=_vec_start_method(),
             )
             env = raw_env
         # --- ICM re-wrap для новой фазы (сохраняем тот же icm_module и optimizer) ---
@@ -1631,6 +1635,17 @@ def resolve_lr_args(learning_rate: float | None, bc_lr: float | None,
     if bc_lr_final is None:
         bc_lr_final = 1e-4 if bc_lr >= 1e-4 else bc_lr * 0.1
     return (lr, bc_lr, float(bc_lr_final)), note
+
+
+def _vec_start_method() -> str:
+    """Метод старта воркеров SubprocVecEnv: всегда spawn (см. AUDIT 34).
+
+    forkserver (дефолт SB3 на Linux) с poke-env-воркерами виснет намертво: родитель вечно
+    ждёт `get_spaces` от воркера — без ошибки, без логов, без таймаута. Проверено живьём:
+    forkserver не поднял env за 120 с, spawn — за 1.5 с (и на текущем коде, и на fc48248,
+    то есть баг не связан с фиксом режима действий). Переопределяется PYBOT_VEC_START_METHOD.
+    """
+    return os.environ.get("PYBOT_VEC_START_METHOD", "").strip() or "spawn"
 
 
 def build_parser() -> "argparse.ArgumentParser":

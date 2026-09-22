@@ -177,6 +177,9 @@ def main() -> int:
             if "action_mode=_mode" not in src[m.start():m.start() + 160]]
     check("D: каждая фабрика env передаёт action_mode=_mode",
           not bare, f"без режима: {len(bare)}")
+    bare_sm = src.count("SubprocVecEnv(") - src.count("start_method=_vec_start_method()")
+    check("D: все фабрики SubprocVecEnv задают start_method (spawn: forkserver виснет)",
+          bare_sm == 0 and "def _vec_start_method" in src, f"без start_method: {bare_sm}")
     check("D: в свежей ветке нет копии блока установки режима",
           src.count("_mode = set_action_mode") + src.count("_mode = _set_action_mode") == 2,
           str(src.count("_mode = set_action_mode") + src.count("_mode = _set_action_mode")))
