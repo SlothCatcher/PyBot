@@ -281,15 +281,19 @@ def _run_live_probe():
                 self.pending = None
                 active = battle.active_pokemon
                 if expected is not None and active is not None and not active.fainted:
-                    if getattr(active, "species", None) != expected:
-                        self.mismatch.append((j, expected, getattr(active, "species", None)))
+                    # Сравниваем по идентификатору (role + nickname), а не по species: смена
+                    # формы (Mimikyu -> Mimikyu-Busted по Disguise, Zygarde -> Zygarde-Complete)
+                    # меняет species у ТОЙ ЖЕ особи и не является промахом свитча.
+                    got = active.identifier(battle.player_role)
+                    if got != expected:
+                        self.mismatch.append((j, expected, got))
             mask = [int(x) for x in SinglesEnv.get_action_mask(battle)]
             switches = [i for i in range(6) if mask[i]]
             if switches and len(battle.team) > 1:
                 j = switches[0]
                 reserves = canonical_reserves(battle.team)
                 if j < len(reserves):
-                    self.pending = (j, reserves[j].species)
+                    self.pending = (j, reserves[j].identifier(battle.player_role))
                     self.switches += 1
                     return SinglesEnv.action_to_order(np.int64(j), battle, fake=False, strict=False)
             return self.choose_random_move(battle)
