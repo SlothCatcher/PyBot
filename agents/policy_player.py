@@ -1180,7 +1180,7 @@ def run(
             clip_range=clip_range,
             vf_coef=vf_coef,
             device="cpu",
-            tensorboard_log="./tb_logs/",
+            tensorboard_log=_tensorboard_log_dir(),
             # фиксируем размер экстрактора и голов в чекпоинте: иначе policy_kwargs пуст
             # и миграция не знает features_dim, поэтому не может расширять сеть
             policy_kwargs=dict(
@@ -1635,6 +1635,22 @@ def resolve_lr_args(learning_rate: float | None, bc_lr: float | None,
     if bc_lr_final is None:
         bc_lr_final = 1e-4 if bc_lr >= 1e-4 else bc_lr * 0.1
     return (lr, bc_lr, float(bc_lr_final)), note
+
+
+def _tensorboard_log_dir() -> str | None:
+    """Каталог для TensorBoard, если tensorboard установлен, иначе None с предупреждением.
+
+    Без этой проверки SB3 падает в самом начале RL: `configure_logger` бросает ImportError
+    «Trying to log data to tensorboard but tensorboard is not installed». Логи — только
+    диагностика, поэтому отсутствие опциональной зависимости не должно убивать прогон.
+    """
+    import importlib.util
+
+    if importlib.util.find_spec("tensorboard") is None:
+        print("tensorboard не установлен — обучение пойдёт без TB-логов "
+              "(pip install tensorboard, если логи нужны)")
+        return None
+    return "./tb_logs/"
 
 
 def _vec_start_method() -> str:

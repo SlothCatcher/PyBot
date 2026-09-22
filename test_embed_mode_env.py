@@ -177,6 +177,19 @@ def main() -> int:
             if "action_mode=_mode" not in src[m.start():m.start() + 160]]
     check("D: каждая фабрика env передаёт action_mode=_mode",
           not bare, f"без режима: {len(bare)}")
+    check("D: tensorboard — опциональный: при отсутствии логов прогон не падает",
+          "tensorboard_log=_tensorboard_log_dir()" in src and "find_spec(\"tensorboard\")" in src)
+    from agents import policy_player as _pp
+    import importlib.util as _iu
+    _orig = _iu.find_spec
+    _iu.find_spec = lambda name, *a, **k: None if name == "tensorboard" else _orig(name, *a, **k)
+    try:
+        _tb_off = _pp._tensorboard_log_dir()
+    finally:
+        _iu.find_spec = _orig
+    check("D: без tensorboard каталог логов = None, с ним — путь",
+          _tb_off is None and _pp._tensorboard_log_dir() in ("./tb_logs/", None),
+          f"off={_tb_off} on={_pp._tensorboard_log_dir()}")
     bare_sm = src.count("SubprocVecEnv(") - src.count("start_method=_vec_start_method()")
     check("D: все фабрики SubprocVecEnv задают start_method (spawn: forkserver виснет)",
           bare_sm == 0 and "def _vec_start_method" in src, f"без start_method: {bare_sm}")
