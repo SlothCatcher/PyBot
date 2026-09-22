@@ -25,6 +25,16 @@ from poke_env.player import (
     SimpleHeuristicsPlayer,
 )
 
+try:
+    from .type_utils import damage_multiplier_safe
+except ImportError:  # запуск модуля вне пакета
+    from type_utils import damage_multiplier_safe
+
+try:
+    from .fusion_parser import FusionInfoParser
+except ImportError:  # запуск модуля вне пакета
+    from fusion_parser import FusionInfoParser
+
 BATTLE_FORMAT = "gen9fusionmonsrandombattle"
 N_FEATURES = 38
 _STATUSES = [None, Status.BRN, Status.PAR, Status.SLP, Status.FRZ, Status.PSN, Status.TOX]
@@ -40,16 +50,19 @@ SELF_PLAY_PATH = "models/self_play_snapshot"
 def _make_self_play_opponents():
     onlyfiles = [f for f in listdir("models/") if isfile(join("models/", f)) and "self_play_snapshot_" in f]
     players = []
-    try:        
-        for i in onlyfiles:
-            snap = PPO.load(onlyfiles[i], device="cpu")
+    for fname in onlyfiles:
+        try:
+            from agents.checkpoint_utils import load_policy_compat
+            snap, info = load_policy_compat(join("models", fname), N_FEATURES)
+            if snap is None:
+                print(f"Failed to load self_play snapshot {fname}: {info.get('error')}")
+                continue
             players.append(PolicyPlayer(
                 policy=snap.policy, battle_format=BATTLE_FORMAT, start_listening=False
             ))
-        
-        return players
-    except Exception:
-        return players
+        except Exception as e:
+            print(f"Failed to load self_play snapshot {fname}: {e}")
+    return players
 
 def _hazards(side_conditions: dict) -> np.ndarray:
     return np.array(
@@ -118,7 +131,10 @@ class FeaturesExtractor(BaseFeaturesExtractor):
         return obs["observation"]
 
 
-class PolicyPlayer(Player):
+class PolicyPlayer(FusionInfoParser, Player):
+    """FusionInfoParser первым в MRO: даёт перестановку typechange перед |request|
+    (иначе решение уходит со старым типом) и разбор статов фьюжна из html."""
+
     policy: ActorCriticPolicy | None
 
     def __init__(
@@ -132,9 +148,12 @@ class PolicyPlayer(Player):
     ) -> BattleOrder | Awaitable[BattleOrder]:
         if battle.wait:
             return DefaultBattleOrder()
+        if self.policy is None:
+            return DefaultBattleOrder()
         obs = self.embed_battle(battle)
-        obs 
         mask = np.array(SinglesEnv.get_action_mask(battle))
+        if mask.sum() == 0:
+            return DefaultBattleOrder()
         with torch.no_grad():
             obs_dict = {
                 "observation": torch.as_tensor(
@@ -153,17 +172,29 @@ class PolicyPlayer(Player):
         moves_base_power = -np.ones(4)
         moves_dmg_multiplier = np.ones(4)
         type_chart = GenData.from_gen(battle.gen).type_chart
-        for i, move in enumerate(battle.available_moves):
+        # слоты приёмов = раскладка действий 6..9 (known_moves[:4]): available_moves короче и
+        # без «дыр», когда часть приёмов выключена (PP=0/Disable/Taunt/Choice-lock)
+        try:
+            from agents.features import move_slots_for_action as _slots_for_action
+        except ImportError:
+            from features import move_slots_for_action as _slots_for_action  # type: ignore
+        for i, move in enumerate(_slots_for_action(battle)):
             moves_base_power[i] = move.base_power / 100
             if battle.opponent_active_pokemon is not None:
+                # безопасный расчёт: при неизвестном втором типе (??? / STELLAR) иммунитет
+                # сохраняется (было: KeyError -> нейтрал 1.0)
+                # типы противника — с учётом фьюжнов (вне fusion-форматов поведение прежнее)
                 try:
-                    moves_dmg_multiplier[i] = move.type.damage_multiplier(
-                        battle.opponent_active_pokemon.type_1,
-                        battle.opponent_active_pokemon.type_2,
-                        type_chart=type_chart,
-                    )
-                except KeyError:
-                    moves_dmg_multiplier[i] = 1.0
+                    from agents.fusion_types import effective_types as _et
+                except ImportError:
+                    from fusion_types import effective_types as _et  # type: ignore
+                opp_t1, opp_t2, _ = _et(battle.opponent_active_pokemon)
+                moves_dmg_multiplier[i] = damage_multiplier_safe(
+                    move.type,
+                    opp_t1,
+                    opp_t2,
+                    type_chart=type_chart,
+                )
 
         fainted_mon_team = len([mon for mon in battle.team.values() if mon.fainted]) / 6
         fainted_mon_opponent = (
@@ -249,6 +280,16 @@ class ExampleEnv(SinglesEnv):
 
 
 def train():
+    # Этот (легаси) скрипт умеет только indices: политика здесь позиционная, а embed-режим
+    # требует другой класс политики и другой нумерации свитчей. Молча играть в embed-маске
+    # позиционной политикой — гарантированный шум, поэтому лучше явная ошибка.
+    import os as _os
+    _mode = _os.environ.get("PYBOT_ACTION_MODE", "indices").strip().lower()
+    if _mode != "indices":
+        raise SystemExit(
+            "policy_player_simple.py не поддерживает режим действий "
+            f"{_mode!r}: используйте agents/policy_player.py --action-mode {_mode}"
+        )
     num_envs = 2
     total_timesteps = 2_000_000
     phase_size = 200_000  # раз в столько шагов обновляем self-play снапшот

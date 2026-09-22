@@ -1,6 +1,13 @@
-config.py
+/config.py
+!agents/config.py
 tb_logs
 venv
+# heuristic raw cache (перегенерация датасета без боёв при смене N_FEATURES)
+models/heuristic_raw_cache.pkl
+models/heuristic_raw_chunks/
+models/heuristic_dataset_tmp/
+models/heuristic_dataset_tmp_recompute/
+models/replay_cache/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -221,3 +228,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+# models — weights/datasets large, keep local only
+models/
+
+# memmap-кэш obs для BC (создаётся рядом с датасетом, может быть на десятки ГБ)
+*_bc_obs.npy
+*_bc_obs.npy.meta.json
