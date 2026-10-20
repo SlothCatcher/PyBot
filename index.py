@@ -225,27 +225,92 @@ class BotRestartRequired(RuntimeError):
     """Соединение умерло (watchdog) — супервизор должен поднять бота заново."""
 
 
+def _is_websocket_closed(ws) -> bool:
+    """Проверяет, закрыт ли websocket, с учётом разных версий библиотеки websockets.
+
+    В websockets<13 был `ws.closed` (bool). В websockets 13+ его убрали, остался
+    `ws.state == State.CLOSED` и `ws.close_code is not None`. Проверяем всё вместе,
+    чтобы бот не «зависал» с ложно-открытым соединением и вовремя перезапускался.
+    """
+    if ws is None:
+        return True
+    # legacy: websockets<13
+    if getattr(ws, "closed", None) is True:
+        return True
+    # websockets 13+ : state == CLOSED
+    try:
+        state = getattr(ws, "state", None)
+        if state is not None:
+            from websockets.protocol import State as _WSState
+            if state == _WSState.CLOSED:
+                return True
+            # ещё есть CLOSING — тоже считаем битым, сервер уже рвёт связь
+            if state == _WSState.CLOSING:
+                return True
+    except Exception:
+        pass
+    # close_code выставляется при закрытии (даже если state ещё не CLOSED)
+    if getattr(ws, "close_code", None) is not None:
+        return True
+    # некоторые обёртки выставляют open=False
+    if getattr(ws, "open", None) is False:
+        return True
+    return False
+
+
 async def _connection_watchdog(player, *, interval: float, grace: float) -> str:
     """Ждёт, пока соединение сломается, и возвращает причину.
 
-    Ловит именно «тихую» смерть: websocket закрыт со стороны сервера/сети (aiohttp ставит
-    `closed=True`, в т.ч. по ping_timeout), логин потерян. Без этого `accept_challenges`
-    висит в ожидании вызова вечно, и бот выглядит живым, хотя играть уже не может.
+    Ловит именно «тихую» смерть: websocket закрыт со стороны сервера/сети (в т.ч.
+    по ping_timeout), логин потерян. Без этого `accept_challenges` висит в ожидании
+    вызова вечно, и бот выглядит живым, хотя играть уже не может.
+
+    Причина была в том, что старая проверка `ws.closed` перестала работать:
+    в websockets 13+ этого атрибута нет, и watchdog никогда не срабатывал.
+    Теперь проверяем `state/close_code/open` и состояние слушателя poke-env.
     """
     started = time.monotonic()
     while True:
         await asyncio.sleep(interval)
         client = getattr(player, "ps_client", None)
+        if client is None:
+            return "нет ps_client"
+
+        # 1) слушатель poke-env (PSClient.listen) умер — даже если ws-объект
+        # ещё выглядит открытым, сообщения уже не приходят
+        listening = getattr(client, "_listening_coroutine", None)
+        if listening is not None:
+            try:
+                if getattr(listening, "done", lambda: False)():
+                    exc = None
+                    with contextlib.suppress(Exception):
+                        exc = listening.exception()
+                    if exc is not None:
+                        return f"слушатель упал: {type(exc).__name__}: {exc}"
+                    return "слушатель завершён (websocket закрыт сервером)"
+            except Exception:
+                pass
+
         ws = getattr(client, "websocket", None)
         if ws is None:
             if time.monotonic() - started < grace:
                 continue
             return "нет websocket-соединения"
-        if getattr(ws, "closed", False):
-            return "websocket закрыт (сервер разорвал связь или пропала сеть)"
+        if _is_websocket_closed(ws):
+            # собираем детали для лога
+            details = []
+            with contextlib.suppress(Exception):
+                details.append(f"state={getattr(ws, 'state', '?')}")
+            with contextlib.suppress(Exception):
+                details.append(f"close_code={getattr(ws, 'close_code', None)}")
+            with contextlib.suppress(Exception):
+                details.append(f"close_reason={getattr(ws, 'close_reason', None)!r}")
+            suffix = f" ({', '.join(details)})" if details else ""
+            return f"websocket закрыт (сервер разорвал связь или пропала сеть){suffix}"
         logged_in = getattr(client, "logged_in", None)
         if logged_in is not None and not logged_in.is_set():
-            return "потерян логин на сервере"
+            if time.monotonic() - started >= grace:
+                return "потерян логин на сервере"
 
 
 async def _serve_player(player, spec: BotSpec, *, battles: int, login_timeout: float,
